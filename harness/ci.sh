@@ -5,8 +5,9 @@
 #   ci.sh projects GROUP... cargo_rustd.py on each group of projects, under both backends, all
 #                           at once: `small` is the CI's three with the flags, the daemon's
 #                           life and plain cargo, and another group is projects by name
-# Each lane run at once has a temporary directory, a daemon home and a cache of its own, and
-# its output is printed whole when it ends. A harness that is not of a platform is skipped
+# Each lane run at once has a temporary directory, a daemon home, a cache and a copy of the
+# harness of its own (the harnesses build in the workspaces beside them), and its output is
+# printed whole when it ends. A harness that is not of a platform is skipped
 # here, and this says why.
 set -u
 cd "$(dirname "$0")"
@@ -14,13 +15,12 @@ os=$(uname -s) arch=$(uname -m)
 case "$os" in
 MINGW* | MSYS*)
     os=Windows py=python
-    RUSTD_BIN="$(cygpath -w "$(cd .. && pwd)")\\target\\release\\rustd.exe"
+    : "${RUSTD_BIN:=$(cygpath -w "$(cd .. && pwd)")\\target\\release\\rustd.exe}"
     base=$(cygpath -m "${RUNNER_TEMP:-$TEMP}")/ci
     ;;
 *)
     py=python3
-    RUSTD_BIN="$(cd .. && pwd)/target/release/rustd"
-    # Short: a socket's path is at most 104 bytes on macOS.
+    : "${RUSTD_BIN:=$(cd .. && pwd)/target/release/rustd}"
     base=/tmp/ci-$$
     ;;
 esac
@@ -32,12 +32,14 @@ backends="cranelift llvm"
 if macos; then parts="core keys store"; else parts="core keys store model"; fi
 
 names=() pids=()
+# A lane's directory is its number: a daemon's worker sockets are deep under it, and a socket's
+# path is at most 108 bytes on Linux and 104 on macOS.
 lane() {
-    local name=$1 dir="$base/${1// /-}"
+    local name=$1 dir="$base/${#names[@]}"
     shift
-    mkdir -p "$dir/tmp"
+    mkdir -p "$dir/t"
     (
-        export TMPDIR="$dir/tmp" RUSTD_HOME="$dir/home" XDG_CACHE_HOME="$dir/cache" RUSTD_PROJECTS="$dir/projects" RUSTD_REPORTS="$dir"
+        export TMPDIR="$dir/t" RUSTD_HOME="$dir/h" XDG_CACHE_HOME="$dir/c" RUSTD_PROJECTS="$dir/p" RUSTD_REPORTS="$dir"
         start=$SECONDS
         "$@" >"$dir/log" 2>&1
         status=$?
@@ -54,7 +56,7 @@ lanes() {
         failed="$failed [${names[$i]}]"
     done
     for i in "${!names[@]}"; do
-        local dir="$base/${names[$i]// /-}"
+        local dir="$base/$i"
         echo "::group::${names[$i]}: exit $(cut -d' ' -f1 "$dir/end"), $(cut -d' ' -f2 "$dir/end")s"
         # Groups do not nest.
         sed -e 's/^::group::/== /' -e '/^::endgroup::$/d' "$dir/log"
@@ -67,7 +69,13 @@ lanes() {
 
 if [ $# = 0 ]; then
     for backend in $backends; do
-        for part in $parts; do lane "$backend $part" bash ci.sh "$backend" "$part"; done
+        for part in $parts; do
+            copy="$base/${#names[@]}/r"
+            mkdir -p "$copy/.cargo"
+            cp ../.cargo/config.toml "$copy/.cargo/"
+            (cd .. && git ls-files -z harness | tar -cf - --null -T -) | tar -xf - -C "$copy"
+            lane "$backend $part" bash "$copy/harness/ci.sh" "$backend" "$part"
+        done
     done
     lanes
     exit
@@ -99,7 +107,9 @@ failed=
 run() {
     [ "$(part "$1")" = "$want" ] || return 0
     echo "::group::$*"
+    local start=$SECONDS
     "$py" "$@" || { failed="$failed [$*]"; echo "::error::$RUSTD_BACKEND $want: $* failed"; }
+    echo "took $((SECONDS - start))s: $*"
     echo "::endgroup::"
 }
 

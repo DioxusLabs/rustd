@@ -139,7 +139,7 @@ jobs:
           submodules: true
       - uses: ./.github/actions/rustd
       - name: cargo rustd against cargo
-        run: eval "bash harness/ci.sh projects ${{ matrix.groups }}"
+        run: bash harness/ci.sh projects ${{ matrix.groups }}
       # The lints are rust-analyzer's whatever the backend or the platform, so they are checked once.
       - name: cargo rustd clippy against clippy
         if: matrix.platform == 'linux-x64'
