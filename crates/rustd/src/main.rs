@@ -16,6 +16,7 @@ mod remote;
 mod socket;
 mod splice;
 mod stub;
+mod symbol_path;
 mod symbols;
 mod tree;
 mod weaken;
@@ -313,48 +314,12 @@ impl Resolver<'_> {
 
     /// The function's path as `rustc-demangle` prints its v0 symbol.
     fn path(&self, func: FunctionId) -> Option<String> {
-        let ModuleDef::Function(func) = ModuleDef::from(ModuleDefId::FunctionId(func)) else {
-            return None;
-        };
-        let name = func.name(self.db);
-        let Some(assoc) = func.as_assoc_item(self.db) else {
-            return self.item_path(func.module(self.db), name.as_str());
-        };
-        let AssocItemContainer::Impl(imp) = assoc.container(self.db) else { return None };
-        let self_ty = self.type_path(&imp.self_ty(self.db))?;
-        match imp.trait_(self.db) {
-            Some(trait_) => {
-                let mut path =
-                    self.item_path(trait_.module(self.db), trait_.name(self.db).as_str())?;
-                // `impl PartialEq<str> for String` and `impl PartialEq<&str> for String` are
-                // told apart by the trait's arguments alone.
-                let trait_ref = imp.trait_ref(self.db)?;
-                let params = hir::GenericDef::from(trait_).type_or_const_params(self.db);
-                let mut args = Vec::new();
-                for (idx, param) in params.iter().enumerate().skip(1) {
-                    let arg = trait_ref.get_type_argument(idx)?;
-                    let default = param.as_type_param(self.db).and_then(|it| it.default(self.db));
-                    // FIXME: a default that names a parameter is understood only as `= Self`.
-                    let is_default = default.as_ref().is_some_and(|default| {
-                        if default.as_type_param(self.db).is_some() {
-                            return hir::attach_db(self.db, || arg == trait_ref.self_ty());
-                        }
-                        let default = self.type_path(default);
-                        default.is_some() && default == self.type_path(&arg)
-                    });
-                    if idx + 1 == params.len() && is_default {
-                        break;
-                    }
-                    args.push(self.type_path(&arg)?);
-                }
-                if !args.is_empty() {
-                    path = format!("{path}<{}>", args.join(", "));
-                }
-                let trait_ = path;
-                Some(format!("<{self_ty} as {trait_}>::{}", name.as_str()))
-            }
-            None => Some(format!("<{self_ty}>::{}", name.as_str())),
-        }
+        symbol_path::function(
+            self.db,
+            func,
+            |module, name| self.item_path(module, name),
+            |ty| self.type_path(ty),
+        )
     }
 
     /// The symbol of `func`, when it has one.
