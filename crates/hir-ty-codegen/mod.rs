@@ -6135,6 +6135,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 PassMode::Cast(ty) => left.take(ty),
                 PassMode::Pair(a, b, offset) => {
                     if let Some(padded) = left.spill(a.ty) {
+                        // The other half finds the same one register left: both are copied.
+                        if b.ty == types::I128 {
+                            left.stack += 16;
+                            *mode = PassMode::OnStack { size: offset.bytes() as u32 + 16, padded };
+                            continue;
+                        }
                         left.take(b.ty);
                         *mode = PassMode::PairSpilled { first: true, other: b, offset, padded };
                         continue;
