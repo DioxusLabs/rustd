@@ -287,6 +287,16 @@ impl<'a> Selective<'a> {
         let mut command = self.command()?;
         command.args(flags).args(["--exact", name, "--test-threads", "1"]);
         command.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
+        // Tests that share a process name their temporary files apart by a counter in a static,
+        // which starts again in each process: each test gets a temporary directory of its own.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp = std::env::temp_dir().join(format!("rustd-test-{}-{next}", std::process::id()));
+        std::fs::create_dir_all(&temp)
+            .with_context(|| format!("making the test's temporary directory {}", temp.display()))?;
+        for var in ["TMPDIR", "TMP", "TEMP"] {
+            command.env(var, &temp);
+        }
         let mut child = command.spawn().with_context(|| format!("running the test {name}"))?;
         let read = |pipe: Option<Box<dyn std::io::Read + Send>>| {
             std::thread::spawn(move || {
@@ -317,6 +327,7 @@ impl<'a> Selective<'a> {
         };
         let stdout = stdout.join().unwrap_or_default();
         let stderr = stderr.join().unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&temp);
         let line = stdout.lines().find_map(outcome).filter(|it| it.0 == name);
         let shown = line.map_or_else(|| name.to_owned(), |it| it.1.to_owned());
         let outcome = line.and_then(|it| it.2).or_else(|| summarized(&stdout));
