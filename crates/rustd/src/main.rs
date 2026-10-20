@@ -2901,7 +2901,19 @@ fn link(
             Err(why) => declined = format!("; not spliced: {why:#}"),
         }
     }
-    let linked = shell(cmd).output()?;
+    // A splice into a Mach-O executable needs room in its header, which is asked for by
+    // what the executable that is there has to fit, and again by what was linked where
+    // that turns out to have more to fit.
+    let run = |room: Option<String>| match room {
+        Some(room) => shell(&format!("{cmd} {room}")).output(),
+        None => shell(cmd).output(),
+    };
+    let mut linked = run(splice.and_then(splice::room))?;
+    if linked.status.success()
+        && let Some(room) = splice.and_then(splice::short_of_room)
+    {
+        linked = run(Some(room))?;
+    }
     let status = linked.status;
     let said = String::from_utf8_lossy(&linked.stderr);
     eprint!("{}{said}", String::from_utf8_lossy(&linked.stdout));

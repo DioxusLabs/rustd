@@ -122,9 +122,16 @@ What is specific to the port:
 - The splice (`splice/macho.rs`). The loader wants `__LINKEDIT` last with the signature at
   its end. The patch goes where `__LINKEDIT` was, in two new segments, `__LINKEDIT` is
   written again behind them, the unwind tables are rebuilt and the ad hoc signature is
-  redone. The result is written to a copy that replaces the executable by rename. It needs
-  room for two more load commands, so the link line gets `-Wl,-headerpad,0x200`; without
-  it the splice declines. The file does not grow from splice to splice.
+  redone. The result is written to a copy that replaces the executable by rename. The file
+  does not grow from splice to splice.
+- The unwind tables stay sections of `__TEXT`. The dyld of macOS 15 tells the unwinder only
+  of `__unwind_info` and `__eh_frame` that the segment command of `__TEXT` lists, whatever
+  segment name their own headers carry, and it refuses an executable with a section outside
+  the segment that lists it. So the rebuilt tables are written between the load commands
+  and the first section, which is inside `__TEXT`. That room is the linker's
+  `-headerpad`: when rustd links it asks for two segment commands plus the tables of the
+  executable that is there, a quarter more and 64 KiB, and links once more when what it
+  linked has tables that do not fit. Without the room the splice declines.
 - Executables with chained fixups are declined and linked in full. That was measured with
   `MACOSX_DEPLOYMENT_TARGET=13.0`; rustc's default deployment target of 11.0 produces dyld
   info and splices.

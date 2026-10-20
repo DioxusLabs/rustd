@@ -248,6 +248,32 @@ def rewrite(binary):
     os.chmod(binary, 0o755)
 
 
+def sound_macho(path):
+    """Whether the sections are where the loader of any release takes them from: each inside
+    the segment its header is listed in and named for, and the unwinder's two in `__TEXT`.
+    One loader goes by the segment a section is listed in, another by the name in its header."""
+    data = open(path, "rb").read()
+    u32 = lambda at: int.from_bytes(data[at:at + 4], "little")
+    u64 = lambda at: int.from_bytes(data[at:at + 8], "little")
+    name = lambda at: data[at:at + 16].rstrip(b"\0").decode()
+    at, found = 32, set()
+    for _ in range(u32(16)):
+        if u32(at) == 0x19:
+            segment, start, size = name(at + 8), u64(at + 24), u64(at + 32)
+            for header in (at + 72 + 80 * n for n in range(u32(at + 64))):
+                section, named, address, length = name(header), name(header + 16), u64(header + 32), u64(header + 40)
+                if named != segment:
+                    return f"macho: {section} says it is of {named} and is listed in {segment}"
+                if not start <= address <= address + length <= start + size:
+                    return f"macho: {section} at {address:#x} is outside {segment}"
+                found.add((segment, section))
+        at += u32(at + 4)
+    for section in ("__unwind_info", "__eh_frame"):
+        if ("__TEXT", section) not in found:
+            return f"macho: no {section} in __TEXT"
+    return None
+
+
 def sound_pe(path):
     """What dumpbin has against the file, and whether the tables the loader and the unwinder
     read are in order: sections that follow one another, functions sorted and inside the
@@ -478,11 +504,14 @@ def main():
             raise SystemExit(f"the daemon did not start: {log_path}")
         time.sleep(0.05)
 
+    said = {}
+
     def run(path, env=None):
         try:
             ran = subprocess.run([*RUNNER, path], capture_output=True, text=True, timeout=30, env={**os.environ, **(env or {})})
         except Exception as error:
             return f"did not run: {error}"
+        said[path] = ran.stderr
         return ran.stdout + (f"[exit {ran.returncode}]" if ran.returncode else "")
 
     def sync():
@@ -505,7 +534,7 @@ def main():
             said = [l for l in read.stderr.splitlines() if l.strip()]
             if read.returncode or said:
                 return f"{os.path.basename(tool[0])}: {(said or ['exit ' + str(read.returncode)])[0][:80]}"
-        return None
+        return sound_macho(path) if linkline.MACHO else None
 
     def edit(edits):
         text = open(os.path.join(ws, MAIN)).read()
@@ -556,6 +585,9 @@ def main():
         kind = how.split(":")[0] if verdict == "same" else "wrong"
         hows[how] = hows.get(how, 0) + 1
         print(f"{what:48} {verdict:16} {took:5.0f} ms  {how}", flush=True)
+        if verdict.startswith("DIFFERENT") and wrong <= 3:
+            ours = run(binary)
+            print(f"    cargo's: {theirs[-300:]!r}\n    rustd's: {ours[-300:]!r}\n    stderr: {said[binary][-600:]!r}", flush=True)
 
     soak = int(os.environ.get("SPLICES_SOAK", "0"))
     soak_wrong = 0

@@ -1,0 +1,31 @@
+# TEMPORARY: shows that the assertion of splices.py fails on the layout main has, on a macOS
+# where those executables still run. Removed before the branch is done.
+name: tmp-macos
+on:
+  push:
+    branches: ["ci-macos"]
+jobs:
+  old-layout:
+    name: old layout under the new assertion (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, warp-macos-latest-arm64-6x]
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+          fetch-depth: 0
+      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
+      - run: sw_vers
+      - run: git checkout 159f69351d -- crates/rustd/src
+      - run: cargo build -p rustd --release
+      - name: splices.py
+        working-directory: harness
+        run: |
+          export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
+          python3 splices.py && echo "== splices.py ok" || echo "== splices.py FAILED"

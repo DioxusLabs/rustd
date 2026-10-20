@@ -13,9 +13,6 @@ use crate::weaken;
 /// What an ELF linker is told so that the first definition of a name is the one that stays.
 const FIRST_DEFINITION_STAYS: &str = "-Wl,--allow-multiple-definition";
 
-/// What Apple's linker is told so that a splice has room in the header for its two segments.
-const ROOM_FOR_SEGMENTS: &str = "-Wl,-headerpad,0x200";
-
 /// The same for `link.exe`, which warns of every name it does so for unless told not to.
 const FIRST_DEFINITION_STAYS_MSVC: [&str; 2] = ["/FORCE:MULTIPLE", "/IGNORE:4006"];
 
@@ -332,11 +329,9 @@ impl LinkLine {
         binary: &Path,
         response: &Path,
     ) -> anyhow::Result<String> {
-        let flag = match self.flavor {
-            Flavor::Apple => ROOM_FOR_SEGMENTS,
-            _ => FIRST_DEFINITION_STAYS,
-        };
-        self.args.splice(first..first, ours.into_iter().chain([flag.to_owned()]));
+        // Apple's linker has no such flag: what it is given of rustc's is weakened.
+        let stays = (self.flavor != Flavor::Apple).then(|| FIRST_DEFINITION_STAYS.to_owned());
+        self.args.splice(first..first, ours.into_iter().chain(stays));
         let output =
             self.args.iter().position(|it| it == "-o").context("the link names no output")?;
         *self.args.get_mut(output + 1).context("the link names no output")? =
@@ -529,7 +524,6 @@ mod tests {
             args,
             [
                 "/p/rustd.o",
-                ROOM_FOR_SEGMENTS,
                 &weak.display().to_string(),
                 "/t/libstd-3.rlib",
                 "-arch",

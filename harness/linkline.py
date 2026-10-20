@@ -76,6 +76,8 @@ def ahead(link, objects, rustd):
     copies = subprocess.check_output([rustd, "weaken", *(link[i] for i in theirs)], text=True).splitlines()
     for i, copy in zip(theirs, copies):
         link[i] = copy
-    # A splice adds two segments to the header, which the linker leaves no room for.
-    link[first:first] = [*objects, "-Wl,-headerpad,0x200"]
+    # A splice writes two segments and the unwind tables behind the load commands, which the
+    # linker leaves no room for. rustd asks for it by the size of the tables when it links;
+    # this is for the links the harness runs itself, of programs whose tables are small.
+    link[first:first] = [*objects, "-Wl,-headerpad,0x100000"]
     return link

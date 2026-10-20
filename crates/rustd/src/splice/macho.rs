@@ -5,14 +5,20 @@
 //! signature has no hash of. So the patch goes where `__LINKEDIT` was, in two segments of
 //! its own, and `__LINKEDIT` is written again behind them:
 //!
-//! 1. `__RUSTD_TEXT`, read and run: the table of the unwinder with the patch's functions
-//!    added, the frames of the program with the patch's behind them, the patch's constants
-//!    and functions, and a stub for each call that is out of a branch's reach.
+//! 1. `__RUSTD_TEXT`, read and run: the patch's constants and functions, and a stub for
+//!    each call that is out of a branch's reach.
 //! 2. `__RUSTD_DATA`, read and written: the patch's writable sections and those that store
 //!    addresses, and an address slot for each symbol the code reaches through one.
 //! 3. `__LINKEDIT`: as the linker wrote it but for the addresses the loader moves with the
 //!    program, which are encoded again, and for the signature, which keeps the hashes of
 //!    the pages that are as they were.
+//!
+//! The unwinder asks the loader for `__unwind_info` and `__eh_frame` of `__TEXT`, and the
+//! loader gives it only sections that are inside the segment of that name. So the table
+//! with the patch's functions added, and the frames of the program with the patch's behind
+//! them, are written into the room the linker left between the load commands and the first
+//! section, and the two section headers say so. Where they do not fit, the splice declines,
+//! and the link that follows asks the linker for the room ([`room`]).
 //!
 //! The kernel remembers the signature of a file it has run, so the executable is not
 //! written where it is: a copy is, which the file system makes without copying where it
@@ -20,6 +26,7 @@
 
 use std::{
     fs::{File, OpenOptions},
+    io::Read,
     path::Path,
 };
 
@@ -409,6 +416,10 @@ impl Image {
         ensure!(
             !unwind.bytes.is_empty() && !frames.bytes.is_empty(),
             "the executable has no unwind tables"
+        );
+        ensure!(
+            bytes.get(commands.len()..room).is_some_and(|it| it.iter().all(|&it| it == 0)),
+            "something is in the room behind the load commands"
         );
 
         let linkedit = segments.last().context("no segments")?;
@@ -1074,7 +1085,26 @@ impl<'a> Patch<'a> {
             None => 0,
         };
 
-        // Where everything goes, as offsets from `base`.
+        // The tables of the unwinder go to the end of the room the linker left behind the
+        // load commands: the unwinder is only told of sections of `__TEXT` itself.
+        let image_base = image.base()?;
+        ensure!(image.offset_of(image_base)? == 0, "a first segment that is not the file's start");
+        let frames_at = unwind_table_len(&image.unwind.bytes, frames)?.next_multiple_of(8);
+        let our_frames = match self.frames {
+            Some(index) => self.file.section_by_index(index)?.size() as usize,
+            None => 0,
+        };
+        let frames_end = frames_at + old_frames + our_frames;
+        let commands = image.commands.len() + 2 * SEGMENT;
+        let tables_offset = image.room.saturating_sub(frames_end) & !7;
+        ensure!(
+            commands <= tables_offset,
+            "the header has no room for two more segments and {frames_end} bytes of unwind tables"
+        );
+        let tables_address = image_base + tables_offset as u64;
+        let mut tables = vec![0u8; frames_end];
+
+        // Where everything else goes, as offsets from `base`.
         let mut end = 0u64;
         let mut reserve = |len: usize, align: u64| {
             let start = end.next_multiple_of(align);
@@ -1082,12 +1112,6 @@ impl<'a> Patch<'a> {
             start
         };
         let mut placed = FxHashMap::default();
-        let unwind_at = reserve(unwind_table_len(&image.unwind.bytes, frames)?, 8);
-        let frames_at = reserve(old_frames, 8);
-        if let Some(index) = self.frames {
-            placed.insert(index, reserve(self.file.section_by_index(index)?.size() as usize, 8));
-        }
-        let frames_end = reserve(0, 1);
         let (mut stubs_at, mut code_end, mut data_at) = (0, 0, 0);
         for (segment, sections) in self.sections.iter().enumerate() {
             for &index in sections {
@@ -1097,6 +1121,10 @@ impl<'a> Patch<'a> {
             if segment == TEXT {
                 stubs_at = reserve(self.stubs.len() * Code::STUB, 4);
                 code_end = reserve(0, 1);
+                // A segment of nothing is not one.
+                if code_end == 0 {
+                    reserve(4, 4);
+                }
                 data_at = reserve(0, PAGE);
             }
         }
@@ -1116,6 +1144,9 @@ impl<'a> Patch<'a> {
             let in_place = self.in_place.get(&section).map_or(&[][..], |it| it);
             Ok(match in_place.iter().find(|it| it.holds(at)) {
                 Some(it) => it.old.address + (at - it.offset),
+                None if Some(section) == self.frames => {
+                    tables_address + (frames_at + old_frames) as u64 + at
+                }
                 None => base + placed[&section] + at,
             }
             .wrapping_add_signed(added))
@@ -1137,7 +1168,14 @@ impl<'a> Patch<'a> {
         let mut stored = Vec::new();
         let mut restored = FxHashSet::default();
         for section in self.file.sections() {
-            let Some(&start) = placed.get(&section.index()) else { continue };
+            // What the section is written into, where that is loaded and where in it.
+            let (appended, base, start) = if Some(section.index()) == self.frames {
+                (&mut tables, tables_address, (frames_at + old_frames) as u64)
+            } else if let Some(&start) = placed.get(&section.index()) {
+                (&mut appended, base, start)
+            } else {
+                continue;
+            };
             let data = section.data()?;
             appended[start as usize..][..data.len()].copy_from_slice(data);
             let in_place = self.in_place.get(&section.index()).map_or(&[][..], |it| it);
@@ -1170,7 +1208,7 @@ impl<'a> Patch<'a> {
                     Fixup::Absolute => {
                         let value =
                             address(target, relocation.addend + u64_at(field(8)?, 0)? as i64)?;
-                        put64(&mut appended, at, value);
+                        put64(appended, at, value);
                         stored.push(place);
                     }
                     Fixup::Distance(from, len) => {
@@ -1187,11 +1225,7 @@ impl<'a> Patch<'a> {
                         let written = i64::from(u32_at(field(4)?, 0)? as i32);
                         let to = slot(relocation).wrapping_add_signed(relocation.addend + written);
                         let distance = i32::try_from(to.wrapping_sub(place) as i64);
-                        put32(
-                            &mut appended,
-                            at,
-                            distance.context("the program is too large")? as u32,
-                        );
+                        put32(appended, at, distance.context("the program is too large")? as u32);
                     }
                     fixup => {
                         let instruction = u32_at(field(4)?, 0)?;
@@ -1215,7 +1249,7 @@ impl<'a> Patch<'a> {
                             Fixup::SlotPage => Code::page(instruction, slot(relocation), place)?,
                             _ => Code::offset(instruction, slot(relocation))?,
                         };
-                        put32(&mut appended, at, instruction);
+                        put32(appended, at, instruction);
                     }
                 }
             }
@@ -1240,10 +1274,9 @@ impl<'a> Patch<'a> {
 
         // The frames: the program's, which say how far their code is from where they were,
         // and the patch's behind them.
-        let image_base = image.base()?;
-        let frames_address = base + frames_at;
+        let frames_address = tables_address + frames_at as u64;
         let moved = frames_address.wrapping_sub(image.frames.address) as i64;
-        let section = &mut appended[frames_at as usize..frames_end as usize];
+        let section = &mut tables[frames_at..];
         section[..image.frames.bytes.len()].copy_from_slice(&image.frames.bytes);
         for pointer in Pointer::all(&image.frames.bytes)? {
             if pointer.relative {
@@ -1273,11 +1306,8 @@ impl<'a> Patch<'a> {
             &entries,
             u32::try_from(base + code_end - image_base)?,
         )?;
-        ensure!(
-            unwind_at as usize + unwind.len() <= frames_at as usize,
-            "an unwind table longer than planned"
-        );
-        appended[unwind_at as usize..][..unwind.len()].copy_from_slice(&unwind);
+        ensure!(unwind.len() <= frames_at, "an unwind table longer than planned");
+        tables[..unwind.len()].copy_from_slice(&unwind);
 
         // The symbols of the functions name the new code, for whoever reads a backtrace.
         let mut renamed = Vec::new();
@@ -1313,15 +1343,17 @@ impl<'a> Patch<'a> {
 
         let text = (base, data_at);
         let data = (base + data_at, linkedit_at - data_at);
-        let tables = [(unwind_at, unwind.len()), (frames_at, (frames_end - frames_at) as usize)];
-        let layout = Layout { text, data, tables, rebases, renamed };
+        let layout = Layout {
+            text,
+            data,
+            tables: [(tables_address, unwind.len()), (frames_address, frames_end - frames_at)],
+            rebases,
+            renamed,
+        };
         let (commands, linkedit) = layout.linked(image, offset + linkedit_at)?;
-        ensure!(
-            commands.len() <= image.room,
-            "the header has no room for two more segments: link with -Wl,-headerpad,{:#x}",
-            (commands.len() - image.commands.len()).next_multiple_of(0x100)
-        );
+        ensure!(commands.len() <= tables_offset, "load commands longer than planned");
         overwritten.push((0, commands));
+        overwritten.push((tables_offset as u64, tables));
         appended.extend_from_slice(&linkedit);
         Ok(Addition { offset, appended, overwritten, redirected })
     }
@@ -1332,7 +1364,8 @@ struct Layout {
     /// The address and length of each new segment.
     text: (u64, u64),
     data: (u64, u64),
-    /// `__unwind_info` and `__eh_frame`, by where the first segment has them.
+    /// The address and length of `__unwind_info` and of `__eh_frame`, which are in the room
+    /// behind the load commands.
     tables: [(u64, usize); 2],
     rebases: Vec<u64>,
     /// The entries of the symbol table that get another address.
@@ -1346,13 +1379,23 @@ impl Layout {
         let address = self.data.0 + self.data.1;
         let mut commands = image.commands.clone();
 
-        // The segments, with the tables of the unwinder in the first: the unwinder looks
-        // for them by name, so those of the program get another.
+        // The tables of the unwinder are where the splice wrote them. They stay sections of
+        // `__TEXT` by both names, that of the segment they are listed in and that of their
+        // own header: the loader of one release looks for them by the first, that of
+        // another by the second, and neither takes a section outside its segment.
+        for (table, (table_address, len)) in
+            [&image.unwind, &image.frames].into_iter().zip(self.tables)
+        {
+            put64(&mut commands, table.header + 32, table_address);
+            put64(&mut commands, table.header + 40, len as u64);
+            put32(&mut commands, table.header + 48, u32::try_from(table_address - image.base()?)?);
+        }
+
         let mut added = Vec::new();
-        let segment = |name: &[u8], (address, len): (u64, u64), protection: u32, sections: u32| {
+        let segment = |name: &[u8], (address, len): (u64, u64), protection: u32| {
             let mut command = vec![0; SEGMENT];
             put32(&mut command, 0, macho::LC_SEGMENT_64);
-            put32(&mut command, 4, (SEGMENT + sections as usize * SECTION) as u32);
+            put32(&mut command, 4, SEGMENT as u32);
             command[8..8 + name.len()].copy_from_slice(name);
             for (at, field) in
                 [address, len, address - old.address + old.offset, len].into_iter().enumerate()
@@ -1361,24 +1404,14 @@ impl Layout {
             }
             put32(&mut command, 56, protection);
             put32(&mut command, 60, protection);
-            put32(&mut command, 64, sections);
             command
         };
         let run = macho::VM_PROT_READ | macho::VM_PROT_EXECUTE;
-        added.extend(segment(b"__RUSTD_TEXT", self.text, run, 2));
-        for (table, (at, len)) in [&image.unwind, &image.frames].into_iter().zip(self.tables) {
-            let mut section = commands[table.header..table.header + SECTION].to_vec();
-            put64(&mut section, 32, self.text.0 + at);
-            put64(&mut section, 40, len as u64);
-            put32(&mut section, 48, u32::try_from(self.text.0 + at - old.address + old.offset)?);
-            added.extend(section);
-            commands[table.header + 2..table.header + 9].copy_from_slice(b"_rustd_");
-        }
+        added.extend(segment(b"__RUSTD_TEXT", self.text, run));
         added.extend(segment(
             b"__RUSTD_DATA",
             self.data,
             macho::VM_PROT_READ | macho::VM_PROT_WRITE,
-            0,
         ));
 
         // `__LINKEDIT`: the fixups are written again, and what is behind them moves by as
@@ -1441,6 +1474,88 @@ impl Layout {
         put32(&mut commands, 20, size + added.len() as u32);
         commands.splice(image.at.linkedit..image.at.linkedit, added);
         Ok((commands, linkedit))
+    }
+}
+
+/// What Apple's linker is told so that the executable it writes in place of the one at
+/// `path` has the room a splice needs behind its load commands: two segments, and the
+/// tables of the unwinder with what patches add to them. The executable that is there says
+/// how long its tables are; where none is, the room is that of a small program, and
+/// [`short_of_room`] says whether what was linked has to be linked again.
+pub(super) fn room(path: &Path) -> Option<String> {
+    let tables = match Header::read(path) {
+        Some(header) => header.tables,
+        None if cfg!(target_os = "macos") && !path.exists() => ROOM_UNMEASURED,
+        None => return None,
+    };
+    Some(headerpad(tables))
+}
+
+/// What Apple's linker is told to link the executable at `path` again with, where it left
+/// less room behind the load commands than a splice into it needs.
+pub(super) fn short_of_room(path: &Path) -> Option<String> {
+    let Header { tables, room } = Header::read(path)?;
+    let needed = 2 * SEGMENT + tables + tables / 8 + ROOM_FOR_A_PATCH / 2;
+    (room < needed).then(|| headerpad(tables))
+}
+
+/// The flag that leaves room for two segments and for tables that grow from `tables` bytes
+/// by a quarter and by [`ROOM_FOR_A_PATCH`].
+fn headerpad(tables: usize) -> String {
+    let room = 2 * SEGMENT + tables + tables / 4 + ROOM_FOR_A_PATCH;
+    format!("-Wl,-headerpad,{:#x}", room.next_multiple_of(PAGE as usize))
+}
+
+/// What the tables of the unwinder may grow by before a splice has no room for them, on top
+/// of a quarter of what they are.
+const ROOM_FOR_A_PATCH: usize = 0x10000;
+
+/// The tables of a program that is not there to measure are taken to be this long.
+const ROOM_UNMEASURED: usize = 0x20000;
+
+/// What the header of a Mach-O executable says of the room a splice has.
+struct Header {
+    /// How long `__unwind_info` and `__eh_frame` are together.
+    tables: usize,
+    /// How many bytes are free between the load commands and the first section.
+    room: usize,
+}
+
+impl Header {
+    /// Of the executable at `path`; nothing where that is no 64-bit Mach-O executable.
+    fn read(path: &Path) -> Option<Header> {
+        // Load commands are no longer than this.
+        let mut start = Vec::new();
+        File::open(path).ok()?.take(1 << 16).read_to_end(&mut start).ok()?;
+        let is_executable = u32_at(&start, 0).ok()? == macho::MH_MAGIC_64
+            && u32_at(&start, 12).ok()? == macho::MH_EXECUTE;
+        if !is_executable {
+            return None;
+        }
+        let commands = HEADER + u32_at(&start, 20).ok()? as usize;
+        let mut tables = 0;
+        let mut first_section = usize::MAX;
+        let mut command = HEADER;
+        for _ in 0..u32_at(&start, 16).ok()? {
+            if u32_at(&start, command).ok()? == macho::LC_SEGMENT_64 {
+                for nth in 0..u32_at(&start, command + 64).ok()? as usize {
+                    let header = command + SEGMENT + nth * SECTION;
+                    let name = start.get(header..header + 16)?;
+                    let is_table =
+                        name == b"__unwind_info\0\0\0" || name == b"__eh_frame\0\0\0\0\0\0";
+                    if is_table {
+                        tables += u64_at(&start, header + 40).ok()? as usize;
+                    }
+                    // A section without bytes in the file has no offset.
+                    match u32_at(&start, header + 48).ok()? as usize {
+                        0 => {}
+                        offset => first_section = first_section.min(offset),
+                    }
+                }
+            }
+            command += u32_at(&start, command + 4).ok()? as usize;
+        }
+        Some(Header { tables, room: first_section.checked_sub(commands)? })
     }
 }
 

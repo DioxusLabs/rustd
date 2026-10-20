@@ -310,8 +310,8 @@ cargo's.
 Two things differ from Linux. Apple's linker has no way to let the first of two
 definitions win, so the daemon links rustc's line with copies of the workspace's objects in
 which every definition is weak, and its own object in front; this is the link the daemon
-already did on macOS, and the line also gets `-Wl,-headerpad,0x200` so that the executable
-can be spliced later. And there is no `/proc`: in the global mode, the cargo above the
+already did on macOS, and the line also gets a `-Wl,-headerpad` sized by the unwind tables
+of the executable (docs/platforms.md) so that it can be spliced later. And there is no `/proc`: in the global mode, the cargo above the
 wrapper is read through `libproc` and `sysctl`.
 
 What was run, on an 8-CPU Apple M4 virtual machine with macOS 26.5 and Rust 1.99.0:

@@ -893,6 +893,18 @@ impl LoadRelocations {
 }
 
 /// How `.eh_frame` and `.eh_frame_hdr` say an address is written (`DW_EH_PE_*`).
+/// What the link that writes the executable at `path` is told besides, so that an edit can
+/// be spliced into what it writes: the room Apple's linker leaves in a Mach-O header.
+pub(crate) fn room(path: &Path) -> Option<String> {
+    macho::room(path)
+}
+
+/// What the executable just linked at `path` is linked again with, where an edit could not
+/// be spliced into it for want of that room.
+pub(crate) fn short_of_room(path: &Path) -> Option<String> {
+    macho::short_of_room(path)
+}
+
 mod eh {
     pub(super) const ABSOLUTE: u8 = 0x00;
     pub(super) const UNSIGNED_4: u8 = 0x03;
