@@ -55,27 +55,22 @@ jobs:
         if: matrix.platform == 'linux-x64'
       - run: cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd
 
+  # Every harness under both backends at once, on one large machine per platform: see
+  # harness/ci.sh.
   harness:
-    name: harness (${{ matrix.platform }}, ${{ matrix.backend }}, ${{ matrix.part }})
+    name: harness (${{ matrix.platform }})
     if: ${{ !github.event.pull_request.draft }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        platform: [linux-x64, linux-arm64, macos-arm64, windows-x64]
-        backend: [cranelift, llvm]
-        part: [core, keys, store, model]
-        exclude:
-          # buildmodel.py builds for Linux targets.
-          - { platform: macos-arm64, part: model }
         include:
-          - { platform: linux-x64, runner: warp-ubuntu-latest-x64-8x }
-          - { platform: linux-arm64, runner: warp-ubuntu-latest-arm64-8x }
-          - { platform: macos-arm64, runner: warp-macos-latest-arm64-6x }
-          - { platform: windows-x64, runner: warp-windows-2025-x64-8x }
+          - { platform: linux-x64, runner: warp-ubuntu-latest-x64-32x }
+          - { platform: linux-arm64, runner: warp-ubuntu-latest-arm64-32x }
+          - { platform: macos-arm64, runner: warp-macos-latest-arm64-12x }
+          - { platform: windows-x64, runner: warp-windows-2025-x64-32x }
     env:
-      RUSTD_BACKEND: ${{ matrix.backend }}
       RUSTD_OPT: 2
       RUSTD_EMIT: fast
     steps:
@@ -108,7 +103,7 @@ jobs:
       # published, for both architectures; the runner's docker takes a file out of it without
       # root.
       - name: MinIO
-        if: runner.os == 'Linux' && matrix.part == 'core'
+        if: runner.os == 'Linux'
         run: |
           image=cgr.dev/chainguard/minio@sha256:c93745c56fccdaf0e5dcb88999a96a65a136428beb045ef5d546255a80d747a7
           mkdir -p "$HOME/s3tools"
@@ -117,31 +112,25 @@ jobs:
           docker rm "$container"
           "$HOME/s3tools/minio" --version
       - name: Harnesses
-        run: bash harness/ci.sh ${{ matrix.part }}
+        run: bash harness/ci.sh
 
-  # `cargo rustd` in place of cargo on projects as they are published: what the programs print
-  # and what every test says has to be what cargo gives. `small` is ripgrep, fd and hyperfine
-  # with the flags, the daemon's life and plain cargo; on Linux AArch64 the larger projects
-  # each have a machine of their own. Incremental compilation is left to the profile, as on a
-  # developer's machine.
+  # `cargo rustd` in place of cargo on projects as they are published, under both backends at
+  # once: what the programs print and what every test says has to be what cargo gives. `small`
+  # is ripgrep, fd and hyperfine with the flags, the daemon's life and plain cargo; Linux
+  # AArch64 builds the larger projects.
   projects:
-    name: projects (${{ matrix.target.platform }}, ${{ matrix.backend }}, ${{ matrix.target.projects }})
+    name: projects (${{ matrix.platform }})
     if: ${{ !github.event.pull_request.draft }}
-    runs-on: ${{ matrix.target.runner }}
-    timeout-minutes: 120
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        backend: [cranelift, llvm]
-        target:
-          - { platform: linux-x64, runner: warp-ubuntu-latest-x64-8x, projects: small, args: --small }
-          - { platform: macos-arm64, runner: warp-macos-latest-arm64-6x, projects: small, args: --small }
-          - { platform: linux-arm64, runner: warp-ubuntu-latest-arm64-8x, projects: ripgrep fd, args: ripgrep fd --only-projects }
-          - { platform: linux-arm64, runner: warp-ubuntu-latest-arm64-8x, projects: bat hyperfine, args: bat hyperfine --only-projects }
-          - { platform: linux-arm64, runner: warp-ubuntu-latest-arm64-8x, projects: just axum, args: just axum --only-projects }
-          - { platform: linux-arm64, runner: warp-ubuntu-latest-arm64-8x, projects: nushell, args: nushell --only-projects }
+        include:
+          - { platform: linux-x64, runner: warp-ubuntu-latest-x64-16x, groups: '"small"' }
+          - { platform: macos-arm64, runner: warp-macos-latest-arm64-12x, groups: '"small"' }
+          - { platform: linux-arm64, runner: warp-ubuntu-latest-arm64-32x, groups: '"ripgrep fd" "bat hyperfine" "just axum" "nushell"' }
     env:
-      RUSTD_BACKEND: ${{ matrix.backend }}
       RUSTD_OPT: 2
       RUSTD_EMIT: fast
     steps:
@@ -150,16 +139,10 @@ jobs:
           submodules: true
       - uses: ./.github/actions/rustd
       - name: cargo rustd against cargo
-        working-directory: harness
-        run: |
-          export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
-          status=0
-          env -u CARGO_INCREMENTAL python3 cargo_rustd.py ${{ matrix.target.args }} || status=$?
-          cat CARGO-RUSTD.md
-          exit $status
+        run: eval "bash harness/ci.sh projects ${{ matrix.groups }}"
       # The lints are rust-analyzer's whatever the backend or the platform, so they are checked once.
       - name: cargo rustd clippy against clippy
-        if: matrix.target.platform == 'linux-x64' && matrix.backend == 'cranelift'
+        if: matrix.platform == 'linux-x64'
         working-directory: harness
         run: rustup component add clippy --toolchain "$(cat toolchain)" && RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd" python3 clippy.py
 

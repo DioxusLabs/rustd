@@ -1,25 +1,97 @@
 #!/usr/bin/env bash
-# The harnesses CI runs, on every platform: `ci.sh PART` runs the ones of that part, under
-# the backend in RUSTD_BACKEND, and says at the end which failed. A harness that is not of a
-# platform says so here and is skipped there.
+# What CI runs, on every platform:
+#   ci.sh                   every harness part, under both backends, all at once
+#   ci.sh BACKEND PART      the harnesses of one part under one backend
+#   ci.sh projects GROUP... cargo_rustd.py on each group of projects, under both backends, all
+#                           at once: `small` is the CI's three with the flags, the daemon's
+#                           life and plain cargo, and another group is projects by name
+# Each lane run at once has a temporary directory, a daemon home and a cache of its own, and
+# its output is printed whole when it ends. A harness that is not of a platform is skipped
+# here, and this says why.
 set -u
 cd "$(dirname "$0")"
-want=${1:?usage: ci.sh core|keys|store|model}
 os=$(uname -s) arch=$(uname -m)
 case "$os" in
 MINGW* | MSYS*)
     os=Windows py=python
     RUSTD_BIN="$(cygpath -w "$(cd .. && pwd)")\\target\\release\\rustd.exe"
+    base=$(cygpath -m "${RUNNER_TEMP:-$TEMP}")/ci
     ;;
 *)
     py=python3
     RUSTD_BIN="$(cd .. && pwd)/target/release/rustd"
+    # Short: a socket's path is at most 104 bytes on macOS.
+    base=/tmp/ci-$$
     ;;
 esac
 export RUSTD_BIN
 linux() { [ "$os" = Linux ]; }
 macos() { [ "$os" = Darwin ]; }
+backends="cranelift llvm"
+# buildmodel.py builds for Linux targets.
+if macos; then parts="core keys store"; else parts="core keys store model"; fi
 
+names=() pids=()
+lane() {
+    local name=$1 dir="$base/${1// /-}"
+    shift
+    mkdir -p "$dir/tmp"
+    (
+        export TMPDIR="$dir/tmp" RUSTD_HOME="$dir/home" XDG_CACHE_HOME="$dir/cache" RUSTD_PROJECTS="$dir/projects" RUSTD_REPORTS="$dir"
+        start=$SECONDS
+        "$@" >"$dir/log" 2>&1
+        status=$?
+        echo "$status $((SECONDS - start))" >"$dir/end"
+        echo "ended: $name, exit $status after $(((SECONDS - start) / 60))m$(((SECONDS - start) % 60))s"
+        exit $status
+    ) &
+    names+=("$name") pids+=($!)
+}
+lanes() {
+    local failed= i
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" && continue
+        failed="$failed [${names[$i]}]"
+    done
+    for i in "${!names[@]}"; do
+        local dir="$base/${names[$i]// /-}"
+        echo "::group::${names[$i]}: exit $(cut -d' ' -f1 "$dir/end"), $(cut -d' ' -f2 "$dir/end")s"
+        # Groups do not nest.
+        sed -e 's/^::group::/== /' -e '/^::endgroup::$/d' "$dir/log"
+        echo "::endgroup::"
+    done
+    echo "failed:${failed:- none}"
+    [ -z "$failed" ] && rm -rf "$base"
+    test -z "$failed"
+}
+
+if [ $# = 0 ]; then
+    for backend in $backends; do
+        for part in $parts; do lane "$backend $part" bash ci.sh "$backend" "$part"; done
+    done
+    lanes
+    exit
+fi
+if [ "$1" = projects ]; then
+    shift
+    for backend in $backends; do
+        for group in "$@"; do lane "$backend $group" bash ci.sh project "$backend" "$group"; done
+    done
+    lanes
+    exit
+fi
+if [ "$1" = project ]; then
+    export RUSTD_BACKEND=$2
+    if [ "$3" = small ]; then args=--small; else args="$3 --only-projects"; fi
+    # Incremental compilation is left to the profile, as on a developer's machine.
+    env -u CARGO_INCREMENTAL "$py" cargo_rustd.py $args
+    status=$?
+    cat "${RUSTD_REPORTS:-.}"/CARGO-RUSTD*.md
+    exit $status
+fi
+
+export RUSTD_BACKEND=$1
+want=$2
 # Parts are by how long they take, about the same each: keys.py with the daemon under load,
 # buildmodel.py alone, the store's own, and the rest with the remote store.
 part() { case "$1" in keys.py | stress.py | selects.py) echo keys ;; buildmodel.py) echo model ;; store*) echo store ;; *) echo core ;; esac; }
@@ -27,7 +99,7 @@ failed=
 run() {
     [ "$(part "$1")" = "$want" ] || return 0
     echo "::group::$*"
-    "$py" "$@" || { failed="$failed [$*]"; echo "::error::$* failed"; }
+    "$py" "$@" || { failed="$failed [$*]"; echo "::error::$RUSTD_BACKEND $want: $* failed"; }
     echo "::endgroup::"
 }
 
