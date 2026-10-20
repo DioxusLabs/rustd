@@ -99,7 +99,7 @@ fi
 
 export RUSTD_BACKEND=$1
 want=$2
-# Parts are by how long they take, about the same each, the longest harness of each first.
+# Parts take about the same time each, by the times CI measured for each harness.
 part() {
     case "$1" in
     storekills.py | difftest.py | programs.py | storefull.py | fuzz/fuzz.py) echo store ;;
