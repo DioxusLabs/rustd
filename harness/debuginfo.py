@@ -795,13 +795,15 @@ def profiler(tally, what, binary, reference, cwd, crates):
     lost = [name for name, line in mine if not re.search(r"\.rs:\d+$|-cgu\.\d+:0$", line)]
     stacks, through = back_to_main(script)
     # A perf that unwinds none of rustc's build of the program back to main either is not saying
-    # anything of rustd's tables.
-    theirs = 0 if through else back_to_main(sampled(perf, reference, cwd) or "")[1]
+    # anything of rustd's tables, and nor is one that unwinds so few of its samples that as many
+    # of rustd's could all fail by chance: perf copies only so much of the stack.
+    theirs, back = ([], 0) if through else back_to_main(sampled(perf, reference, cwd) or "")
+    expected = back * len(stacks) / max(len(theirs), 1)
     verdict = ("NO SAMPLES" if not mine else "NO LINE" if lost else "named" if through
-               else "NOT UNWOUND" if theirs else "rustc's neither")
+               else "NOT UNWOUND" if expected >= 5 else "rustc's neither")
     tally.say(f"{what}: perf, unwinding by .eh_frame", verdict,
               f"{len(mine)} frames of rustd's functions in {len(stacks)} samples, {len(lost)} without a line, {through} samples back to main"
-              + ("" if through else f", {theirs} of rustc's build's")
+              + ("" if through else f", {back} of rustc's build's {len(theirs)}")
               + (f": {lost[0][:60]}" if lost else ""))
 
 
