@@ -1,17 +1,15 @@
 //! Running what was built, as cargo does: the program of `cargo run`, the test executables
 //! of `cargo test`.
 
-use std::{
-    path::Path,
-    process::{Command, ExitStatus},
-};
+use std::{path::Path, process::ExitStatus};
 
 use anyhow::Context as _;
 
 use super::{
     cli::Invocation,
     say,
-    state::{Kind, Program, State, as_built, cargo_path},
+    select::Selective,
+    state::{Kind, Program, State, as_staged, running},
 };
 
 /// The exit status of cargo when a test fails or a program can't be run.
@@ -26,16 +24,18 @@ pub(crate) fn program(
 ) -> anyhow::Result<Option<i32>> {
     let runnable = |it: &&Program| !it.test && matches!(it.kind, Kind::Bin | Kind::Example);
     let mut programs: Vec<&Program> = state.programs.iter().filter(runnable).collect();
-    if let Some(name) = asked.flags.bin.as_ref().or(asked.flags.example.as_ref()) {
-        programs.retain(|it| it.name == *name);
+    match asked.flags.bin.as_ref().or(asked.flags.example.as_ref()) {
+        Some(name) => programs.retain(|it| it.name == *name),
+        // As cargo picks: the bin the package runs by default, among the bins it built.
+        None => programs.retain(|it| it.default_run),
     }
     let &[program] = programs.as_slice() else { return Ok(None) };
     let shown = shown_path(&program.executable, cwd);
     let args = asked.program_args().map(|it| format!(" {it}")).collect::<String>();
     say::status(asked.flags.quiet, "Running", &format!("`{shown}{args}`"));
-    let mut command = Command::new(&program.executable);
+    let mut command = running(&state.runner, &program.executable);
     command.args(asked.program_args()).envs(program.env.iter().cloned());
-    as_built(&mut command)?;
+    as_staged(&mut command)?;
     let status = command.status().with_context(|| format!("could not execute {shown}"))?;
     Ok(Some(exit_code(status)))
 }
@@ -49,11 +49,17 @@ pub(crate) fn tests(asked: &Invocation, state: &State, cwd: &Path) -> anyhow::Re
         let unit = if matches!(test.kind, Kind::Test | Kind::Bench) { "" } else { "unittests " };
         let shown = shown_path(&test.executable, cwd);
         say::status(asked.flags.quiet, "Running", &format!("{unit}{} ({shown})", source.display()));
-        let mut command = Command::new(&test.executable);
-        command.args(asked.program_args()).envs(test.env.iter().cloned());
-        command.current_dir(&test.package_dir);
-        as_built(&mut command)?;
-        let status = command.status().with_context(|| format!("could not execute {shown}"))?;
+        let selective = Selective::of(asked, state, test);
+        let status = match selective.map(|it| it.run(asked)).transpose()?.flatten() {
+            Some(status) => status,
+            None => {
+                let mut command = running(&state.runner, &test.executable);
+                command.args(asked.program_args()).envs(test.env.iter().cloned());
+                command.current_dir(&test.package_dir);
+                as_staged(&mut command)?;
+                command.status().with_context(|| format!("could not execute {shown}"))?
+            }
+        };
         if !status.success() {
             failed.push(rerun_flags(test));
             if !asked.flags.no_fail_fast {
@@ -75,31 +81,40 @@ pub(crate) fn tests(asked: &Invocation, state: &State, cwd: &Path) -> anyhow::Re
     }
 }
 
-/// Runs the doc tests with cargo, which hands them to rustd in rustdoc's place: rustd
-/// builds each example as its own program over its code of the library.
-pub(crate) fn doc_tests(asked: &Invocation) -> anyhow::Result<i32> {
-    let mut args = vec!["--doc".to_owned()];
-    args.extend(asked.build_args.iter().cloned());
-    if asked.flags.no_fail_fast {
-        args.push("--no-fail-fast".to_owned());
+/// Runs the examples of the libraries whose doc tests cargo runs, a library after another,
+/// and stops at the first that fails unless told not to. The result is cargo's exit status.
+pub(crate) fn doc_tests(asked: &Invocation, state: &State) -> anyhow::Result<i32> {
+    let mut failed = Vec::new();
+    for why in &state.unrun_doc_tests {
+        say::error(why);
+        failed.push(None);
     }
-    args.extend(asked.positional.iter().cloned());
-    args.push("--".to_owned());
-    args.extend(asked.trailing.iter().cloned());
-    only_doc_tests(&args)
-}
-
-/// Runs `cargo test` with `args`, which ask for the doc tests alone, with rustd in
-/// rustdoc's place.
-pub(crate) fn only_doc_tests(args: &[String]) -> anyhow::Result<i32> {
-    let rustdoc = std::env::var_os("RUSTDOC").unwrap_or_else(|| "rustdoc".into());
-    let mut cargo = crate::doctest::as_asked(cargo_path());
-    cargo
-        .env("RUSTDOC", std::env::current_exe().context("finding rustd itself")?)
-        .env(crate::doctest::ENABLED, rustdoc);
-    cargo.arg("test").args(args);
-    as_built(&mut cargo)?;
-    Ok(exit_code(cargo.status().context("running `cargo test --doc`")?))
+    for library in state.programs.iter().filter(|it| it.kind == Kind::Doc) {
+        if !failed.is_empty() && !asked.flags.no_fail_fast {
+            break;
+        }
+        say::status(asked.flags.quiet, "Doc-tests", &library.name.replace('-', "_"));
+        let args: Vec<String> = asked.program_args().cloned().collect();
+        let code = crate::doctest::run(
+            &state.runner,
+            &library.executable,
+            &library.package_dir,
+            &library.env,
+            &state.root,
+            &args,
+        )?;
+        if code != 0 {
+            failed.push(Some(rerun_flags(library)));
+        }
+    }
+    match failed.as_slice() {
+        [] => Ok(0),
+        [Some(one)] => {
+            say::error(&format!("doctest failed, to rerun pass `{one}`"));
+            Ok(FAILED)
+        }
+        _ => Ok(FAILED),
+    }
 }
 
 /// The flags that have cargo run this test target alone.
@@ -110,6 +125,7 @@ fn rerun_flags(test: &Program) -> String {
         Kind::Example => format!("--example {}", test.name),
         Kind::Test => format!("--test {}", test.name),
         Kind::Bench => format!("--bench {}", test.name),
+        Kind::Doc => "--doc".to_owned(),
     };
     format!("-p {} {target}", test.package)
 }

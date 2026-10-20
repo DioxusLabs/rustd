@@ -72,13 +72,24 @@ impl Served {
     /// start together one listens and the other is told the socket is taken; a socket file
     /// that is there once the lock is held was left by a process that is gone.
     ///
-    /// The socket is made in a directory of its own that only the user can enter and is
-    /// moved to `socket` once only the user can connect to it: at no time is it somewhere
-    /// others reach with the mode the umask gave it, whatever directory `socket` is in.
+    /// In a directory only the user can enter, the socket is made in its place. Elsewhere it
+    /// is made in a directory of its own that only the user can enter and is moved to
+    /// `socket` once only the user can connect to it: at no time is it somewhere others
+    /// reach with the mode the umask gave it. That longer path can be past the length a
+    /// socket's path may have where `socket` itself is not.
     pub(crate) fn bind(socket: &Path) -> Result<Served, NotServed> {
         let lock = private_file(OpenOptions::new().write(true).create(true), &lock_of(socket))?;
         if lock.try_lock().is_err() {
             return Err(NotServed::Taken);
+        }
+        if socket.parent().is_some_and(|dir| dir.is_dir() && private_dir(dir).is_ok()) {
+            match std::fs::remove_file(socket) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
+                _ => {}
+            }
+            let listener = UnixListener::bind(socket)?;
+            only_the_user_connects(socket)?;
+            return Ok(Served::on(listener, lock));
         }
         let made_in = with_suffix(socket, ".new");
         match std::fs::remove_dir_all(&made_in) {
@@ -91,7 +102,11 @@ impl Served {
         only_the_user_connects(&made)?;
         std::fs::rename(&made, socket)?;
         std::fs::remove_dir(&made_in)?;
-        Ok(Served { listener, open: Arc::default(), most: MOST_CONNECTIONS, _lock: lock })
+        Ok(Served::on(listener, lock))
+    }
+
+    fn on(listener: UnixListener, lock: File) -> Served {
+        Served { listener, open: Arc::default(), most: MOST_CONNECTIONS, _lock: lock }
     }
 
     /// The connections made to the socket, one after another, each with its place among
@@ -391,6 +406,21 @@ mod tests {
         let file = dir.join("file");
         std::fs::write(&file, "").unwrap();
         assert_eq!(private_dir(&file).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_socket_as_long_as_one_can_be_is_served() {
+        let most =
+            std::mem::size_of_val(&unsafe { std::mem::zeroed::<libc::sockaddr_un>() }.sun_path) - 1;
+        let dir = scratch("long");
+        let deep = dir.join("d".repeat(most - dir.as_os_str().len() - "//sock".len()));
+        private_dir(&deep).unwrap();
+        let socket = deep.join("sock");
+        assert_eq!(socket.as_os_str().len(), most);
+        let served = Served::bind(&socket).unwrap();
+        let _client = UnixStream::connect(&socket).unwrap();
+        served.incoming().next().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

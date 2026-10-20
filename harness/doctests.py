@@ -5,8 +5,8 @@ the same tests must end the same way and print the same.
     RUSTD_BIN=../target/release/rustd python3 doctests.py [--few] [name-version ...]
 
 Each crate is unpacked by `vendor.sh` and built in a directory that is removed afterwards.
-A crate rustd leaves to rustdoc is counted as refused, with its reason; a difference is
-WRONG and fails the run. `--few` is the first three crates."""
+An example rustd does not build fails with rustd's reason, and its crate is counted as
+refused with that reason; any other difference is WRONG and fails the run. `--few` is the first three crates."""
 import os
 import re
 import subprocess
@@ -49,18 +49,19 @@ def row(spec):
 def judged(want, got):
     """What the two runs of a crate come to."""
     if want[:2] != got[:2]:
+        refused = [l for l in got[1] if REFUSED.search(l)]
+        if refused:
+            return "refused", refused[0][:300]
         lines = [f"cargo's `{w}`, rustd's `{g}`" for w, g in zip(want[1], got[1]) if w != g]
         return "WRONG", (lines[0] if lines else f"cargo's ends with {want[0]}, rustd's with {got[0]}")[:300]
-    left = re.search(r"rustd: the doctests are left to rustdoc: (.*)", got[2])
-    if left:
-        return "refused", left.group(1)
-    built = re.findall(r"doctests: compiled (\d+) of (\d+) fns", got[2])
-    if not built:
-        return "WRONG", "rustd did not say what it built for the doctests"
     tests = sum(l.startswith("test ") and not l.startswith("test result") for l in want[1])
     if not tests:
         return "WRONG", f"cargo ran no doctest: {want[2].strip()[-200:]}"
-    return "same", f"{tests} doctests, {sum(int(n) for n, _ in built)} of {sum(int(n) for _, n in built)} functions of the library from rustd"
+    return "same", f"{tests} doctests"
+
+
+# What rustd says of an example it does not build.
+REFUSED = re.compile(r"which only a program of its own can have|rustd found no error|rustd does not run|rustd builds the examples of a library in its edition")
 
 
 def main():

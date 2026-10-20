@@ -28,6 +28,9 @@ pub(crate) struct Selection {
     pub(crate) packages: Vec<String>,
     /// Whether every member of the workspace is built.
     pub(crate) workspace: bool,
+    /// The members `--exclude` leaves out of `--workspace`.
+    #[serde(default)]
+    pub(crate) excludes: Vec<String>,
     /// The triple built for, when it is not the host.
     pub(crate) target: Option<String>,
     /// Whether tests, examples and benchmarks are built, and so what they depend on.
@@ -43,6 +46,7 @@ impl Default for Selection {
             all_features: false,
             packages: Vec::new(),
             workspace: false,
+            excludes: Vec::new(),
             target: None,
             dev_deps: false,
         }
@@ -71,6 +75,9 @@ impl Selection {
         }
         if self.workspace {
             flags.push("--workspace".to_owned());
+        }
+        for package in &self.excludes {
+            flags.extend(["--exclude".to_owned(), package.clone()]);
         }
         flags
     }

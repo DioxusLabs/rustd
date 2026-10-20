@@ -4,5 +4,6 @@
   "crates": [
     "app"
   ],
-  "doctests": true
+  "doctests": true,
+  "expect": "refused"
 }

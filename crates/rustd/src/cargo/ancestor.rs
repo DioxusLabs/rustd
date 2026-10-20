@@ -6,11 +6,12 @@ use std::{ffi::OsString, path::PathBuf};
 
 /// A cargo that is running, as the system describes it.
 pub(crate) struct Cargo {
-    pub(crate) pid: u32,
     pub(crate) executable: PathBuf,
     /// Its arguments, without its own name.
     pub(crate) args: Vec<String>,
+    #[cfg_attr(not(test), expect(dead_code, reason = "only the tests read it"))]
     pub(crate) cwd: PathBuf,
+    #[cfg_attr(not(test), expect(dead_code, reason = "only the tests read it"))]
     pub(crate) env: Vec<(OsString, OsString)>,
 }
 
@@ -77,7 +78,6 @@ mod system {
             Some((OsString::from_vec(name), OsString::from_vec(value)))
         });
         Some(Cargo {
-            pid,
             executable: std::fs::read_link(of(pid, "exe")).ok()?,
             args: args.map(|it| it.into_string().ok()).collect::<Option<_>>()?,
             cwd: std::fs::read_link(of(pid, "cwd")).ok()?,
@@ -178,7 +178,6 @@ mod system {
         });
         let dirs: libc::proc_vnodepathinfo = info(pid, libc::PROC_PIDVNODEPATHINFO)?;
         Some(Cargo {
-            pid,
             executable: executable(pid)?,
             args: args
                 .into_iter()
@@ -191,8 +190,8 @@ mod system {
     }
 }
 
-/// Elsewhere the command line of another process is not read yet, and every build under
-/// plain cargo is rustc's.
+/// Elsewhere the command line of another process is not read yet, and plain cargo fails
+/// at the first crate of a workspace.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod system {
     use super::Cargo;

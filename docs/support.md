@@ -27,7 +27,7 @@ to stable; those are marked where they are used.
 | Full link | yes (1) | yes (1) | yes (1) | yes (1) | yes, older branch (2) |
 | Splice | yes (3) | yes (3) | yes (4) | yes, with a limit (5) | yes, older branch (2) |
 | Debug info | yes (6) | yes (6) | lines only (7) | unverified (7) | no |
-| `cargo rustd` | yes (8) | unverified (9) | no: goes to cargo (9) | no: goes to cargo (9) | no |
+| `cargo rustd` | yes (8) | unverified (9) | no: fails the build (9) | no: fails the build (9) | no |
 | Disk store | yes (10) | yes (10) | yes (10) | yes (10) | unverified |
 | Remote store | yes, not real AWS (11) | unverified | unverified | unverified | unverified |
 | Fuzzed | yes (12) | no | no | no | no |
@@ -178,31 +178,31 @@ native AArch64, where four rows that need an x86-64 host are not run (CI on `513
 [reports/BUILDMODEL.md](reports/BUILDMODEL.md) has the table at 97 cases per backend, of
 which 92 were supported and 5 refused.
 
-`cargo rustd` is narrower. It serves the dev and test profiles and hands the rest to
-cargo, as [cargo.md](cargo.md) lists.
+`cargo rustd` is narrower. What it does not build fails the build with the reason, as
+[cargo.md](cargo.md) lists; nothing of the workspace is handed to cargo.
 
 | Feature | Daemon (`buildmodel.py`) | `cargo rustd` |
 |---|---|---|
 | dev and test profiles | supported | served |
-| release and custom profiles, `opt-level`, `debug-assertions`, `overflow-checks`, `codegen-units`, `strip`, per-package overrides | supported | handed to cargo for `--release` and `--profile`; unverified for profile settings changed in the manifest |
+| release and custom profiles, `opt-level`, `debug-assertions`, `overflow-checks`, `codegen-units`, `strip`, per-package overrides | supported | unverified |
 | `panic = "abort"` | supported | unverified |
-| `lto = true`, `lto = "thin"` | refused: rustc recompiles the whole program at link time and leaves no library to link rustd's functions against | cargo |
+| `lto = true`, `lto = "thin"` | refused: rustc recompiles the whole program at link time and leaves no library to link rustd's functions against | fails the build |
 | `lto = "off"` | supported | unverified |
 | crate types `bin`, `lib`, `rlib`, `dylib`, `cdylib`, `staticlib` | supported | programs only; a `cdylib` or `staticlib` that is not linked into an executable has nothing to splice into |
-| proc macros (attribute, derive, function-like) | supported: rustc's build of the macro is loaded and its expansion is compiled by rustd | served; an edit to the proc-macro crate itself is cargo's |
-| build scripts (`rerun-if-changed`, `rerun-if-env-changed`, `rustc-cfg`, `rustc-env`, `rustc-link-lib`, `OUT_DIR`, `links`) | supported | served; a change to a script or its inputs is cargo's, then the daemon reloads |
-| unit tests, integration tests, examples, benches | supported | served; adding or removing a `#[test]` is cargo's |
-| doctests | supported through `cargo rustd test --doc` (`doctests.py`, 30 crates); documentation behind `cfg(doc)` is not seen | served; an example rustd cannot build is left to rustdoc with the reason |
-| features, optional and weak dependencies, feature unification under resolvers 1, 2 and 3 | supported | `--features` served; `--all-features` and `--no-default-features` handed to cargo |
+| proc macros (attribute, derive, function-like) | supported: rustc's build of the macro is loaded and its expansion is compiled by rustd | served; the proc-macro crate itself is rustc's, and an edit to it has cargo rebuild it before the daemon reloads |
+| build scripts (`rerun-if-changed`, `rerun-if-env-changed`, `rustc-cfg`, `rustc-env`, `rustc-link-lib`, `OUT_DIR`, `links`) | supported | served; the script is rustc's, and a change to it or its inputs has cargo run it again before the daemon reloads |
+| unit tests, integration tests, examples, benches | supported | examples served; tests and benches fail the build (`--doc` aside) |
+| doctests | supported through `cargo rustd test --doc` and `cargo rustd test` | served: the examples of a library are one crate of the daemon's; an example that needs a crate of its own, a `compile_fail` one rust-analyzer finds no error in, and the examples of a proc macro fail with the reason |
+| features, optional and weak dependencies, feature unification under resolvers 1, 2 and 3 | supported | `--features` served; `--all-features` and `--no-default-features` unverified |
 | path, git, registry, renamed, vendored, `[patch]` and `[replace]` dependencies | supported | served |
-| an edit to a path dependency the daemon was not asked to build | refused with a reason | cargo |
-| `RUSTFLAGS` and `[build] rustflags`, including `-C target-cpu` and `target-feature` | supported | handed to cargo when set in the environment; unverified in configuration |
+| an edit to a path dependency the daemon was not asked to build | refused with a reason | fails the build |
+| `RUSTFLAGS` and `[build] rustflags`, including `-C target-cpu` and `target-feature` | supported | unverified |
 | `.cargo/config.toml` `[env]`, `linker`, `runner` | supported | unverified |
-| `env!` and `option_env!` | supported, and followed when the variable changes | served; a changed variable that rustc reported reading sends the build to cargo |
+| `env!` and `option_env!` | supported, and followed when the variable changes | served; a changed variable that rustc reported reading has cargo run again for the dependencies, and the daemon reloads |
 | mixed editions 2015 to 2024 | supported | served |
 | `#![no_std]`, `#![no_main]` | supported | unverified |
-| cross compilation to `aarch64-unknown-linux-gnu` and `x86_64-unknown-linux-musl` from Linux x86-64 | supported | unverified; a target that is not ELF is handed to cargo |
-| manifest, lock file or workspace membership changing under a running daemon (`git checkout` between commits) | supported | cargo builds, then the daemon reloads |
+| cross compilation to `aarch64-unknown-linux-gnu` and `x86_64-unknown-linux-musl` from Linux x86-64 | supported | unverified; a target that is not ELF or Mach-O fails the build |
+| manifest, lock file or workspace membership changing under a running daemon (`git checkout` between commits) | supported | cargo builds the dependencies, then the daemon reloads |
 
 "Supported" for a release profile means the program printed the same as cargo's. It does
 not mean the code is as fast: rustd's code is not optimised across functions under either

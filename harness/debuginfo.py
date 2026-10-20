@@ -111,6 +111,7 @@ LOCALS = [("width", "10"), ("scale", "2.5"), ("name", '"abc"'), ("point", "sline
           ("pair", "sline::Pair (7, 1.5)"), ("list", "[1, 2, 3]"), ("tuple", "(true, 99 'c', 9)"), ("sum", "31"),
           ("*borrowed", "sline::Point {x: 3, y: -4}")]
 OPTIMIZED_OUT = "<optimized out>"
+PRINTER_OPTIMIZED_OUT = "Python Exception <class 'gdb.error'>: value has been optimized out"
 
 TYPES_MAIN = """#[derive(Clone, Copy)]
 struct Point { x: i32, y: i64 }
@@ -760,29 +761,47 @@ def frames_agree(ours, ends, bare, lined):
     return verdict, f"{len(ours)} functions, {without} without an entry, {beyond} that end before theirs, {filled} filled past theirs, {len(bare) - without} of assembly alone"
 
 
-def profiler(tally, what, binary, cwd, crates):
+def sampled(perf, binary, cwd):
+    """What `perf script` makes of `binary` sampled with its stacks unwound by `.eh_frame`, or
+    None where this machine does not let this user profile."""
+    data = os.path.join(tempfile.mkdtemp(prefix="rustd-debuginfo-perf-"), "perf.data")
+    record = subprocess.run([perf, "record", "-o", data, "-F", "5000", "--call-graph", "dwarf", binary],
+                            cwd=cwd, capture_output=True, text=True)
+    if record.returncode != 0 or not os.path.exists(data):
+        return None
+    return subprocess.run([perf, "script", "-i", data, "-F", "ip,sym,srcline"], capture_output=True, text=True).stdout
+
+
+def back_to_main(script):
+    """The samples of `script`, and how many of them were unwound back to `main`."""
+    stacks = [stack for stack in script.split("\n\n") if stack.strip()]
+    return stacks, sum(bool(re.search(r"4main\b|::main\b", stack)) for stack in stacks)
+
+
+def profiler(tally, what, binary, reference, cwd, crates):
     """Whether perf, unwinding by `.eh_frame`, names the functions of `crates` and their lines."""
     if WINDOWS:
         return tally.say(f"{what}: perf", "not run", "perf is of Linux")
     perf = shutil.which("perf")
-    data = os.path.join(tempfile.mkdtemp(prefix="rustd-debuginfo-perf-"), "perf.data")
-    record = perf and subprocess.run([perf, "record", "-o", data, "-F", "5000", "--call-graph", "dwarf", binary],
-                                     cwd=cwd, capture_output=True, text=True)
-    if not perf or record.returncode != 0 or not os.path.exists(data):
+    script = perf and sampled(perf, binary, cwd)
+    if not script:
         # Not a verdict on the binary: the machine does not let this user profile.
         tally.say(f"{what}: perf", "not run", "no perf here, or it may not sample: see kernel.perf_event_paranoid")
         return
-    script = subprocess.run([perf, "script", "-i", data, "-F", "ip,sym,srcline"], capture_output=True, text=True).stdout
     frames = re.findall(r"^\s+[0-9a-f]+ (\S+)\n\s+(\S+)$", script, re.M)
     mine = [(name, line) for name, line in frames if any(f"{len(c)}{c}" in name or f"{c}::" in name for c in crates)]
     # A line 0 of one of rustc's codegen units is rustc saying of its own code that it has no
     # line: the crate's functions that were left to rustc are not what is asked about here.
     lost = [name for name, line in mine if not re.search(r"\.rs:\d+$|-cgu\.\d+:0$", line)]
-    stacks = [stack for stack in script.split("\n\n") if stack.strip()]
-    through = sum(bool(re.search(r"4main\b|::main\b", stack)) for stack in stacks)
-    verdict = "NO SAMPLES" if not mine else "NO LINE" if lost else "NOT UNWOUND" if not through else "named"
+    stacks, through = back_to_main(script)
+    # A perf that unwinds none of rustc's build of the program back to main either is not saying
+    # anything of rustd's tables.
+    theirs = 0 if through else back_to_main(sampled(perf, reference, cwd) or "")[1]
+    verdict = ("NO SAMPLES" if not mine else "NO LINE" if lost else "named" if through
+               else "NOT UNWOUND" if theirs else "rustc's neither")
     tally.say(f"{what}: perf, unwinding by .eh_frame", verdict,
               f"{len(mine)} frames of rustd's functions in {len(stacks)} samples, {len(lost)} without a line, {through} samples back to main"
+              + ("" if through else f", {theirs} of rustc's build's")
               + (f": {lost[0][:60]}" if lost else ""))
 
 
@@ -911,7 +930,7 @@ def program(tally, what, workspace, crates, package, inject=None):
     functions, count = described(fx.binary)
     tally.say(f"{what}: what a debugger is told of", "counted", f"{functions} functions, {count} parameters and locals in them")
     if not inject:
-        profiler(tally, what, fx.binary, fx.ws, crates + [package])
+        profiler(tally, what, fx.binary, fx.reference, fx.ws, crates + [package])
     return fx
 
 
@@ -1059,10 +1078,16 @@ def printed_by(debugger, binary, cwd, place, names):
     """What a debugger prints for each of the names when stopped at a place, addresses aside."""
     commands = ["set pagination off", "set startup-with-shell off", f"break {place}", "run",
                 *[x for name in names for x in (f"echo <{name}>\\n", f"print {name}")], "kill"]
+    # A pretty-printer that finds part of the value optimized out says so on stderr, after
+    # what it printed of the rest, so the two are read together.
     ran = subprocess.run([debugger, "-q", "-batch", *[x for c in commands for x in ("-ex", c)], binary],
-                         capture_output=True, text=True, errors="replace", cwd=cwd, timeout=300)
-    found = {name: re.search(rf"<{re.escape(name)}>\n\$\d+ = (.*)", ran.stdout) for name in names}
-    return {name: re.sub(r"0x[0-9a-f]+", "0x..", it.group(1)) if it else None for name, it in found.items()}
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", cwd=cwd, timeout=300)
+    # gdb's warnings are whole lines of stderr that can land in the middle of a printed value.
+    out = re.sub(r"warning: [^\n]*\n", "", ran.stdout)
+    found = {name: re.search(rf"<{re.escape(name)}>\n\$\d+ = (.*)", out) for name in names}
+    printed = {name: re.sub(r"0x[0-9a-f]+", "0x..", it.group(1)) if it else None for name, it in found.items()}
+    return {name: f"{it.split(PRINTER_OPTIMIZED_OUT)[0]}{OPTIMIZED_OUT}" if it and PRINTER_OPTIMIZED_OUT in it else it
+            for name, it in printed.items()}
 
 
 def kept_by_rustc(ws, asked):

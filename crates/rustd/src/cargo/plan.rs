@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
 use super::{package, units::Record};
@@ -15,6 +16,10 @@ const FIRST_DEFINITION_STAYS: &str = "-Wl,--allow-multiple-definition";
 
 /// What Apple's linker is told so that a splice has room in the header for its two segments.
 const ROOM_FOR_SEGMENTS: &str = "-Wl,-headerpad,0x200";
+
+/// And for the tables of the unwinder to grow into, where the loader looks for them.
+const ROOM_FOR_TABLES: &str = "-Wl,-sectcreate,__TEXT,__rustd_room,";
+const ROOM_FOR_TABLES_LEN: usize = 0x10000;
 
 /// The same for `link.exe`, which warns of every name it does so for unless told not to.
 const FIRST_DEFINITION_STAYS_MSVC: [&str; 2] = ["/FORCE:MULTIPLE", "/IGNORE:4006"];
@@ -54,12 +59,6 @@ pub(crate) struct Plan {
     /// The command that links `binary`, for a shell.
     pub(crate) link_cmd: String,
     pub(crate) symbol_files: Vec<PathBuf>,
-    /// Whether the program's own crate is compiled with `cfg(test)` and is not a test target:
-    /// the unit tests of a library or a binary.
-    pub(crate) unit_test: bool,
-    /// Source rustc compiled into the program that rustd does not: a change to one of these
-    /// is cargo's to build.
-    pub(crate) left_to_rustc: Vec<PathBuf>,
     /// The copies of rustc's output the plan names, which have to stay.
     pub(crate) copies: Vec<PathBuf>,
     /// The package rustc wrote of what a debugger reads of the program it linked, when the
@@ -68,6 +67,102 @@ pub(crate) struct Plan {
     pub(crate) package: Option<PathBuf>,
     /// The newest record the plan was made from.
     pub(crate) stamp: u128,
+}
+
+/// The harness of a test executable, which the daemon writes from the tests it finds and
+/// rustc compiles. It is glue alone: each test it has calls the daemon's code of that test.
+/// It is kept beside the object of the program, where the daemon looks for it.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Harness {
+    rustc: PathBuf,
+    cwd: PathBuf,
+    args: Vec<String>,
+    source: PathBuf,
+    object: PathBuf,
+}
+
+/// The codegen flags of the test executable that the harness is compiled with too.
+const OF_HARNESS: [&str; 8] = [
+    "opt-level",
+    "debuginfo",
+    "panic",
+    "overflow-checks",
+    "debug-assertions",
+    "target-cpu",
+    "target-feature",
+    "relocation-model",
+];
+
+impl Harness {
+    fn beside(object: &Path) -> PathBuf {
+        object.with_file_name("harness.json")
+    }
+
+    /// The harness of the program whose object is `object`, when it is a test executable.
+    pub(crate) fn of(object: &Path) -> anyhow::Result<Option<Harness>> {
+        let path = Harness::beside(object);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let text = std::fs::read_to_string(&path)?;
+        Ok(Some(serde_json::from_str(&text).with_context(|| format!("{}", path.display()))?))
+    }
+
+    /// Plans the harness of the test executable rustc was asked for by `unit`, with its
+    /// files in `dir`: libtest's when `test`, and otherwise a program's own `main`.
+    fn plan(unit: &Record, dir: &Path, test: bool) -> Harness {
+        let mut args = vec!["--cap-lints=allow".to_owned()];
+        if test {
+            args.push("--test".to_owned());
+        }
+        let mut given = unit.args.iter();
+        while let Some(arg) = given.next() {
+            match arg.as_str() {
+                "--crate-name" | "--edition" | "--target" | "--sysroot" => {
+                    args.push(arg.clone());
+                    args.extend(given.next().cloned());
+                }
+                "-C" => {
+                    let Some(value) = given.next() else { break };
+                    let name = value.split_once('=').map_or(&**value, |it| it.0);
+                    if OF_HARNESS.contains(&name) {
+                        args.extend(["-C".to_owned(), value.clone()]);
+                    }
+                }
+                _ if arg.starts_with("--edition=") || arg.starts_with("--target=") => {
+                    args.push(arg.clone())
+                }
+                _ => {}
+            }
+        }
+        let (source, object) = (dir.join("harness.rs"), dir.join("harness.o"));
+        args.extend(["--emit=obj", "-Ccodegen-units=1", "-o"].map(str::to_owned));
+        args.push(object.display().to_string());
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()).into();
+        Harness { rustc, cwd: unit.cwd.clone(), args, source, object }
+    }
+
+    /// Has the harness be `text`. `true` when it was another.
+    pub(crate) fn write(&self, text: &str) -> anyhow::Result<bool> {
+        if self.object.exists() && std::fs::read_to_string(&self.source).is_ok_and(|it| it == text)
+        {
+            return Ok(false);
+        }
+        std::fs::write(&self.source, text)?;
+        let compiled = std::process::Command::new(&self.rustc)
+            .current_dir(&self.cwd)
+            .args(&self.args)
+            .arg(&self.source)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .with_context(|| format!("running {}", self.rustc.display()))?;
+        anyhow::ensure!(
+            compiled.status.success(),
+            "the harness of the tests does not build: {}",
+            String::from_utf8_lossy(&compiled.stderr).trim_end()
+        );
+        Ok(true)
+    }
 }
 
 /// The library of the workspace among `records` that wrote the file a link line names. The
@@ -83,12 +178,14 @@ fn member_that_wrote<'a>(records: &'a [Record], file: &Path) -> Option<&'a Recor
 
 impl Plan {
     /// Plans the program `unit` built, with the daemon's files for it in `dir`. `records` are
-    /// the units of the workspace. `Err` is why the program is left to cargo.
+    /// the units of the workspace. With `examples`, the root of the crate of the examples of
+    /// the library `unit` tests, the program is the examples', linked as the unit tests are.
+    /// `Err` is why the program is left to cargo.
     pub(crate) fn of(
         unit: &Record,
         records: &[Record],
         dir: &Path,
-        unit_test: bool,
+        examples: Option<&Path>,
     ) -> anyhow::Result<Result<Plan, String>> {
         if let Some(why) = unsupported(unit) {
             return Ok(Err(why));
@@ -107,8 +204,6 @@ impl Plan {
             binary: dir.join("bin"),
             link_cmd: String::new(),
             symbol_files: Vec::new(),
-            unit_test,
-            left_to_rustc: Vec::new(),
             copies: Vec::new(),
             package: (unit.codegen("split-debuginfo") == Some("packed"))
                 .then(|| link.output().map(|it| package::beside(Path::new(it))))
@@ -130,44 +225,32 @@ impl Plan {
             plan.copies.push(copy.to_owned());
             plan.stamp = plan.stamp.max(owner.stamp);
             *arg = copy.display().to_string();
-            if member.is_none() {
-                continue;
-            }
-            // With `cfg(test)` the daemon has it on every crate of the workspace, and rustc
-            // built the libraries of a unit test without it.
-            if unit_test {
-                plan.left_to_rustc.extend(owner.inputs().files);
-            } else {
+            if member.is_some() {
                 plan.crates.push(owner.source.clone());
             }
+        }
+        // The library the examples are of is linked as built, and its tests may link it too.
+        if let Some(examples) = examples {
+            plan.crates.insert(0, examples.to_owned());
+            let mut seen = FxHashSet::default();
+            plan.crates.retain(|it| seen.insert(it.clone()));
         }
         plan.symbol_files = link.rustc_files();
         std::fs::create_dir_all(dir)?;
         link.give_way(&plan.copies)?;
-        plan.link_cmd =
-            link.command(&[&plan.patch, &plan.object], &plan.binary, &dir.join("link.args"))?;
+        let mut ahead = vec![&*plan.patch, &*plan.object];
+        // The tests of an integration test are the daemon's, and so is the harness that runs
+        // them: its `main` comes ahead of the one rustc wrote for none.
+        let harness = unit.is_test().then(|| Harness::plan(unit, dir, examples.is_none()));
+        let beside = Harness::beside(&plan.object);
+        match &harness {
+            Some(harness) => std::fs::write(&beside, serde_json::to_string(harness)?)?,
+            None => _ = std::fs::remove_file(&beside),
+        }
+        ahead.extend(harness.as_ref().map(|it| &*it.object));
+        plan.link_cmd = link.command(&ahead, &plan.binary, &dir.join("link.args"))?;
         Ok(Ok(plan))
     }
-}
-
-/// Why the tests of `unit` are only right as rustc built them, if they are. rustc's
-/// harness stays in a test executable and calls the tests and their helpers, so each has
-/// to be a symbol the daemon's copy can take the place of, called the way the source says.
-fn harness_alone(unit: &Record) -> Option<String> {
-    let name = &unit.crate_name;
-    if unit.codegen("incremental").is_none() {
-        return Some(format!(
-            "the tests of `{name}` are built without incremental compilation, where rustc \
-             keeps them private to its object"
-        ));
-    }
-    let level = unit.codegen("opt-level").unwrap_or("0");
-    (level != "0").then(|| {
-        format!(
-            "the tests of `{name}` are built with opt-level {level}, where rustc inlines \
-             them into its harness and changes how it calls their helpers"
-        )
-    })
 }
 
 /// Why rustd has no part in a crate that was compiled with these flags, when it has none.
@@ -186,9 +269,6 @@ fn unsupported(unit: &Record) -> Option<String> {
     }
     if unit.args.iter().any(|it| it.starts_with("-Z")) {
         return Some(format!("`{name}` is built with unstable flags"));
-    }
-    if unit.is_test() {
-        return harness_alone(unit);
     }
     None
 }
@@ -245,8 +325,9 @@ impl LinkLine {
             .collect();
         let args: Vec<String> = words[first + 1..]
             .iter()
-            // It exports what a dynamic library would, and is gone with rustc's directory.
-            .filter(|it| !it.ends_with("symbols.o"))
+            // The record keeps a copy of it, and the plan names that; one gone with rustc's
+            // directory and not kept, as an older record has it, can't be linked.
+            .filter(|it| !it.ends_with("symbols.o") || Path::new(it).exists())
             .cloned()
             .collect();
         let flavor = Flavor::of(&args)?;
@@ -272,11 +353,6 @@ impl LinkLine {
     fn output(&self) -> Option<&str> {
         let at = self.args.iter().position(|it| it == "-o")?;
         self.args.get(at + 1).map(|it| &**it)
-    }
-
-    /// Whether `file` is one of what is linked.
-    pub(crate) fn has(&self, file: &str) -> bool {
-        self.args.iter().any(|it| it == file)
     }
 
     /// What rustc built that is linked, and the standard library's crates next to it.
@@ -332,15 +408,19 @@ impl LinkLine {
         binary: &Path,
         response: &Path,
     ) -> anyhow::Result<String> {
-        let flag = match self.flavor {
-            Flavor::Apple => ROOM_FOR_SEGMENTS,
-            _ => FIRST_DEFINITION_STAYS,
+        let flags = match self.flavor {
+            Flavor::Apple => {
+                let room = response.with_file_name("rustd.room");
+                std::fs::write(&room, vec![0; ROOM_FOR_TABLES_LEN])?;
+                vec![ROOM_FOR_SEGMENTS.to_owned(), format!("{ROOM_FOR_TABLES}{}", room.display())]
+            }
+            _ => vec![FIRST_DEFINITION_STAYS.to_owned()],
         };
-        self.args.splice(first..first, ours.into_iter().chain([flag.to_owned()]));
+        self.args.splice(first..first, ours.into_iter().chain(flags));
         let output =
             self.args.iter().position(|it| it == "-o").context("the link names no output")?;
         *self.args.get_mut(output + 1).context("the link names no output")? =
-            binary.display().to_string();
+            linking(binary).display().to_string();
         let quoted: Vec<String> = self
             .args
             .iter()
@@ -392,6 +472,15 @@ impl LinkLine {
         std::fs::write(response, quoted.join("\n"))?;
         Ok(format!("\"{}\" \"@{}\"", self.linker, response.display()))
     }
+}
+
+/// Where the linker writes the executable at `binary`, which takes its place once it is
+/// whole: the linker writes its output in place, and a client that runs, or links to, the
+/// executable while another build links it would have half a file, not yet executable.
+pub(crate) fn linking(binary: &Path) -> PathBuf {
+    let mut linking = binary.as_os_str().to_owned();
+    linking.push(".linking");
+    PathBuf::from(linking)
 }
 
 /// The directories `link.exe` finds the libraries of the compiler and of the system in.
@@ -461,14 +550,8 @@ mod tests {
     }
 
     #[test]
-    fn tests_the_harness_reaches_by_symbol_only() {
-        let incremental = "incremental=/t/debug/incremental";
-        assert_eq!(unsupported(&unit(&["--test", "-C", incremental])), None);
-        assert_eq!(unsupported(&unit(&["--test", "-C", incremental, "-C", "opt-level=0"])), None);
-        let private = unsupported(&unit(&["--test"]));
-        assert!(private.is_some_and(|why| why.contains("without incremental")));
-        let inlined = unsupported(&unit(&["--test", "-C", incremental, "-C", "opt-level=2"]));
-        assert!(inlined.is_some_and(|why| why.contains("opt-level 2")));
+    fn tests_are_built_whatever_rustc_would_have_inlined() {
+        assert_eq!(unsupported(&unit(&["--test"])), None);
         assert_eq!(unsupported(&unit(&["-C", "opt-level=3"])), None);
     }
 
@@ -530,12 +613,13 @@ mod tests {
             [
                 "/p/rustd.o",
                 ROOM_FOR_SEGMENTS,
+                &format!("{ROOM_FOR_TABLES}{}", dir.join("rustd.room").display()),
                 &weak.display().to_string(),
                 "/t/libstd-3.rlib",
                 "-arch",
                 "arm64",
                 "-o",
-                "/p/bin"
+                "/p/bin.linking"
             ]
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -553,8 +637,6 @@ mod tests {
             binary: PathBuf::from("P:/bin"),
             link_cmd: String::new(),
             symbol_files: Vec::new(),
-            unit_test: false,
-            left_to_rustc: Vec::new(),
             copies: Vec::new(),
             stamp: 0,
             package: None,
@@ -601,8 +683,6 @@ mod tests {
             binary: PathBuf::from("/p/bin"),
             link_cmd: String::new(),
             symbol_files: Vec::new(),
-            unit_test: false,
-            left_to_rustc: Vec::new(),
             copies: Vec::new(),
             package: None,
             stamp: 0,
@@ -630,7 +710,7 @@ mod tests {
                 "-Wl,-Bstatic",
                 "/t/deps/libb-2.rlib",
                 "-o",
-                "/p/bin",
+                "/p/bin.linking",
                 "-pie"
             ]
         );

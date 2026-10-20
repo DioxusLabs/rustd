@@ -32,7 +32,7 @@ use super::{
 
 /// What a compiled function or static was when the base took it in.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Mark {
+pub(super) struct Mark {
     serial: u128,
     /// The source locations it reports, which stitching fills in.
     locations: u64,
@@ -41,7 +41,7 @@ struct Mark {
 }
 
 impl Mark {
-    fn new(db: &dyn HirDatabase, serial: u128, requests: &Requests) -> Mark {
+    pub(super) fn new(db: &dyn HirDatabase, serial: u128, requests: &Requests) -> Mark {
         let mut hasher = rustc_hash::FxHasher::default();
         for request in &requests.datas {
             match request {
@@ -53,6 +53,11 @@ impl Mark {
             }
         }
         Mark { serial, locations: hasher.finish(), lines: 0 }
+    }
+
+    /// What a running program can tell of it.
+    pub(super) fn seen(&self) -> (u128, u64) {
+        (self.serial, self.locations)
     }
 
     /// The mark of a function, whose code is a patch's to describe again when `debug` is set

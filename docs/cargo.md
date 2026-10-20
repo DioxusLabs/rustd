@@ -27,94 +27,97 @@ The project you build must use Rust 1.99.0, the toolchain rustd is pinned to. Us
     cargo rustd run   [cargo's flags] [-- program arguments]
     cargo rustd test  [cargo's flags] [test names] [-- test arguments]
     cargo rustd check [cargo's flags]
+    cargo rustd clippy [cargo's flags] [-- -D warnings ...]
     cargo rustd status
     cargo rustd stop
 
 `build`, `run` and `test` take the flags cargo takes and leave the same files in the same
 places under `target/`. `check` is `cargo check` and nothing else: rustd has no diagnostics
 of its own. `status` prints what the daemon holds, and for every workspace how many builds
-the daemon served and how many went to cargo, with the reasons. `stop` ends the daemon. Any
-other subcommand is passed to cargo as typed.
+the daemon served and how many went to cargo, which through `cargo rustd` is none. `stop` ends the daemon. Any other subcommand is passed to cargo as typed.
 
 ## What a build does
 
-The first build of a workspace is cargo's own, run with rustd as the
-`RUSTC_WORKSPACE_WRAPPER`. The wrapper runs rustc exactly as cargo asked and records, for
-each crate of the workspace, the arguments, the files rustc wrote and, for a program, the
-line the linker was run with. Diagnostics, progress and the exit status are cargo's.
+The crates of the workspace are compiled by rustd, in the first build and in every build
+after it. rustc compiles what the workspace depends on, and nothing of the workspace except
+what runs on the host during the build (below). `cargo rustd` never hands a build of the
+workspace to cargo: what rustd cannot build fails the build, with the reason.
 
-When that build succeeds, the command tells the daemon to load the workspace and returns
-without waiting. The daemon is started if it is not running. Until the workspace is loaded,
-builds are cargo's, and each one says so:
+The first build runs cargo once, with rustd as the `RUSTC_WORKSPACE_WRAPPER`. For a crate
+from the registry the wrapper runs rustc exactly as cargo asked, so those are the same
+artifacts a plain `cargo build` makes and a shared cache (sccache, a CI cache of `target/`)
+serves them. For a crate of the workspace the wrapper gives rustc a source with no code in
+it, which only names the crates it is linked against: cargo's plan, its fingerprints and
+the linker line are real, and no function of the workspace is compiled by rustc. While
+cargo runs, the daemon loads the workspace; when cargo is done, the daemon compiles the
+workspace's crates and links the programs, which are put where cargo would have put them.
+Two `Finished` lines are printed, cargo's and then rustd's:
 
-    rustd: the daemon is still loading the workspace (951ms so far); building with cargo
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.31s
+    Finished `dev` profile [rustd] target(s) in 9.87s
 
-Once the daemon is ready, a build after an edit does not start cargo at all. The daemon
-compiles the functions that changed and either splices them into the executable or links
-again, and the result is put where cargo would have put it. The status line shows which path
-a build took:
+A build after an edit does not start cargo at all. The daemon compiles the functions that
+changed and either splices them into the executable or links again.
 
-    Finished `dev` profile [rustd] target(s) in 0.24s
+When something cargo acts on has changed (a manifest, `Cargo.lock`, a cargo configuration
+file, the toolchain file, a build script or proc macro of the workspace, or something a
+build script reads), the build starts over the same way: cargo runs once, rustc builds the
+dependencies that are new or changed and reruns the build scripts that have to, and the
+daemon loads the workspace again and builds its crates. The same happens when rustd's
+records are missing, were written by another version of rustd, or `target/` was removed.
+On a large workspace the reload is long: 36 to 51 s on nushell.
 
-`[rustd]` means the daemon built it. A cargo build prints cargo's usual line.
+A build asked while the daemon is still loading the workspace waits for it.
 
 `run` then runs the program and `test` runs the test executables the way cargo does: the
 same working directory, the variables cargo sets, cargo's `Running` lines and the same exit
 status.
 
-Loading takes from under a second to most of a minute depending on the workspace. Measured
-on one machine, it was 2.5 s for just, 6.9 s for ripgrep and 42.4 s for nushell (see
-[results.md](results.md)).
+### What rustc still compiles of the workspace
 
-## When cargo builds instead
+Build scripts, proc-macro crates, and the workspace crates either of them depends on. They
+run on the host inside cargo and rustc while the build is planned, and rustc loads a proc
+macro as a dynamic library of its own ABI; rustd makes neither yet. Every other crate of
+the workspace is rustd's.
 
-rustd hands a build to cargo whenever it cannot be sure its own result would be what cargo's
-is. It prints one line with the reason, `rustd: <reason>; building with cargo`, and counts
-it in `cargo rustd status`. The build then behaves as cargo's because it is cargo's.
+## What fails the build
 
-A whole invocation goes to cargo when any of these hold (`Invocation::only_cargo` in
-`cargo/cli.rs`):
+Each of these is an error that names what is not supported, with exit status 101. None of
+them is built by cargo instead.
 
-| Condition | Reason printed |
+| Asked | Error |
 |---|---|
-| `--message-format` | `--message-format` is cargo's to answer |
-| a `-Z` flag | unstable cargo flags |
-| `--exclude` | `--exclude` is not loaded by the daemon yet |
-| more than one `--target` | several targets in one build |
-| `RUSTC_WORKSPACE_WRAPPER` set to another wrapper | `RUSTC_WORKSPACE_WRAPPER` is set to another wrapper |
-| `rustd-rustc` missing | `rustd-rustc` is not installed next to `rustd` |
+| `--benches`, `--bench`, `--all-targets` | the daemon does not build the benchmarks of a workspace yet |
+| `--message-format` other than `human` and `short` (the JSON ones), `--build-plan`, `--unit-graph` | the flag is not answered by `cargo rustd` yet |
+| a `-Z` flag | unstable cargo flags are not read by rustd |
+| more than one `--target` | several `--target` in one build are not built by the daemon yet |
 | `--target` or `CARGO_BUILD_TARGET` naming a target that is neither ELF nor Mach-O, or one rustd does not know | programs for the triple are not linked through `cargo rustd` yet |
+| `RUSTC_WORKSPACE_WRAPPER` set to another wrapper | `cargo rustd` does not run rustc through it |
+| `rustd-rustc` or `rustd-rustc-first` missing | `rustd-rustc` (or `rustd-rustc-first`) is not installed next to `rustd` |
+| a toolchain other than the one rustd is pinned to | rustc 1.x is not the 1.99.0 this rustd compiles for |
+| a workspace crate built as `cdylib`, `dylib`, `staticlib`, or as more than one crate type | the daemon builds a `lib`, an `rlib` or a `bin` alone |
+| a workspace in which every crate is a build script's, a proc macro or a dependency of one | the daemon builds none of those yet |
+| `lto`, coverage or profiling flags, and what else `plan.rs` refuses | the reason, per program |
+| source in which rust-analyzer finds an error | `path:line:column: message [E0308]` |
+| a function the daemon cannot compile | the function and the reason |
 
-A single build goes to cargo when:
+Tests are the largest of these. rustc compiles a test crate whole in order to write its
+harness, and no crate of the workspace is rustc's to compile; the daemon has to write the
+harness itself. Doc tests are the daemon's too, with no rustdoc: the examples of a library
+are one crate the daemon writes and builds, a module each, and each runs in a process of
+its own. An example that only a crate of its own can be (`#![feature]`, `crate::`, another
+edition) fails with the reason. A `compile_fail` example passes when rust-analyzer finds an
+error in it, so one that only the borrow checker refuses fails, saying so.
 
-- the daemon is still loading the workspace;
-- a manifest, `Cargo.lock`, a cargo configuration file, the toolchain file, or something a
-  build script reads has changed since cargo last built. Cargo builds, and the daemon loads
-  the workspace again afterwards. On a large workspace that reload is long: 36 to 51 s on
-  nushell;
-- a `#[test]` function was added or removed, or its attributes changed. The list of tests in
-  a test executable is rustc's;
-- a library changed that unit tests are linked against as rustc built it;
-- rust-analyzer finds an error in the source. The daemon refuses it, cargo runs, and you get
-  rustc's diagnostics and cargo's exit status. This costs 0.1 to 0.5 s over cargo alone.
-  Errors rust-analyzer does not find are not caught here; see "Known problems";
-- the daemon refused the build or failed.
-
-Doc tests go through rustd in rustdoc's place. An example rustd cannot build is left to
-rustdoc, with a line saying why.
-
-The fallback is per invocation or per program, not per crate. If one program of an
-invocation cannot be the daemon's, cargo builds the invocation.
-
-These flags are handled on the daemon's path: `--target` naming the host, a single `-p`,
-`--features`, `--bin`, `--example`, `--test`, `--lib`, `--manifest-path`, `--workspace`,
-`--no-run`, `--no-fail-fast`, `-q`, test filters and the arguments after `--`.
+These flags are handled: `--target` naming the host, `-p`, `--features`, `--bin`, `--bins`,
+`--example`, `--examples`, `--lib`, `--manifest-path`, `--workspace`, `--release`,
+`--profile`, `-q`, and the arguments after `--`.
 
 The daemon's state is kept per command line. `cargo rustd build`, `cargo rustd build -q`
 and `cargo rustd build --features x` are three different builds to rustd, told apart by a
 hash of the subcommand (`run` counts as `build`), the build flags, the working directory
-and the environment variables that change what cargo builds. The first use of each is a
-cargo build, usually a quick one because cargo's own output is shared between them.
+and the environment variables that change what cargo builds. The first use of each runs
+cargo once, which has little to do when the dependencies are already built.
 
 ## The daemon
 
@@ -128,12 +131,9 @@ rust-analyzer database for one repository, toolchain, target, feature set and `c
 setting. Git worktrees of one repository share a worker, so what they have in common is
 analysed once. Different repositories get different workers.
 
-A new worktree still starts with a cargo build, because it has a target directory of its
-own. What it saves is the daemon's side: the worktree joins the worker that is already
-loaded instead of loading the workspace again. With a ripgrep checkout loaded, the first
-`cargo rustd build` in a new worktree of it was cargo's and took 16 s, the worktree showed
-as ready under the same worker, and the first edit there was built by the daemon in 0.4 s. A `cargo rustd test` can use
-two workers, because unit tests are built with `cfg(test)` and integration tests without.
+A new worktree still has cargo build the dependencies, because it has a target directory
+of its own. What it saves is the daemon's side: the worktree joins the worker that is
+already loaded instead of loading the workspace again.
 
 `cargo rustd status` shows the daemon, its workers and their log files:
 
@@ -168,10 +168,47 @@ Cargo keeps what it builds through a workspace wrapper apart from what it builds
 one. `cargo build` and `cargo rustd build` in one checkout therefore each compile the
 workspace's crates once, and share the dependencies.
 
+## Which tests run
+
+`cargo rustd test` remembers the tests that passed, in the daemon's memory: a new daemon
+runs every test once. When a test program is built, the
+daemon writes beside it what each test can reach: the functions, the instances of generic
+ones and the statics, with a print of their code. A test that passed is not run again when
+nothing it can reach changed and nothing outside the code changed either. It is listed
+as `ok (cached)`. Each test that is run is a process of its own.
+
+Outside the code means the environment, the test's arguments, the other programs of the
+build, and the length and time of every file in the package that is not a Rust source the
+build compiled. A test that reaches code that is not all known is run every time. A test
+that failed is not remembered.
+
+Each test that runs is a process of its own, with as many at once as `--test-threads` says,
+or one per core. A test that depends on what another test left in the process fails, as
+under nextest. `RUSTD_TEST_TIMEOUT`, in seconds, stops and fails a test that runs longer.
+
+`--rerun-all` or `RUSTD_TEST_CACHE=0` runs every test in one process, as libtest does,
+and nothing is remembered from that run.
+
+## Clippy
+
+`cargo rustd clippy` builds what `cargo rustd build` builds, then asks the daemon for
+clippy's lints of the crates of those programs and prints them as clippy does. The lints of a
+body are one query of the worker's database, so the database runs them again only for the
+bodies an edit changed or whose types changed: after an edit to one function, one body is
+linted again. `RUSTD_STATS=1` prints how many.
+
+Eight of clippy's lints are there: `bool_comparison`, `eq_op`, `identity_op`,
+`len_zero`, `let_unit_value`, `needless_bool`, `needless_return` and `self_assignment`,
+at clippy's levels. `#[allow]`, `#[warn]`, `#[deny]` and `#[expect]` on the item, its module
+or the crate are read, and so are `-D`, `-W` and `-A` after `--`, `-D warnings` among them.
+Nothing in what a macro wrote is linted. rustc's own warnings are not printed, and a
+workspace of libraries alone, which builds no program, fails with that reason.
+`harness/clippy.py` compares it with clippy.
+
 ## Environment variables
 
 These are read by `cargo rustd` and passed to the worker it starts. They are part of which
-build a command line is, so changing one starts from a cargo build again.
+build a command line is, so changing one starts from a first build again.
 
 | Variable | Meaning | Default |
 |---|---|---|
@@ -196,13 +233,12 @@ a shell without the variable keeps no store, whatever later shells have set.
 ## Known problems
 
 - **The daemon builds programs rustc would reject.** It refuses source in which
-  rust-analyzer finds an error, and those builds go to cargo. It has no borrow checker, so
+  rust-analyzer finds an error, and those builds fail. It has no borrow checker, so
   a borrow or move error is not found: with a warm daemon, `cargo rustd run` built and ran
-  a program that uses a value after moving it. Nothing is reported until cargo next builds
-  that crate. Run `cargo rustd check` when you want rustc's verdict.
+  a program that uses a value after moving it. Nothing is reported. Run `cargo rustd check` when you want rustc's verdict.
 - Linux x86-64 and macOS arm64 have been run; on macOS only ripgrep, fd and hyperfine and
   the generated workspace of the harness. The code compiles for Windows, but every build
-  there would go to cargo (the link step knows ELF and Mach-O), and the command has not
+  there fails (the link step knows ELF and Mach-O), and the command has not
   been built or run there. The socket's permission and peer checks do nothing on Windows.
 - On Linux `cargo rustd` was measured with the Cranelift backend only; LLVM has been run
   through the harness gate, not through `harness/cargo_rustd.py`. On macOS the harness was
@@ -227,7 +263,12 @@ for when they won't: agents, scripts, editors that call `cargo build` themselves
     rustd status     # is it on, and what the daemon served or left to rustc
     rustd disable    # back to how it was
 
-`rustd`, `cargo-rustd` and `rustd-rustc` have to be in the same directory.
+`rustd`, `cargo-rustd`, `rustd-rustc` and `rustd-rustc-first` have to be in the same directory.
+
+Plain `cargo build`, `cargo run` and `cargo test` do not build a workspace while rustd is
+enabled: they fail at its first crate with `plain cargo does not build a workspace while rustd
+is enabled; \`cargo rustd ...\` builds it`. Build scripts, proc macros and registry crates are
+rustc's as before; no other crate of the workspace is compiled by rustc.
 
 ### What `enable` changes
 
@@ -297,8 +338,8 @@ run. macOS arm64 is below.
   alone (one run each, Cranelift: ripgrep 1.32 s against 0.78 s, eza 2.02 against 1.32,
   tokei 1.23 against 0.70, axum 0.68 against 0.41). The cause has not been measured yet.
 - The store grows fast: one harness pass over starship wrote 7.6 GiB.
-- A socket path over 108 bytes cannot be bound; the build goes to cargo and says so. The
-  default locations are well under that.
+- A socket path over 108 bytes cannot be bound; the build fails and says so. The default
+  locations are well under that.
 
 
 ## macOS arm64
@@ -337,7 +378,8 @@ faster than cargo. Why ripgrep's edit takes one to two seconds in some runs was 
 into. A build with no change took 0.03 to 0.06 s through `cargo rustd` against 0.31 to
 0.41 s, and 0.16 to 0.19 s through plain cargo.
 
-Builds that went to cargo in those runs, each with its reason printed: the first build of
+These runs predate the daemon's first build being the only one. Builds that went to cargo
+in them, each with its reason printed: the first build of
 every project, the build of source that does not compile, ripgrep's tests after an edit
 under `cargo rustd` (a library the unit tests are linked with as rustc built it), and the
 tests of ripgrep and hyperfine after an edit under plain cargo ("the build is not one the

@@ -54,8 +54,13 @@ pub(crate) struct State {
     pub(crate) checkouts: Vec<Checkout>,
     /// Why every build of this is cargo's, when rustd has no part in it.
     pub(crate) refusal: Option<String>,
-    /// Whether a library that was built has doc tests.
-    pub(crate) doc_tests: bool,
+    /// Why the doc tests of a library that has them are not run, for each that rustd does not
+    /// run.
+    #[serde(default)]
+    pub(crate) unrun_doc_tests: Vec<String>,
+    /// What cargo runs the programs under: the target's `runner`, empty when it has none.
+    #[serde(default)]
+    pub(crate) runner: Vec<String>,
     pub(crate) counts: Counts,
 }
 
@@ -74,6 +79,10 @@ pub(crate) struct Program {
     pub(crate) package: String,
     /// Whether it is built as a test: `cargo test` runs it.
     pub(crate) test: bool,
+    /// Whether it is the program `cargo run` of its package runs with none named: its one
+    /// bin, or the one the manifest's `default-run` names.
+    #[serde(default)]
+    pub(crate) default_run: bool,
     /// The root file of the target.
     pub(crate) source: PathBuf,
     /// The directory of the package, which a test runs in.
@@ -108,6 +117,8 @@ pub(crate) enum Kind {
     Example,
     Test,
     Bench,
+    /// The examples of a library's documentation, which `cargo test --doc` runs.
+    Doc,
 }
 
 impl Kind {
@@ -248,12 +259,12 @@ pub(crate) struct Staged {
 }
 
 impl Staged {
-    /// `Err` is why rustc builds every crate of the build `asked` for. The crates that
+    /// `Err` is why the daemon does not build what `asked` is for. The crates that
     /// run during the build are rustc's, and so are the ones those depend on: a build
     /// script, a proc macro, and what either is declared to need under any feature.
     pub(crate) fn of(asked: &Invocation) -> anyhow::Result<Result<Staged, String>> {
-        if asked.subcommand == Subcommand::Test || asked.flags.selects_targets {
-            return Ok(Err("the build picks its targets".to_owned()));
+        if let Some(why) = asked.builds_tests() {
+            return Ok(Err(why));
         }
         let metadata = metadata(asked)?;
         let members: Vec<&Package> = metadata.workspace_packages();
@@ -274,35 +285,55 @@ impl Staged {
             }
         }
         let mut roots = Vec::new();
+        let mut examples = Vec::new();
+        let mut tests = Vec::new();
         for (at, member) in members.iter().enumerate() {
             if reached.contains(&at) {
                 continue;
             }
             let of_build = |it: &&Target| {
-                let apart = [
-                    TargetKind::CustomBuild,
-                    TargetKind::Example,
-                    TargetKind::Test,
-                    TargetKind::Bench,
-                ];
+                let apart = [TargetKind::CustomBuild, TargetKind::Bench];
                 !it.kind.iter().any(|it| apart.contains(it))
             };
             for target in member.targets.iter().filter(of_build) {
+                let source = target.src_path.clone().into_std_path_buf();
+                // An integration test is a program of its own too. Its harness, when
+                // it has one, is the daemon's to write.
+                if target.is_test() {
+                    tests.push(source);
+                    continue;
+                }
+                // An example is a program of its own: no crate of the build is linked
+                // with it, and the daemon loads it when cargo has it built.
+                if target.is_example() {
+                    examples.push(source);
+                    continue;
+                }
                 let alone = matches!(
                     *target.crate_types,
                     [CrateType::Lib | CrateType::RLib | CrateType::Bin]
                 );
                 if !alone {
                     return Ok(Err(format!(
-                        "`{}` is linked into more than a program of the workspace",
-                        target.name
+                        "`{}` is built as {}, which the daemon does not link yet: it builds \
+                         a `lib`, an `rlib` or a `bin` alone",
+                        target.name,
+                        target
+                            .crate_types
+                            .iter()
+                            .map(|it| format!("`{it}`"))
+                            .collect::<Vec<_>>()
+                            .join(" and "),
                     )));
                 }
-                roots.push(target.src_path.clone().into_std_path_buf());
+                roots.push(source);
             }
         }
         if roots.is_empty() {
-            return Ok(Err("every crate of the workspace runs during the build".to_owned()));
+            return Ok(Err("every crate of the workspace runs during the build, as a build \
+                           script, a proc macro or what one depends on: the daemon builds \
+                           none of those yet"
+                .to_owned()));
         }
         // Before cargo builds what would then be built again.
         if let Some(why) = other_toolchain() {
@@ -319,18 +350,13 @@ impl Staged {
             };
             daemon::Ahead { config, crates: roots.clone(), root }
         });
+        roots.extend(examples);
+        roots.extend(tests);
         Ok(Ok(Staged { roots, ahead }))
     }
 }
 
 impl Built {
-    /// Runs cargo on what `asked` builds, with rustd as the wrapper of the workspace's
-    /// crates. Progress and diagnostics are cargo's own. `Err` is cargo's exit status when
-    /// it failed.
-    pub(crate) fn by_cargo(asked: &Invocation) -> anyhow::Result<Result<Built, i32>> {
-        Built::by(asked, None)
-    }
-
     /// The same, with rustc building of the crates rooted at `staged` only what stands in
     /// for them: the code of those is the daemon's to compile.
     pub(crate) fn staged(
@@ -344,14 +370,29 @@ impl Built {
         let started = stamp_now();
         let mut cargo = Command::new(cargo_path());
         match asked.subcommand {
-            Subcommand::Build | Subcommand::Run => cargo.arg("build"),
+            Subcommand::Build | Subcommand::Run | Subcommand::Clippy => cargo.arg("build"),
             Subcommand::Test => cargo.args(["test", "--no-run"]),
         };
-        cargo.args(&asked.build_args).arg("--message-format=json-render-diagnostics");
-        as_built(&mut cargo)?;
-        if let Some(staged) = staged {
-            cargo.env(switch::VARIABLE, switch::first_wrapper_path()?);
-            cargo.env(wrapper::STAGED, std::env::join_paths(&staged.roots)?);
+        // What cargo says is read here, and rustc's diagnostics are shown in the shape asked.
+        let mut args = asked.build_args.iter();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--message-format" => drop(args.next()),
+                // The examples are linked as the unit tests of their library are.
+                "--doc" => drop(cargo.arg("--lib")),
+                arg => drop(cargo.arg(arg)),
+            }
+        }
+        cargo.arg(match asked.flags.message_format.iter().any(|it| it == "short") {
+            true => "--message-format=json-diagnostic-short,json-render-diagnostics",
+            false => "--message-format=json-render-diagnostics",
+        });
+        match staged {
+            Some(staged) => {
+                as_staged(&mut cargo)?;
+                cargo.env(wrapper::STAGED, std::env::join_paths(&staged.roots)?);
+            }
+            None => as_built(&mut cargo)?,
         }
         cargo.stdout(Stdio::piped());
         let mut cargo = cargo.spawn().context("running cargo")?;
@@ -387,6 +428,11 @@ impl Built {
 }
 
 impl State {
+    /// The source files the programs are compiled from.
+    pub(crate) fn sources(&self) -> impl Iterator<Item = &Path> {
+        self.programs.iter().flat_map(|it| &it.inputs).map(PathBuf::as_path)
+    }
+
     /// The file in the record of a unit that names the builds its program is in, a key a
     /// line.
     pub(crate) const STATES: &str = "states";
@@ -416,40 +462,6 @@ impl State {
     pub(crate) fn of_unit(unit: &Path) -> Vec<String> {
         let keys = std::fs::read_to_string(unit.join(State::STATES)).unwrap_or_default();
         keys.lines().map(str::to_owned).collect()
-    }
-
-    /// Forgets the builds `keys`: rustc has linked a program of theirs again, and what
-    /// they kept of cargo's is not what cargo has now.
-    pub(crate) fn forget<'a>(keys: impl IntoIterator<Item = &'a String>) {
-        for key in keys {
-            for path in [State::path(key), State::kept_path(key)].into_iter().flatten() {
-                let _ = std::fs::remove_file(path);
-            }
-        }
-    }
-
-    /// The program linked from the unit recorded in `unit`, the checkout it is asked for
-    /// in, and where it is among that checkout's programs. `Err` is why the daemon is not
-    /// asked for it.
-    pub(crate) fn asked_for(&self, unit: &Path) -> Result<(&Checkout, usize), String> {
-        let program = self.of_unit_dir(unit).ok_or("the build no longer has the program")?;
-        match (program.asked_as, &program.left_to_cargo) {
-            (Some((checkout, at)), _) => Ok((&self.checkouts[checkout], at)),
-            (None, why) => Err(why.clone().unwrap_or_default()),
-        }
-    }
-
-    fn of_unit_dir(&self, unit: &Path) -> Option<&Program> {
-        self.programs.iter().find(|it| it.unit.as_deref() == Some(unit))
-    }
-
-    /// Has `binary` be what cargo has of the program linked from the unit recorded in
-    /// `unit`: cargo was given it where it had rustc's, for the source as it is now.
-    pub(crate) fn cargo_has(&self, unit: &Path, binary: &Path) -> std::io::Result<()> {
-        match self.of_unit_dir(unit) {
-            Some(program) => place(binary, &program.cargos),
-            None => Ok(()),
-        }
     }
 
     pub(crate) fn write(&self) -> anyhow::Result<()> {
@@ -497,11 +509,6 @@ impl State {
             let file = program.newer_input(self.built_at)?;
             Some(format!("`{}`: {why}, and {} changed", program.name, file.display()))
         })
-    }
-
-    /// Counts a build that went to cargo.
-    pub(crate) fn count_cargo(&mut self, reason: &str) {
-        *self.counts.cargo.entry(reason.to_owned()).or_default() += 1;
     }
 
     /// The executables of the build `key` and the hard link kept to what rustc linked of
@@ -622,7 +629,8 @@ impl State {
             guards: Vec::new(),
             checkouts: Vec::new(),
             refusal: None,
-            doc_tests: false,
+            unrun_doc_tests: Vec::new(),
+            runner: runner(asked, cwd),
             counts,
         };
         let project = match project(asked, cwd, &metadata) {
@@ -661,6 +669,7 @@ impl State {
             env: env.clone(),
         };
         let mut checkouts = [checkout(false), checkout(true)];
+        let mut tested_libraries = Vec::new();
         let executables = artifacts.iter().filter(|it| !it.target.is_custom_build());
         for artifact in executables {
             let Some(executable) = &artifact.executable else { continue };
@@ -670,6 +679,10 @@ impl State {
             let test = artifact.profile.test;
             let unit_test = test && !matches!(kind, Kind::Test | Kind::Bench);
             let name = artifact.target.name.clone();
+            let bins = package.targets.iter().filter(|it| it.is_bin()).count();
+            let default_run = kind == Kind::Bin
+                && !test
+                && package.default_run.as_deref().map_or(bins == 1, |it| it == name);
             let unit = Record::of_artifact(&used, executable.as_std_path());
             // Named as cargo names the unit, the same in every build of it.
             let files = dir.join("programs").join(unit.map_or(&name, |it| &it.id));
@@ -681,8 +694,15 @@ impl State {
                 .filter(|it| it != executable.as_std_path())
                 .filter(|it| same_file::is_same_file(it, executable).unwrap_or(false))
                 .collect();
+            if unit_test && kind == Kind::Lib {
+                tested_libraries.push((package, unit, executable.as_std_path(), artifact));
+            }
+            // `--doc` builds the unit tests for how they are linked alone: they are not run.
+            if asked.flags.doc {
+                continue;
+            }
             let plan = match unit {
-                Some(unit) => Plan::of(unit, &used, &files, unit_test)?,
+                Some(unit) => Plan::of(unit, &used, &files, None)?,
                 None => Err(format!(
                     "cargo built `{name}` before rustd recorded what it is linked from; \
                      `cargo clean -p {}` has it built again",
@@ -709,6 +729,7 @@ impl State {
                 kind,
                 package: package.name.to_string(),
                 test,
+                default_run,
                 source: artifact.target.src_path.clone().into_std_path_buf(),
                 package_dir: package_dir(package),
                 executable: executable.clone().into_std_path_buf(),
@@ -721,6 +742,74 @@ impl State {
                 env: run_env(package, &built.scripts)
                     .into_iter()
                     .chain(library_path(executable.as_std_path(), sysroot_libraries.as_deref()))
+                    .collect(),
+            });
+        }
+        // Cargo runs the doc tests of the libraries it runs the unit tests of. The examples of
+        // one are a crate rust-analyzer adds when its file is there, which the daemon writes.
+        let examples_dir = metadata.target_directory.as_std_path().join(crate::doctest::DIR);
+        // Cargo 1.99 runs no doc tests when tests are picked by target or by name.
+        let picked = asked.flags.selects_targets || !asked.positional.is_empty();
+        let tested_libraries =
+            if picked && !asked.flags.doc { Vec::new() } else { tested_libraries };
+        for (package, unit, executable, artifact) in tested_libraries {
+            if !artifact.target.doctest {
+                continue;
+            }
+            if artifact.target.is_proc_macro() {
+                state.unrun_doc_tests.push(format!(
+                    "the doc tests of `{}` are not run: rustd does not run the examples of a                      proc macro yet",
+                    package.name
+                ));
+                continue;
+            }
+            let examples = examples_dir.join(format!("{}.rs", package.name));
+            if !examples.exists() {
+                std::fs::create_dir_all(&examples_dir)?;
+                std::fs::write(&examples, "")?;
+            }
+            let files = dir.join("programs").join(format!("{}-doc", artifact.target.name));
+            std::fs::create_dir_all(&files)?;
+            let plan = match unit {
+                Some(unit) => Plan::of(unit, &used, &files, Some(&examples))?,
+                None => Err(format!(
+                    "cargo built the tests of `{}` before rustd recorded what they are linked                      from; `cargo clean -p {}` has them built again",
+                    artifact.target.name, package.name
+                )),
+            };
+            let (asked_as, left_to_cargo) = match plan {
+                Ok(plan) => {
+                    let checkout = &mut checkouts[1];
+                    checkout.generation = checkout.generation.max(plan.stamp);
+                    checkout.programs.push(plan);
+                    (Some((1, checkout.programs.len() - 1)), None)
+                }
+                Err(why) => (None, Some(why)),
+            };
+            let compiled = reached_from(unit.into_iter().collect(), &used);
+            let inputs: FxHashSet<PathBuf> = compiled
+                .iter()
+                .flat_map(|it| it.inputs().files)
+                .filter(|it| !it.starts_with(metadata.target_directory.as_std_path()))
+                .collect();
+            state.programs.push(Program {
+                name: artifact.target.name.clone(),
+                kind: Kind::Doc,
+                package: package.name.to_string(),
+                test: false,
+                default_run: false,
+                source: artifact.target.src_path.clone().into_std_path_buf(),
+                package_dir: package_dir(package),
+                executable: files.join("bin"),
+                names: Vec::new(),
+                cargos: files.join("cargo"),
+                unit: None,
+                asked_as,
+                left_to_cargo,
+                inputs: inputs.into_iter().collect(),
+                env: run_env(package, &built.scripts)
+                    .into_iter()
+                    .chain(library_path(executable, sysroot_libraries.as_deref()))
                     .collect(),
             });
         }
@@ -739,17 +828,7 @@ impl State {
             checkout.sources = sources.into_iter().collect();
         }
         state.checkouts = checkouts.into_iter().collect();
-        // Cargo runs the doc tests of the packages it runs the tests of.
-        let tested: FxHashSet<_> =
-            artifacts.iter().filter(|it| it.profile.test).map(|it| &it.package_id).collect();
-        // A proc macro is a library with doc tests as much as any other.
-        let library = |it: &cargo_metadata::Target| {
-            it.is_lib() || it.is_rlib() || it.is_dylib() || it.is_proc_macro()
-        };
-        let documented = |it: &&Package| it.targets.iter().any(|it| library(it) && it.doctest);
-        state.doc_tests =
-            metadata.packages.iter().filter(|it| tested.contains(&it.id)).any(|it| documented(&it));
-        state.guards = guards(cwd, &metadata, &used, &built.scripts, &state.checkouts);
+        state.guards = guards(cwd, &metadata, &used, &built.scripts);
         let kept: Vec<PathBuf> = State::all()
             .iter()
             .chain([&state])
@@ -815,6 +894,69 @@ pub(crate) fn place(from: &Path, to: &Path) -> std::io::Result<()> {
 pub(crate) fn as_built(command: &mut Command) -> std::io::Result<()> {
     command.env(switch::VARIABLE, switch::wrapper_path()?).env(wrapper::DRIVEN, "1");
     Ok(())
+}
+
+/// The same for the first build of a workspace, and for the programs it built: a cargo one
+/// of them runs finds the build as `cargo rustd` left it, under the wrapper it was built with.
+pub(crate) fn as_staged(command: &mut Command) -> std::io::Result<()> {
+    command.env(switch::VARIABLE, switch::first_wrapper_path()?).env(wrapper::DRIVEN, "1");
+    Ok(())
+}
+
+/// A command that runs `executable` as cargo runs a program it built: under `runner`, when
+/// the target has one.
+pub(crate) fn running(runner: &[String], executable: &Path) -> Command {
+    match runner {
+        [program, args @ ..] => {
+            let mut command = Command::new(program);
+            command.args(args).arg(executable);
+            command
+        }
+        [] => Command::new(executable),
+    }
+}
+
+/// The `runner` of the target cargo builds for, as cargo reads it: from
+/// `CARGO_TARGET_<TRIPLE>_RUNNER`, or else `target.<triple>.runner` of the nearest cargo
+/// configuration that has one.
+fn runner(asked: &Invocation, cwd: &Path) -> Vec<String> {
+    let host = || {
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let output = Command::new(rustc).arg("-vV").output().ok()?;
+        let said = String::from_utf8_lossy(&output.stdout).into_owned();
+        said.lines().find_map(|it| it.strip_prefix("host: ")).map(str::to_owned)
+    };
+    let Some(triple) = asked.flags.targets.first().cloned().or_else(host) else {
+        return Vec::new();
+    };
+    let words = |it: &str| it.split_whitespace().map(str::to_owned).collect();
+    let variable =
+        format!("CARGO_TARGET_{}_RUNNER", triple.to_uppercase().replace(['-', '.'], "_"));
+    if let Ok(it) = std::env::var(variable) {
+        return words(&it);
+    }
+    let home = std::env::var_os("CARGO_HOME").map(PathBuf::from).or_else(|| {
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+        Some(Path::new(&home).join(".cargo"))
+    });
+    let dirs = cwd.ancestors().map(|it| it.join(".cargo")).chain(home);
+    for dir in dirs {
+        let Some(text) = ["config.toml", "config"]
+            .iter()
+            .find_map(|it| std::fs::read_to_string(dir.join(it)).ok())
+        else {
+            continue;
+        };
+        let Ok(config) = text.parse::<toml::Table>() else { continue };
+        match config.get("target").and_then(|it| it.get(&triple)).and_then(|it| it.get("runner")) {
+            Some(toml::Value::String(it)) => return words(it),
+            Some(toml::Value::Array(it)) => {
+                return it.iter().filter_map(|it| it.as_str().map(str::to_owned)).collect();
+            }
+            _ => {}
+        }
+    }
+    Vec::new()
 }
 
 /// The cargo to run: the one that ran this command, or the one on the path.
@@ -996,13 +1138,7 @@ fn run_env(package: &Package, scripts: &[BuildScript]) -> Vec<(String, String)> 
 }
 
 /// Everything a change to which makes the next build cargo's.
-fn guards(
-    cwd: &Path,
-    metadata: &Metadata,
-    used: &[Record],
-    scripts: &[BuildScript],
-    checkouts: &[Checkout],
-) -> Vec<Guard> {
+fn guards(cwd: &Path, metadata: &Metadata, used: &[Record], scripts: &[BuildScript]) -> Vec<Guard> {
     let root = metadata.workspace_root.as_std_path();
     let manifests = metadata
         .workspace_packages()
@@ -1038,8 +1174,6 @@ fn guards(
         let package = metadata.packages.iter().find(|it| it.id == script.package_id);
         guards.extend(package.map(|it| rerun_guards(it, script)).into_iter().flatten());
     }
-    let left = checkouts.iter().flat_map(|it| &it.programs).flat_map(|it| it.left_to_rustc.clone());
-    guards.push(Guard::files("a library its unit tests are linked with as rustc built it:", left));
     guards
 }
 

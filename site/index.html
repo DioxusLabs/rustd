@@ -127,9 +127,8 @@ check it against the release's SHA-256 sums and put <code>rustd</code>, <code>ca
 and <code>rustd-rustc</code> in <code>~/.cargo/bin</code>. Set <code>RUSTD_VERSION=nightly</code>
 for the newest build of <code>main</code>. rustd also needs the toolchain it is pinned to:</p>
 <pre><code>rustup toolchain install 1.99.0 --component rust-src</code></pre>
-<p>On macOS and Windows the daemon runs and is tested, but <code>cargo rustd</code> does not
-link programs there yet, so every build is handed to cargo with a line saying so. Linux is where
-the numbers below come from.</p>
+<p>On Windows the daemon runs and is tested, but <code>cargo rustd</code> does not link programs
+there yet: a build fails and says so. Linux is where the numbers below come from.</p>
 <p>The downloads have the Cranelift backend. The LLVM backend needs LLVM 20 on the machine and
 is <a href="https://github.com/DioxusLabs/rustd#build-from-source">built from source</a>.</p>
 
@@ -146,8 +145,8 @@ cargo rustd check</code></pre>
 cargo run
 rustd status
 rustd disable</code></pre>
-<p>When rustd cannot build something, cargo or rustc builds it and one line on stderr says why.
-Release builds, other profiles and <code>RUSTFLAGS</code> are handed to cargo unchanged.
+<p>When rustd cannot build something, the build fails and says why; nothing of the workspace
+is handed to cargo.
 The <a href="https://github.com/DioxusLabs/rustd/blob/main/docs/cargo.md">cargo guide</a> has
 the details, and <a href="https://github.com/DioxusLabs/rustd/blob/main/docs/platforms.md">the
 platform notes</a> say what has been run where.</p>
@@ -175,7 +174,7 @@ again. That is open.</p>
 <tr><td>fd 10.3.0</td><td>0.41 / <b>0.03</b></td><td>0.52 / <b>0.17</b></td></tr>
 <tr><td>hyperfine 1.19.0</td><td>0.33 / <b>0.03</b></td><td>0.36 / <b>0.15</b></td></tr>
 </table>
-<p>First build from an empty target directory with <code>RUSTD_FIRST_BUILD=1</code>, where cargo
+<p>First build from an empty target directory, where cargo
 builds the dependencies and rustd the workspace's crates, one run each except nushell:</p>
 <table>
 <tr><th>Project</th><th><code>cargo build</code></th><th><code>cargo rustd build</code></th></tr>
@@ -189,7 +188,7 @@ results</a>.</p>
 
 <h2>What it does not do</h2>
 <ul>
-<li>It does not replace rustc. rustc builds the dependencies, and the first build unless <code>RUSTD_FIRST_BUILD=1</code> is set.</li>
+<li>It does not replace rustc. rustc builds the dependencies, and of the workspace its build scripts and proc macros.</li>
 <li>It finds no borrow or move errors. <code>cargo rustd check</code> is <code>cargo check</code>.</li>
 <li>It does not optimise across functions. The code is for the edit loop, not for release.</li>
 <li>It has been wrong: a fuzzer found twenty-one problems, most of them miscompiles. The ones

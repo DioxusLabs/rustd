@@ -15,8 +15,9 @@ building into a target directory of its own as the reference:
   edit      the source is edited; `cargo rustd build`, the program is run, `cargo rustd test`
   broken    a type error is added; both have to fail with the same status
 After every step the program's output and exit status and the result of every test have to be
-what plain cargo gives for the same source. A build cargo did in place of the daemon passes
-(that is the contract) and is in the table with the reason.
+what plain cargo gives for the same source. Every build of `cargo rustd` has to be the
+daemon's: one cargo did in its place fails the run. `cargo rustd test` builds no tests yet
+and says so; those steps are in the table as open.
 
 Every project is run twice, in a fresh copy each time: with `cargo rustd`, and with plain
 cargo in a cargo home in which `rustd enable` was run. `--rustd` or `--plain` runs the one.
@@ -35,11 +36,11 @@ that is not, and that is edited in between; a wrapper the user had; what a proje
 configuration and the environment do; and plain `cargo build`, `run`, `test`, `check`,
 `install` and doc tests with the daemon there, killed, and of another version.
 
-Writes CARGO-RUSTD.md and cargo_rustd.json next to this file, or CARGO-RUSTD-LLVM.md and
-cargo_rustd_llvm.json under `RUSTD_BACKEND=llvm`. A run of some projects replaces their rows
+Writes CARGO-RUSTD.md and cargo_rustd.json next to this file or in `RUSTD_REPORTS`, or
+CARGO-RUSTD-LLVM.md and cargo_rustd_llvm.json under `RUSTD_BACKEND=llvm`. A run of some projects replaces their rows
 and keeps the others. `--small` is the three projects of the CI job.
 """
-import collections, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
+import collections, glob, json, os, pathlib, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -47,7 +48,7 @@ sys.path.insert(0, HERE)
 # alone. Here it stays as the caller has it: without it the tests of every project are
 # cargo's, and that case is one of the flags.
 INCREMENTAL = os.environ.get("CARGO_INCREMENTAL")
-from difftest import host
+from difftest import CROSS, TARGET, host
 if INCREMENTAL is None:
     os.environ.pop("CARGO_INCREMENTAL", None)
 else:
@@ -163,7 +164,7 @@ PROJECTS = {
 # The projects of the CI job: small, and a build script, a workspace and a test suite among them.
 SMALL = ["ripgrep", "fd", "hyperfine"]
 # How a project is built: the name of the mode, and how the report names it.
-MODES = {"rustd": "`cargo rustd`", "plain": "plain cargo after `rustd enable`"}
+MODES = {"rustd": "`cargo rustd`"}
 
 # What cargo and `cargo rustd` print about the build, which is not the program's output.
 STATUS = re.compile(r"^\s*((Compiling|Checking|Finished|Running|Downloading|Downloaded|Blocking|Locking|Updating|Adding|Fresh|Dirty|Doc-tests)\b|rustd:|warning:)")
@@ -273,34 +274,46 @@ class Side:
             return "cargo" if re.search(r"^\s*Compiling ", stderr, re.M) else "nothing to build"
         return "daemon"
 
-    def settled(self):
-        """Waits until no build of plain cargo is still being handed to the daemon."""
-        settling = os.path.join(self.env["RUSTD_HOME"], "settling")
-        began = time.time()
-        while self.plain and os.path.isdir(settling) and os.listdir(settling) and time.time() - began < WARMUP_SECS:
-            time.sleep(0.05)
-
     def share(self):
         """The functions of the largest load the daemon compiled itself, of all it has."""
         loads = []
-        workers = os.path.join(self.env["RUSTD_HOME"], "workers")
-        for worker in os.listdir(workers) if os.path.isdir(workers) else []:
-            path = os.path.join(workers, worker, "log")
-            # A worker that began as a spare keeps its log where it began.
+        # A worker that began as a spare keeps its log where it began.
+        homes = [os.path.join(self.env["RUSTD_HOME"], it) for it in ("workers", "spares")]
+        for path in [os.path.join(home, worker, "log") for home in homes if os.path.isdir(home) for worker in os.listdir(home)]:
             log = open(path, errors="replace").read() if os.path.exists(path) else ""
             loads += [(int(of), int(done)) for done, of in re.findall(r"^cold: compiled (\d+) of (\d+) fns", log, re.M)]
         return max(loads, default=(0, 0))[::-1]
 
 
+# What `cargo rustd` says of a command that builds tests, which the daemon does not build
+# yet. Known and not mended: such a step is in the table as open and is not compared.
+TESTS_OPEN = "the daemon does not build the benchmarks of a workspace yet"
+
+
 def how_built(stderr):
-    """Whether the daemon built it, or why cargo did."""
-    reason = re.search(r"^rustd: (.*); (building with cargo|this is `cargo \w+`)$", stderr, re.M)
-    if reason:
-        return "cargo: " + reason[1]
-    kept = re.search(r"^rustd: (.*); nothing has changed since cargo built$", stderr, re.M)
-    if kept:
-        return "unchanged: " + kept[1]
-    return "daemon" if "[rustd]" in stderr else "cargo"
+    """Who built it: the daemon, nobody (`error: ` and why rustd failed the build) or cargo.
+    A build of the workspace by cargo is one `cargo rustd` never does: it fails the run."""
+    if "[rustd]" in stderr:
+        return "daemon"
+    refused = re.search(r"^error: (.*)$", stderr, re.M)
+    return "error: " + refused[1] if refused else "cargo"
+
+
+def by_cargo(how):
+    """Whether `how`, which is what `how_built` said of a `cargo rustd`, is a build cargo
+    did in the daemon's place."""
+    return how.startswith("cargo")
+
+
+def daemons_builds(status):
+    """The builds `cargo rustd status` counts as the daemon's, of every workspace it lists."""
+    return sum(int(it) for it in re.findall(r"(\d+) builds by the daemon,", status))
+
+
+def cargos_builds(status):
+    """The builds `cargo rustd status` counts as cargo's, of every workspace it lists: none
+    is one `cargo rustd` does."""
+    return sum(int(it) for it in re.findall(r"builds by the daemon, (\d+) by cargo", status))
 
 
 def program_output(ran):
@@ -329,7 +342,9 @@ def test_results(ran):
     # the failures from the list at the end, and the totals say the rest.
     failed = [name for listed in re.findall(r"^failures:\n((?:    \S.*\n)+)", names, re.M) for name in listed.split("\n")]
     tests = collections.Counter([(name, "ran") for name in re.findall(r"^test (.+?) \.\.\. ", names, re.M)] + [(name.strip(), "FAILED") for name in failed if name])
-    totals = sorted(re.findall(r"^test result: (\w+)\. (\d+ passed; \d+ failed; \d+ ignored; \d+ measured; \d+ filtered out)", ran.stdout, re.M))
+    # rustd says how many of the tests that passed or were ignored it did not run again.
+    stdout = re.sub(r" \(\d+ cached\);", ";", ran.stdout)
+    totals = sorted(re.findall(r"^test result: (\w+)\. (\d+ passed; \d+ failed; \d+ ignored; \d+ measured; \d+ filtered out)", stdout, re.M))
     return ran.returncode, tests, totals
 
 
@@ -339,7 +354,8 @@ def difference(ours, theirs):
         return None
     if not isinstance(ours, tuple):
         return f"{ours!r} for {theirs!r}"
-    for mine, other in zip(ours, theirs):
+    # A different exit status says little alone: what else differs says why, first.
+    for mine, other in [*zip(ours[1:], theirs[1:]), (ours[0], theirs[0])]:
         if mine != other:
             if isinstance(mine, collections.Counter):
                 only = list((mine - other).items())[:3], list((other - mine).items())[:3]
@@ -413,7 +429,6 @@ def wait_warm(side, root):
     """Waits until the daemon has every build of `root` loaded or has given up on one. The
     result is the seconds it took and how each ended."""
     began = time.time()
-    side.settled()
     while time.time() - began < WARMUP_SECS:
         _, status = side.cargo("status")
         states = re.findall(rf"^    {re.escape(root)}: (.*)$", status.stdout, re.M)
@@ -466,17 +481,23 @@ def project(name, spec, work, mode):
         """Runs `command` on both sides and compares what `compare` reads from each."""
         (took, mine), (reference, other) = ours.cargo(command, *args), theirs.cargo(command, *args)
         row["times"][label] = (round(took, 2), round(reference, 2))
-        row["built"][label] = ours.how_built(mine.stderr)
+        how = row["built"][label] = ours.how_built(mine.stderr)
         wrong = difference(compare(mine), compare(other))
+        opened = not plain and TESTS_OPEN in how
+        if opened:
+            wrong = None
+        elif not plain and by_cargo(how):
+            wrong = "; ".join(filter(None, [wrong, "the build was cargo's"]))
         if wrong:
             row["wrong"].append(f"{label}: {wrong}")
             open(os.path.join(work, f"{name}-{label}.rustd.txt"), "w", encoding="utf-8").write(mine.stdout + mine.stderr)
             open(os.path.join(work, f"{name}-{label}.cargo.txt"), "w", encoding="utf-8").write(other.stdout + other.stderr)
-        print(f"  {label:12} rustd {took:7.2f}s  cargo {reference:7.2f}s  {row['built'][label]:8.80}  {wrong or 'same'}", flush=True)
-        # What the tests that failed here alone said.
-        said = wrong and re.search(r"^failures:\n(.*?)^failures:", mine.stdout, re.M | re.S)
-        if said:
-            print("".join(f"      {line}\n" for line in said[1].splitlines()[:60]), end="", flush=True)
+        print(f"  {label:12} rustd {took:7.2f}s  cargo {reference:7.2f}s  {row['built'][label]:8.80}  {wrong or ('open' if opened else 'same')}", flush=True)
+        # What the tests that failed on either side said.
+        for side, ran in ("rustd", mine), ("cargo", other):
+            said = wrong and re.search(r"^failures:\n(.*?)^failures:", ran.stdout, re.M | re.S)
+            if said:
+                print(f"      under {side}:\n" + "".join(f"      {line}\n" for line in said[1].splitlines()[:60]), end="", flush=True)
 
     def runs(label):
         if ask:
@@ -524,25 +545,50 @@ def project(name, spec, work, mode):
     print(f"  functions    {row['share'][0]} of {row['share'][1]} compiled by rustd", flush=True)
     _, counted = ours.cargo("status")
     row["status"] = counted.stdout
+    if not plain and cargos_builds(counted.stdout):
+        row["wrong"].append(f"status: {cargos_builds(counted.stdout)} builds by cargo")
     ours.cargo("stop")
     return row
 
 
 FLAG_WORKSPACE = {
-    "Cargo.toml": '[workspace]\nmembers = ["app", "util"]\nresolver = "2"\n\n[profile.quick]\ninherits = "dev"\n\n[profile.release]\npanic = "abort"\n\n[profile.quick.package.util]\nopt-level = 3\noverflow-checks = false\n',
-    "util/Cargo.toml": '[package]\nname = "util"\nversion = "0.1.0"\nedition = "2021"\n\n[features]\nloud = []\n',
-    "util/src/lib.rs": '/// ```\n/// assert_eq!(util::greeting("it").len(), 8);\n/// ```\n///\n/// ```should_panic\n/// assert_eq!(util::greeting("it"), "");\n/// ```\npub fn greeting(name: &str) -> String {\n    let text = format!("hello {name}");\n    if cfg!(feature = "loud") { text.to_uppercase() } else { text }\n}\n\nthread_local! {\n    static SAID: std::cell::RefCell<Option<String>> = None.into();\n}\n\npub fn said() -> String {\n    SAID.with_borrow(|it| it.clone().unwrap_or_default())\n}\n\n#[cfg(test)]\nmod tests {\n    // A test and the library see one thread local, whoever compiled either.\n    #[test]\n    fn says_what_a_test_set() {\n        super::SAID.with_borrow_mut(|it| *it = Some("set".to_string()));\n        assert_eq!(super::said(), "set");\n    }\n\n    #[test]\n    fn greets() {\n        assert!(super::greeting("a").to_lowercase().starts_with("hello"));\n    }\n}\n',
-    "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\ndefault-run = "app"\n\n[features]\nloud = ["util/loud"]\n\n[dependencies]\nutil = { path = "../util" }\n',
-    "app/src/main.rs": '#![allow(unexpected_cfgs)]\n\nfn main() {\n    let name = std::env::args().nth(1).unwrap_or("world".to_string());\n    println!("{}", util::greeting(&name));\n    println!("{} {} {}", cfg!(debug_assertions), cfg!(extra), cfg!(target_feature = "avx2"));\n    let sum = std::panic::catch_unwind(|| name.len() as u8 + 251);\n    println!("{:?}", sum.ok());\n    if name == "fail" {\n        std::process::exit(3);\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn in_the_program() {\n        assert_eq!(util::greeting("x").len(), 7);\n    }\n}\n',
+    "Cargo.toml": '[workspace]\nmembers = ["app", "util", "probe"]\nresolver = "2"\n\n[profile.quick]\ninherits = "dev"\n\n[profile.release]\npanic = "abort"\n\n[profile.quick.package.util]\nopt-level = 3\noverflow-checks = false\n',
+    "util/Cargo.toml": '[package]\nname = "util"\nversion = "0.1.0"\nedition = "2021"\n\n[features]\nloud = []\n\n[dev-dependencies]\nprobe = { path = "../probe" }\n',
+    # What the unit tests of `util` use, which uses `util`: they link the library twice, as tested and not.
+    "probe/Cargo.toml": '[package]\nname = "probe"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nutil = { path = "../util" }\n',
+    "probe/src/lib.rs": '/// Documentation for its argument, which a library that has this as a dev-dependency\n/// gives itself for its examples, as regex does with `doc_comment::doctest!`.\n#[macro_export]\nmacro_rules! example {\n    ($docs:expr) => {\n        #[doc = $docs]\n        extern "C" {}\n    };\n}\n\npub fn library_is_tested() -> bool {\n    util::tested()\n}\n\npub fn greeting() -> String {\n    util::greeting("probe")\n}\n',
+    "util/src/lib.rs": '/// ```\n/// assert_eq!(util::greeting("it").len(), 8);\n/// ```\n///\n/// ```should_panic\n/// assert_eq!(util::greeting("it"), "");\n/// ```\npub fn greeting(name: &str) -> String {\n    let text = format!("hello {name}");\n    if cfg!(feature = "loud") { text.to_uppercase() } else { text }\n}\n\n#[cfg(doctest)]\nprobe::example!("```\\nassert_eq!(util::greeting(\\"dev\\"), \\"hello dev\\");\\n```");\n\nthread_local! {\n    static SAID: std::cell::RefCell<Option<String>> = None.into();\n}\n\npub fn said() -> String {\n    SAID.with_borrow(|it| it.clone().unwrap_or_default())\n}\n\n/// Whether this build of the library is the one with its unit tests.\npub fn tested() -> bool {\n    cfg!(test)\n}\n\n#[cfg(test)]\nmod tests {\n    // A test and the library see one thread local, whoever compiled either.\n    #[test]\n    fn says_what_a_test_set() {\n        super::SAID.with_borrow_mut(|it| *it = Some("set".to_string()));\n        assert_eq!(super::said(), "set");\n    }\n\n    #[test]\n    fn greets() {\n        assert!(super::greeting("a").to_lowercase().starts_with("hello"));\n    }\n\n    // The tests are in a build of the library with `cfg(test)`, and what they link that uses\n    // the library has the build without.\n    #[test]\n    fn only_the_tested_build_is_a_test() {\n        assert!(super::tested());\n        assert!(!probe::library_is_tested());\n        assert_eq!(probe::greeting().to_lowercase().trim_end_matches("!"), "hello probe");\n    }\n}\n',
+    "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\ndefault-run = "app"\n\n[features]\nloud = ["util/loud"]\n\n[dependencies]\nutil = { path = "../util" }\n\n[[test]]\nname = "plain"\nharness = false\n',
+    "app/src/main.rs": '#![allow(unexpected_cfgs)]\n\nfn main() {\n    let name = std::env::args().nth(1).unwrap_or("world".to_string());\n    println!("{}", util::greeting(&name));\n    println!("{} {} {}", cfg!(debug_assertions), cfg!(extra), cfg!(target_feature = "avx2"));\n    let sum = std::panic::catch_unwind(|| name.len() as u8 + 251);\n    println!("{:?}", sum.ok());\n    // What a spin waits with: an `isb` on aarch64.\n    std::hint::spin_loop();\n    if name == "fail" {\n        std::process::exit(3);\n    }\n    // A cargo the program runs has the units of the build: the program stays the file it was.\n    if name == "cargo" {\n        use std::os::unix::fs::MetadataExt;\n        let me = std::env::current_exe().unwrap();\n        let before = std::fs::metadata(&me).unwrap().ino();\n        let cargo = std::env::var("CARGO").unwrap_or("cargo".to_string());\n        assert!(std::process::Command::new(cargo).args(["build", "-q", "-p", "app"]).status().unwrap().success());\n        println!("the program stayed: {}", before == std::fs::metadata(&me).unwrap().ino());\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn in_the_program() {\n        assert_eq!(util::greeting("x").len(), 7);\n    }\n\n    #[test]\n    fn links_the_library_without_its_tests() {\n        assert!(!util::tested());\n    }}\n',
     "app/src/bin/other.rs": 'fn main() {\n    println!("other: {}", util::greeting("other"));\n}\n',
     "app/examples/demo.rs": 'fn main() {\n    println!("demo: {}", util::greeting("demo"));\n}\n',
-    "app/tests/it.rs": '#[test]\nfn greets_it() {\n    assert_eq!(util::greeting("it").to_lowercase(), "hello it");\n}\n\n#[test]\nfn fails_when_asked() {\n    assert!(std::env::var("FLAGS_FAIL").is_err());\n}\n\n// A cargo run by a test has the units of the build: the program stays the file it was.\n#[test]\nfn a_cargo_inside_leaves_the_program() {\n    use std::os::unix::fs::MetadataExt;\n    let program = env!("CARGO_BIN_EXE_app");\n    let before = std::fs::metadata(program).unwrap().ino();\n    let cargo = std::env::var("CARGO").unwrap_or("cargo".to_string());\n    let built = std::process::Command::new(cargo).args(["build", "-q", "-p", "app"]).status().unwrap();\n    assert!(built.success());\n    assert_eq!(before, std::fs::metadata(program).unwrap().ino());\n}\n\n// What cargo tells a test of the places of the build is what the daemon tells it.\n#[test]\nfn the_places_of_the_build_are_cargos() {\n    assert!(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).is_dir());\n    let ran = std::process::Command::new(env!("CARGO_BIN_EXE_other")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&ran.stdout).lines().count(), 1);\n}\n',
+    # Integration tests whose harness is the daemon's: tests in modules, `cfg(test)` and a
+    # module of helpers beside them; and one test target that has no harness at all.
+    "app/tests/common/mod.rs": "pub fn twice<T: Clone>(it: T) -> (T, T) {\n    (it.clone(), it)\n}\n",
+    "app/tests/edge.rs": 'mod common;\n\n#[test]\nfn uses_common() {\n    assert_eq!(common::twice(3u8), (3, 3));\n}\n\n#[test]\n#[should_panic(expected = "boom")]\nfn panics() {\n    panic!("boom now");\n}\n\n#[test]\n#[ignore = "slow"]\nfn ignored() {\n    panic!("never run");\n}\n\n#[test]\n#[cfg_attr(miri, ignore = "under miri")]\nfn not_under_miri() {}\n\n#[cfg(test)]\nmod inner {\n    #[test]\n    fn under_cfg_test() {\n        assert_eq!(super::common::twice("a").0, "a");\n    }\n\n    mod deeper {\n        #[test]\n        fn deepest() {}\n    }\n}\n\n#[cfg(not(test))]\n#[test]\nfn never_built() {\n    panic!();\n}\n',
+    "app/tests/plain.rs": 'fn main() {\n    println!("plain: {}", util::greeting("plain"));\n}\n',
+    "app/tests/it.rs": 'use std::error::Error;\nuse std::io;\n\n#[test]\nfn greets_it() {\n    assert_eq!(util::greeting("it").to_lowercase(), "hello it");\n}\n\n#[test]\nfn fails_when_asked() {\n    assert!(std::env::var("FLAGS_FAIL").is_err());\n}\n\n// A test may return what `main` may: libtest fails it on an `Err`, and prints it.\n#[test]\nfn errs_when_asked() -> Result<(), Box<dyn Error>> {\n    std::env::var("FLAGS_FAIL").map_or(Ok(()), |it| Err(format!("asked: {it}").into()))\n}\n\n#[test]\nfn reads_nothing() -> io::Result<()> {\n    Ok(())\n}\n\n// A cargo run by a test has the units of the build: the program stays the file it was.\n#[test]\nfn a_cargo_inside_leaves_the_program() {\n    use std::os::unix::fs::MetadataExt;\n    let program = env!("CARGO_BIN_EXE_app");\n    let before = std::fs::metadata(program).unwrap().ino();\n    let cargo = std::env::var("CARGO").unwrap_or("cargo".to_string());\n    let built = std::process::Command::new(cargo).args(["build", "-q", "-p", "app"]).status().unwrap();\n    assert!(built.success());\n    assert_eq!(before, std::fs::metadata(program).unwrap().ino());\n}\n\n// What cargo tells a test of the places of the build is what the daemon tells it.\n#[test]\nfn the_places_of_the_build_are_cargos() {\n    assert!(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).is_dir());\n    let ran = std::process::Command::new(env!("CARGO_BIN_EXE_other")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&ran.stdout).lines().count(), 1);\n}\n',
 }
+
+def cross_cases():
+    """A run for aarch64 from an x86-64 Linux that has its linker, runner and library: the
+    daemon has a spare worker then, loaded with the host's library."""
+    triple, cross = "aarch64-unknown-linux-gnu", CROSS["aarch64-unknown-linux-gnu"]
+    if TARGET or not host().startswith("x86_64") or "linux" not in host():
+        return []
+    sysroot = subprocess.run(["rustc", "--print", "sysroot"], capture_output=True, text=True).stdout.strip()
+    tools = [cross["linker"], cross["runner"].split()[0]]
+    if not all(map(shutil.which, tools)) or not os.path.isdir(os.path.join(sysroot, "lib", "rustlib", triple)):
+        return []
+    variable = "CARGO_TARGET_" + triple.upper().replace("-", "_")
+    return [("run", ["--target", triple], {variable + "_LINKER": cross["linker"], variable + "_RUNNER": cross["runner"]})]
+
 
 # Each: the subcommand, its arguments, the variables it runs with.
 FLAG_CASES = [
     ("run", [], {}),
     ("run", ["--", "fail"], {}),
+    ("run", ["--", "cargo"], {}),
     ("run", ["--release"], {}),
     ("run", ["--release", "--", "fail"], {}),
     ("run", ["--", "world"], {"RUSTFLAGS": "-C overflow-checks=off"}),
@@ -551,6 +597,7 @@ FLAG_CASES = [
     ("run", ["--no-default-features", "-p", "app"], {}),
     # The host named: what is built for is the same, where it is put is not.
     ("run", ["--target", host()], {}),
+    *cross_cases(),
     ("run", ["-p", "app"], {}),
     ("run", ["--features", "loud", "-p", "app"], {}),
     ("run", ["--bin", "other"], {}),
@@ -560,10 +607,17 @@ FLAG_CASES = [
     ("run", ["-q", "name"], {}),
     ("run", [], {"RUSTFLAGS": "--cfg extra"}),
     ("build", ["--workspace"], {}),
+    ("build", ["--workspace", "--exclude", "util"], {}),
+    ("build", ["--message-format", "short"], {}),
+    ("build", ["--message-format=human"], {}),
     ("build", ["--all-features"], {}),
     ("check", [], {}),
     ("test", [], {}),
     ("test", ["--test", "it"], {}),
+    ("test", ["--test", "it", "--", "--exact", "greets_it"], {}),
+    ("test", ["--test", "edge"], {}),
+    ("test", ["--test", "edge", "--", "--ignored"], {}),
+    ("test", ["--test", "plain"], {}),
     ("test", ["-p", "util", "--lib"], {}),
     ("test", ["greets"], {}),
     ("test", ["--no-fail-fast"], {"FLAGS_FAIL": "1"}),
@@ -593,16 +647,24 @@ def flags(work):
 
     def round_of(label):
         for command, args, extra in FLAG_CASES:
+            served = daemons_builds(ours.cargo("status")[1].stdout)
             (_, mine), (_, other) = ours.cargo(command, *args, env=extra), theirs.cargo(command, *args, env=extra)
             read = test_results if command == "test" else program_output
             differs = difference(read(mine), read(other))
             shown = " ".join([*(f"{k}={v}" for k, v in extra.items()), "cargo rustd", command, *args])
-            rows.append((label, shown, how_built(mine.stderr), mine.returncode, differs or "same"))
-            if differs and (label, shown) in FLAGS_OPEN:
+            how = how_built(mine.stderr)
+            # `-q` has cargo say nothing of who built it: the daemon's count says.
+            if how == "cargo" and daemons_builds(ours.cargo("status")[1].stdout) > served:
+                how = "daemon"
+            if command != "check" and by_cargo(how):
+                differs = "; ".join(filter(None, [differs, "the build was cargo's"]))
+            rows.append((label, shown, how, mine.returncode, differs or "same"))
+            if differs and ((label, shown) in FLAGS_OPEN or TESTS_OPEN in how):
                 differs = "open: " + differs
             elif differs:
-                wrong.append(f"{label}: {shown}: {differs}")
-            print(f"  {label:6} {shown:50} exit {mine.returncode:3}  {how_built(mine.stderr):8.60}  {differs or 'same'}", flush=True)
+                said = "\n".join("    " + line for line in mine.stderr.splitlines()[-12:])
+                wrong.append(f"{label}: {shown}: {differs}\n  rustd said:\n{said}")
+            print(f"  {label:6} {shown:50} exit {mine.returncode:3}  {how:8.60}  {differs or 'same'}", flush=True)
 
     round_of("cold")
     wait_warm(ours, ws)
@@ -612,8 +674,182 @@ def flags(work):
     rewrite(os.path.join(ws, "app/tests/it.rs"), '"hello it"', '"hello it!"')
     round_of("edit")
     _, counted = ours.cargo("status")
+    if cargos_builds(counted.stdout):
+        wrong.append(f"flags: status counts {cargos_builds(counted.stdout)} builds by cargo")
     ours.cargo("stop")
     return rows, wrong, counted.stdout
+
+
+def scripted(work, check):
+    """A member whose build script watches nothing, which runs again for any edit of its
+    package: after the daemon's first build, an edit of the package is an edit, not a reload."""
+    ws = os.path.realpath(os.path.join(work, "scripted"))
+    for file, text in FLAG_WORKSPACE.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
+        open(os.path.join(ws, file), "w").write(text)
+    script = 'fn main() {\n    let out = std::env::var("OUT_DIR").unwrap();\n    std::fs::write(format!("{out}/said.txt"), "said").unwrap();\n    println!("cargo:rustc-cfg=built");\n}\n'
+    open(os.path.join(ws, "util/build.rs"), "w").write(script)
+    home = os.path.join(work, "home-scripted")
+    here = Side(ws, base_env(home), True)
+    _, cold = here.cargo("build")
+    wait_warm(here, ws)
+    rewrite(os.path.join(ws, "util/src/lib.rs"), 'format!("', 'format!("edited ')
+    _, edited = here.cargo("run")
+    logs = [os.path.join(home, kind, it, "log") for kind in ("workers", "spares") if os.path.isdir(os.path.join(home, kind)) for it in os.listdir(os.path.join(home, kind))]
+    reloads = sum(len(re.findall(r"^reload: ", open(it, errors="replace").read(), re.M)) for it in logs if os.path.exists(it))
+    here.cargo("stop")
+    check("an edit of a package whose build script runs again for it does not reload the workspace", cold.returncode == 0 and "edited hello" in edited.stdout and reloads == 0, f"{reloads} reloads, {here.how_built(edited.stderr)}")
+
+
+def registry_impls(work, check):
+    """An impl a registry crate writes in a function is found by the code that uses it:
+    bincode's `deserialize_enum` holds the `EnumAccess` an enum of serde's derive reads with."""
+    ws = os.path.realpath(os.path.join(work, "registry-impls"))
+    os.makedirs(os.path.join(ws, "src"), exist_ok=True)
+    open(os.path.join(ws, "Cargo.toml"), "w").write('[package]\nname = "bz"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nbincode = "=1.3.3"\nserde = { version = "1", features = ["derive"] }\n')
+    open(os.path.join(ws, "src/main.rs"), "w").write('#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]\nenum Kind {\n    A,\n    B(u8),\n    C { x: u16 },\n}\n\nfn main() {\n    let value = vec![Some(Kind::B(3)), None, Some(Kind::C { x: 9 }), Some(Kind::A)];\n    let back: Vec<Option<Kind>> = bincode::deserialize(&bincode::serialize(&value).unwrap()).unwrap();\n    assert_eq!(back, value);\n    println!("{back:?}");\n}\n')
+    here = Side(ws, base_env(os.path.join(work, "home-impls")), True)
+    _, ran = here.cargo("run")
+    here.cargo("stop")
+    said = "[Some(B(3)), None, Some(C { x: 9 }), Some(A)]"
+    check("an impl a registry crate writes in a function is used", ran.returncode == 0 and ran.stdout.strip() == said and here.how_built(ran.stderr) == "daemon", f"{ran.returncode}: {ran.stdout.strip()[-100:]} {ran.stderr.strip()[-300:]}")
+
+
+BODY_STATICS_DEP = """use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+pub fn counted() -> impl Future<Output = usize> {
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    async move { n }
+}
+
+pub fn shared() -> impl Future<Output = usize> {
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    async move { n }
+}
+
+pub fn shared_now() -> usize {
+    let mut future = std::pin::pin!(shared());
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match future.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(n) => n,
+        std::task::Poll::Pending => unreachable!(),
+    }
+}
+"""
+
+BODY_STATICS_NOW = """fn now<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match future.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(it) => it,
+        std::task::Poll::Pending => unreachable!(),
+    }
+}
+"""
+
+
+def body_statics(work, check):
+    """A writable static in the body of a function of another crate that hands out a future,
+    which rustc keeps to its object. We compile such a function ourselves, so the static is
+    ours when nothing of rustc's calls rustc's copy of the function, as hyper-util's `connect`
+    and its `tracing` callsites, and the build fails when something does: two copies of a
+    count would each count part."""
+    dep = os.path.realpath(os.path.join(work, "body-statics-dep"))
+    os.makedirs(os.path.join(dep, "src"), exist_ok=True)
+    open(os.path.join(dep, "Cargo.toml"), "w").write('[package]\nname = "dep"\nversion = "0.1.0"\nedition = "2021"\n')
+    open(os.path.join(dep, "src/lib.rs"), "w").write(BODY_STATICS_DEP)
+    git = lambda *args: subprocess.run(["git", "-c", "user.name=rustd", "-c", "user.email=rustd@localhost", *args], cwd=dep, check=True, capture_output=True)
+    git("init", "-q")
+    git("add", "-A")
+    git("commit", "-qm", "dep")
+    ws = os.path.realpath(os.path.join(work, "body-statics"))
+    os.makedirs(os.path.join(ws, "src/bin"), exist_ok=True)
+    url = pathlib.Path(dep).as_uri()
+    open(os.path.join(ws, "Cargo.toml"), "w").write(f'[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\ndep = {{ git = "{url}" }}\n')
+    open(os.path.join(ws, "src/bin/counted.rs"), "w").write(BODY_STATICS_NOW + 'fn main() {\n    let counts: Vec<usize> = (0..3).map(|_| now(async { dep::counted().await })).collect();\n    println!("{counts:?}");\n}\n')
+    open(os.path.join(ws, "src/bin/shared.rs"), "w").write(BODY_STATICS_NOW + 'fn main() {\n    println!("{} {} {}", dep::shared_now(), now(dep::shared()), dep::shared_now());\n}\n')
+    here = Side(ws, base_env(os.path.join(work, "home-statics")), True)
+    _, counted = here.cargo("run", "--bin", "counted")
+    check("a static of another crate's body that only our copy of its function reaches is ours", counted.returncode == 0 and counted.stdout.strip() == "[0, 1, 2]" and here.how_built(counted.stderr) == "daemon", f"{counted.returncode}: {counted.stdout.strip()[-100:]} {counted.stderr.strip()[-300:]}")
+    _, shared = here.cargo("run", "--bin", "shared")
+    here.cargo("stop")
+    check("and one rustc's code also reaches fails the build, named", shared.returncode != 0 and "writable static `CALLS`" in shared.stderr and "0 1 2" not in shared.stdout, f"{shared.returncode}: {shared.stdout.strip()[-100:]} {shared.stderr.strip()[-300:]}")
+
+
+INCREMENTAL_LIB = """use std::sync::atomic::{AtomicUsize, Ordering};
+static HITS: AtomicUsize = AtomicUsize::new(0);
+pub fn a() -> u32 { A }
+pub fn b() -> u32 { 2 }
+pub fn hit() -> usize { HITS.fetch_add(1, Ordering::SeqCst) + 1 }
+const A: u32 = 1;
+#[cfg(test)]
+mod tests {
+    #[test] fn ta() { assert_eq!(super::a(), 1); }
+    #[test] fn tb() { assert_eq!(super::b(), 2); }
+    #[test] fn h1() { assert!(super::hit() >= 1); }
+    #[test] fn h2() { assert!(super::hit() >= 1); }
+    #[test] #[should_panic] fn tp() { assert_eq!(super::b(), 3); }
+    #[test] fn abort() { if std::env::var_os("INCREMENTAL_ABORT").is_some() { std::process::abort() } }
+    #[test] fn sleep() { if std::env::var_os("INCREMENTAL_SLEEP").is_some() { std::thread::sleep(std::time::Duration::from_secs(60)) } }
+}
+"""
+
+
+def incremental(work):
+    """Which tests `cargo rustd test` runs again. The result is each check with whether it
+    held."""
+    ws = os.path.realpath(os.path.join(work, "incremental"))
+    lib = os.path.join(ws, "src/lib.rs")
+    os.makedirs(os.path.dirname(lib), exist_ok=True)
+    open(os.path.join(ws, "Cargo.toml"), "w").write('[package]\nname = "lib"\nversion = "0.1.0"\nedition = "2021"\n')
+    open(lib, "w").write(INCREMENTAL_LIB)
+    side = Side(ws, base_env(os.path.join(work, "home-incremental")), True)
+    checks = []
+
+    def check(name, cached, *args, env=None, listed=7, failed=()):
+        """That the tests in `cached` are the ones listed as cached, those in `failed` failed,
+        and all others ran."""
+        _, ran = side.cargo("test", *args, env=env)
+        results = dict(re.findall(r"^test tests::(\w+)(?: - should panic)? \.\.\. (.+)$", ran.stdout, re.M))
+        found = sorted(name for name, result in results.items() if result.endswith("(cached)"))
+        failing = sorted(name for name, result in results.items() if result.startswith("FAILED"))
+        held = (ran.returncode == 0) == (not failed) and found == sorted(cached) and failing == sorted(failed) and len(results) == listed
+        # Cached or not, a test is named as libtest names it.
+        held = held and ("tp" not in results or "test tests::tp - should panic ... " in ran.stdout)
+        checks.append((f"incremental: {name}", held, f"cached {found}, failed {failing}"))
+        print(f"  {'ok ' if held else 'NOT'} incremental: {name}  cached {found}, failed {failing}", flush=True)
+        return ran
+
+    every = ["abort", "h1", "h2", "sleep", "ta", "tb", "tp"]
+    check("the first run runs every test", [])
+    check("a run with nothing changed runs none", every)
+    side.cargo("stop")
+    check("a new daemon runs every test", [])
+    edited = INCREMENTAL_LIB.replace("{ A }", "{ A.min(5) }")
+    open(lib, "w").write(edited)
+    check("an edit runs the test that reaches it", [it for it in every if it != "ta"])
+    open(lib, "w").write(edited.replace("+ 1 }", "+ 2 }"))
+    check("an edit of what writes a static runs the tests that reach it", ["abort", "sleep", "ta", "tb", "tp"])
+    check("--rerun-all runs every test", [], "--rerun-all")
+    check("RUSTD_TEST_CACHE=0 runs every test", [], env={"RUSTD_TEST_CACHE": "0"})
+    check("a filter lists the cached test", ["tb"], "tb", listed=1)
+    open(os.path.join(ws, "data.txt"), "w").write("x")
+    check("a new file in the package runs every test", [])
+    check("the environment runs every test", [], env={"INCREMENTAL_ANY": "1"})
+    check("--skip is kept when no test is cached", [], "--", "--skip", "h", env={"INCREMENTAL_ANY": "2"}, listed=5)
+    check("--skip is kept when tests are cached", ["abort", "sleep", "ta", "tb", "tp"], "--", "--skip", "h", env={"INCREMENTAL_ANY": "2"}, listed=5)
+    check("--exact is kept when no test is cached", [], "--", "--exact", "tests::h1", env={"INCREMENTAL_ANY": "3"}, listed=1)
+    # Each test runs in a process of its own: one that aborts or hangs fails alone.
+    aborted = check("a test that aborts fails alone", [], env={"INCREMENTAL_ABORT": "1"}, failed=["abort"])
+    check("a test that failed runs again", [it for it in every if it != "abort"], env={"INCREMENTAL_ABORT": "1"}, failed=["abort"])
+    check("a test that runs too long is stopped", [], env={"INCREMENTAL_SLEEP": "1", "RUSTD_TEST_TIMEOUT": "2"}, failed=["sleep"])
+    held = "---- tests::abort stdout ----" in aborted.stdout and "failures:\n    tests::abort" in aborted.stdout
+    checks.append(("incremental: a test that aborts is listed among the failures", held, ""))
+    side.cargo("stop")
+    return checks
 
 
 def daemon(work):
@@ -685,7 +921,7 @@ def daemon(work):
 
     other = os.path.join(work, "other-build")
     os.makedirs(other, exist_ok=True)
-    for name in ("rustd" + EXE, "cargo-rustd" + EXE, "rustd-rustc" + EXE):
+    for name in ("rustd" + EXE, "cargo-rustd" + EXE, "rustd-rustc" + EXE, "rustd-rustc-first" + EXE):
         shutil.copy(os.path.join(os.path.dirname(RUSTD), name), os.path.join(other, name))
     newer = Side(ws, dict(env, PATH=other + os.pathsep + env["PATH"]), True)
     edit(ws, "five")
@@ -714,6 +950,28 @@ def daemon(work):
     edit(ws, "six")
     _, again = here.cargo("run")
     check("the build after that starts a daemon again and succeeds", again.returncode == 0 and "hello world" in again.stdout and status()[0] not in (None, pid))
+    # What the daemon could not load once, it loads again when a source of the crate is
+    # written: rustc read none of them, so it is not cargo's dep-info that says which.
+    valued = os.path.join(ws, "app/tests/valued.rs")
+    open(valued, "w").write("struct Valued;\n\nimpl std::process::Termination for Valued {\n    fn report(self) -> std::process::ExitCode {\n        std::process::ExitCode::SUCCESS\n    }\n}\n\n#[test]\nfn valued() -> Valued {\n    Valued\n}\n")
+    _, refused = here.cargo("test", "--test", "valued")
+    time.sleep(1)
+    open(valued, "w").write("#[test]\nfn valued() {}\n")
+    _, mended = here.cargo("test", "--test", "valued")
+    open(valued, "w").write('#[test]\n#[cfg_attr(not(miri), ignore = "not under miri")]\nfn valued() {}\n\n#[test]\n#[cfg_attr(miri, ignore)]\n#[cfg_attr(not(miri), should_panic(expected = "boom"))]\nfn gated() {\n    panic!("boom");\n}\n')
+    _, gated = here.cargo("test", "--test", "valued")
+    check("the `cfg_attr`s of a test that hold are read", gated.returncode == 0 and "test valued ... ignored, not under miri" in gated.stdout and "test gated - should panic ... ok" in gated.stdout, f"{gated.returncode}: {gated.stdout.strip()[-300:]} {gated.stderr.strip()[-200:]}")
+    os.remove(valued)
+    check("a test the daemon refuses fails the build, and runs once its source is mended", refused.returncode != 0 and "returns a value" in refused.stderr and mended.returncode == 0 and "1 passed" in mended.stdout, f"{refused.returncode}: {refused.stderr.strip()[-200:]}; then {mended.returncode}: {mended.stdout.strip()[-100:]} {mended.stderr.strip()[-200:]}")
+    _, before = here.cargo("test", "--test", "edge")
+    added = os.path.join(ws, "app/tests/added.rs")
+    open(added, "w").write("#[test]\nfn added() {}\n")
+    _, found = here.cargo("test", "--test", "added")
+    os.remove(added)
+    check("a test file added after the daemon loaded the tests is a target it builds", before.returncode == 0 and found.returncode == 0 and "1 passed" in found.stdout, found.stderr.strip()[-200:])
+    scripted(work, check)
+    registry_impls(work, check)
+    body_statics(work, check)
     here.cargo("stop")
     manners(work, ws, env, here, check, edit)
     abuse(work, ws, tree, env, check, status, alive)
@@ -861,11 +1119,11 @@ def abuse(work, ws, tree, env, check, status, alive):
     edit("skew")
     _, skewed = older.cargo("run", "skew")
     said = how_built(skewed.stderr)
-    check("a build by another build of rustd is cargo's, says why, and replaces the daemon", skewed.returncode == 0 and greets(skewed.stdout, "tree0 skew") and "another build of rustd" in said and status(older)[0] not in (None, pid) and not alive(pid), said)
+    check("a build by another build of rustd is the daemon's, by the daemon it replaces the old one with", skewed.returncode == 0 and greets(skewed.stdout, "tree0 skew") and said == "daemon" and status(older)[0] not in (None, pid) and not alive(pid), said)
     wait_warm(older, ws)
     edit("back")
     _, back = here.cargo("run", "back")
-    check("and the first build of rustd replaces that one the same way", back.returncode == 0 and greets(back.stdout, "tree0 back") and "another build of rustd" in how_built(back.stderr) and status()[0] is not None, how_built(back.stderr))
+    check("and the first build of rustd replaces that one the same way", back.returncode == 0 and greets(back.stdout, "tree0 back") and how_built(back.stderr) == "daemon" and status()[0] is not None, how_built(back.stderr))
     wait_warm(here, ws)
 
     stranger(env["RUSTD_HOME"], check)
@@ -895,7 +1153,13 @@ def stranger(home, check):
     sock = os.path.join(home, "daemon.sock")
     version = re.search(r"version (\S+),", subprocess.run(["cargo", "rustd", "status"], env=dict(os.environ, RUSTD_HOME=home, PATH=os.path.dirname(RUSTD) + os.pathsep + os.environ["PATH"]), capture_output=True, text=True).stdout)[1]
     request = json.dumps({"version": version, "replaces": False, "request": "Status"})
-    knock = lambda user: subprocess.run([*(["sudo", "-n", "-u", user] if user else []), sys.executable, "-c", CONNECT, sock, request], capture_output=True, text=True, cwd="/").stdout.strip()
+    # A Python under the user's home may be one the second user can't run.
+    python, up = os.path.realpath(sys.executable), []
+    while not up or up[-1] != os.path.dirname(up[-1]):
+        up.append(os.path.dirname(up[-1] if up else python))
+    reachable = all(os.stat(it).st_mode & 0o001 for it in [python, *up])
+    python = python if reachable else shutil.which("python3", path="/usr/bin:/bin") or python
+    knock = lambda user: subprocess.run([*(["sudo", "-n", "-u", user] if user else []), python, "-c", CONNECT, sock, request], capture_output=True, text=True, cwd="/").stdout.strip()
     try:
         mine = knock(None)
         check("the user's own raw request is answered", made.returncode == 0 and '"Status"' in mine, mine[:60])
@@ -923,7 +1187,7 @@ def stranger(home, check):
         # user's client, which sends its request and its variables to whoever serves it.
         trap = os.path.join(tempfile.mkdtemp(prefix="rustd-trap-", dir="/tmp"), "sock")
         os.chmod(os.path.dirname(trap), 0o777)
-        listener = subprocess.Popen(["sudo", "-n", "-u", name, sys.executable, "-c", LISTEN, trap], stdout=subprocess.PIPE, text=True, cwd="/")
+        listener = subprocess.Popen(["sudo", "-n", "-u", name, python, "-c", LISTEN, trap], stdout=subprocess.PIPE, text=True, cwd="/")
         try:
             listener.stdout.readline()
             asked = subprocess.run([RUSTD, "sync", trap], capture_output=True, text=True, timeout=60)
@@ -1043,138 +1307,15 @@ def plain(work):
             wrong += f"; {mine.stderr.strip()[-600:]!r}"
         return mine, here.how_built(mine.stderr), wrong
 
-    first, how, wrong = same("run")
-    outer, inner = calls("outer"), calls("inner")
-    check("the first plain `cargo run` is rustc's and is right", first.returncode == 0 and not wrong and how.startswith("cargo"), f"{how}; {wrong or 'same as cargo'}")
+    _, first = here.cargo("run")
+    outer = calls("outer")
+    check("plain `cargo run` fails at the first crate of the workspace, naming `cargo rustd run`", first.returncode == 101 and "`cargo rustd run`" in first.stderr, first.stderr.strip()[-300:])
+    built = glob.glob(os.path.join(ws, "target/debug/deps/libutil-*.rlib")) + glob.glob(os.path.join(ws, "target/debug/app"))
+    check("and rustc compiled no crate of the workspace", not built, " ".join(built))
     check("the user's `rustc-wrapper` still runs, around rustd's wrapper", "chained" not in on.stdout and any("rustd-rustc" in c for c in outer), f"{len(outer)} calls")
-    check("the user's workspace wrapper still runs, under rustd's", "plain-inner.sh" in on.stdout and len(inner) > 0 and not any("rustd-rustc" in c for c in inner), f"{len(inner)} calls")
-    took, states = wait_warm(here, ws)
-    pid, workers, _ = status()
-    check("the daemon was started by that build and has loaded it", pid is not None and "ready" in " ".join(states), f"pid {pid}, {'; '.join(states)}, {took:.1f}s")
-
-    touch("one")
-    mine, how, wrong = same("run", "one")
-    check("an edit of the program is linked by the daemon", mine.returncode == 0 and not wrong and how == "daemon", f"{how}; {wrong or 'same as cargo'}")
-    edit("lib")
-    mine, how, wrong = same("run", "lib")
-    check("an edit of a library of the workspace is built by the daemon into the program", mine.returncode == 0 and not wrong and how == "daemon" and greets(mine.stdout, "lib hello lib"), f"{how}; {wrong or 'same as cargo'}")
-    took, noop = here.cargo("run")
-    check("a build with nothing changed runs nothing", noop.returncode == 0 and "Compiling" not in noop.stderr, f"{took:.2f}s" if noop.returncode == 0 else f"exit {noop.returncode}; {noop.stderr.strip()[-600:]!r}")
-
-    cases = [
-        ("test", [], None), ("test", ["--doc"], None), ("test", ["--no-fail-fast"], {"FLAGS_FAIL": "1"}),
-        ("run", ["--example", "demo"], None), ("run", ["--release"], None),
-        ("run", ["--target", "x86_64-unknown-linux-gnu"], None), ("run", ["--bin", "other"], None),
-        ("run", ["--features", "loud", "-p", "app"], None), ("run", ["--", "fail"], None),
-        ("check", [], None), ("check", ["--all-targets"], None), ("build", ["--workspace", "--all-targets"], None),
-    ]
-    for round in ("first", "edited"):
-        for command, args, more in cases:
-            mine, how, wrong = same(command, *args, more=more)
-            name = " ".join(["cargo", command, *args, *(f"{k}={v}" for k, v in (more or {}).items())])
-            check(f"`{name}`, {round}", not wrong, f"{how[:90]}; {wrong or 'same as cargo'}")
-        wait_warm(here, ws)
-        touch(round)
-        edit(round)
-
-    broken = os.path.join(ws, "app/src/main.rs")
-    kept = open(broken).read()
-    open(broken, "a").write("\nfn broken() -> u32 { \"text\" }\n")
-    mine = here.cargo("build")[1]
-    check("a build that does not compile fails with cargo's status", mine.returncode == 101, f"exit {mine.returncode}")
-    open(broken, "w").write(kept)
-    mine, how, wrong = same("run", "mended")
-    check("and the build after it is mended is right", mine.returncode == 0 and not wrong, f"{how[:90]}; {wrong or 'same as cargo'}")
-
-    wait_warm(here, ws)
-    for file, name in ((broken, "the program's crate"), (os.path.join(ws, "util/src/lib.rs"), "a library of the workspace")):
-        kept = open(file).read()
-        open(file, "a").write(USE_AFTER_MOVE)
-        # Rustc compiles a library of the workspace under plain cargo, and finds it there.
-        mine = here.cargo("run", "moved")[1]
-        check(f"a use after a move in {name} on a warm `cargo run` ends as a build does", mine.returncode in (0, 101), f"exit {mine.returncode}")
-        open(file, "w").write(kept)
-        mine, how, wrong = same("run", "mended")
-        check("and the build after it is mended is right", mine.returncode == 0 and not wrong, f"{how[:90]}; {wrong or 'same as cargo'}")
-        wait_warm(here, ws)
-
-    root = os.path.join(work, "plain-installed")
-    _, installed = here.cargo("install", "--path", "app", "--root", root, "--bin", "app")
-    ran = subprocess.run([os.path.join(root, "bin/app"), "installed"], capture_output=True, text=True)
-    check("`cargo install` installs a program that runs", installed.returncode == 0 and ran.returncode == 0 and ran.stdout.splitlines()[0].endswith("hello installed"), ran.stdout.strip() or installed.stderr[-200:])
-
-    # What rust-analyzer does while the user builds: `cargo check` with JSON messages.
-    wait_warm(here, ws)
-    touch("checked")
-    checker = subprocess.Popen(["cargo", "check", "--workspace", "--all-targets", "--message-format=json"], cwd=ws, env=here.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    mine, how, wrong = same("run", "checked")
-    out, _ = checker.communicate(timeout=600)
-    whole = all(line.startswith("{") for line in out.splitlines())
-    check("a `cargo check` with JSON messages at the same time as a build: both are right", checker.returncode == 0 and whole and mine.returncode == 0 and not wrong, f"{how[:60]}; {len(out.splitlines())} messages; {wrong or 'same as cargo'}")
-
-    trees = [ws]
-    for n in (1, 2, 3):
-        trees.append(os.path.realpath(os.path.join(work, f"plain-worktree{n}")))
-        git("worktree", "add", "-q", "--detach", trees[-1])
-    sides = [Side(root, env, "plain") for root in trees]
-    for side in sides[1:]:
-        side.cargo("build")
-    for side in sides:
-        wait_warm(side, side.ws)
-    pid, workers, text = status()
-    check("the worktrees are loaded by the one daemon", pid is not None and all(f"    {root}: ready" in text for root in trees), f"{len(workers)} workers")
-    for n, root in enumerate(trees[1:], 1):
-        rewrite(os.path.join(root, "util/src/lib.rs"), 'format!("hello {name}")', f'format!("tree{n} {{name}}")')
-    here.how_built("")
-    spawn = lambda root, *args: subprocess.Popen(["cargo", *args], cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, start_new_session=True)
-    clients = [(n, i, spawn(root, "run", f"c{i}")) for i in range(4) for n, root in enumerate(trees) if n]
-    ended = [(n, i, client.communicate(timeout=600), client.returncode) for n, i, client in clients]
-    right = [code == 0 and greets(out[0], f"tree{n} c{i}") for n, i, out, code in ended]
-    check("12 plain cargo builds at once on 3 worktrees each run their own tree's program", all(right) and status()[0] == pid, f"{sum(right)} of 12 right; {here.how_built('')[:80]}")
-
-    for side in sides:
-        wait_warm(side, side.ws)
-    pid, workers, _ = status()
-    touch("killed")
-    signalled = lambda sent: [os.kill(p, sent) for p in workers if alive(p)]
-    signalled(signal.SIGSTOP)
-    client = spawn(ws, "run", "killed")
-    time.sleep(1.5)
-    waits = client.poll() is None
-    os.kill(pid, signal.SIGKILL)
-    signalled(signal.SIGCONT)
-    out, err = client.communicate(timeout=600)
-    said = here.how_built(err)
-    check("the build whose daemon is killed succeeds", waits and client.returncode == 0 and out.splitlines()[0].endswith("killed"), f"exit {client.returncode}, {said[:120]}, {err.strip()[-200:]}")
-    wait_warm(here, ws)
-    touch("after")
-    mine, how, wrong = same("run", "after")
-    check("the build after that is a new daemon's", mine.returncode == 0 and not wrong and how == "daemon" and status()[0] not in (None, pid), how[:90])
-
-    # Another build of rustd: the same files in another place have another version.
-    other = os.path.join(work, "plain-other-build")
-    os.makedirs(other)
-    for name in ("rustd", "cargo-rustd", "rustd-rustc"):
-        shutil.copy(os.path.join(os.path.dirname(RUSTD), name), os.path.join(other, name))
-    pid = status()[0]
+    _, ours = Side(ws, env, True).cargo("run")
+    check("`cargo rustd run` builds it while rustd is enabled", "profile [rustd]" in ours.stderr, ours.stderr.strip()[-300:])
     subprocess.run([RUSTD, "disable"], env=env, capture_output=True)
-    subprocess.run([os.path.join(other, "rustd"), "enable"], env=env, capture_output=True)
-    touch("skew")
-    mine, how, wrong = same("run", "skew")
-    theirs = os.path.join(other, "rustd")
-    began = time.time()
-    while "    " + ws + ": ready" not in status(theirs)[2] and time.time() - began < 120:
-        time.sleep(0.25)
-    newer = status(theirs)[0]
-    check("plain cargo by another build of rustd is rustc's and replaces the daemon", mine.returncode == 0 and not wrong and how.startswith("cargo") and newer not in (None, pid) and not alive(pid), f"{how[:120]}; daemon {pid} then {newer}")
-    touch("skewed")
-    mine, how, wrong = same("run", "skewed")
-    check("and the build after that is the new daemon's", mine.returncode == 0 and not wrong and how == "daemon" and status(theirs)[0] == newer, how[:90])
-    subprocess.run([os.path.join(other, "rustd"), "disable"], env=env, capture_output=True)
-
-    seen = subprocess.run([RUSTD, "status"], env=env, cwd=ws, capture_output=True, text=True).stdout
-    counted = re.search(r"(\d+) programs? linked by the daemon, (\d+) by rustc", seen)
-    check("status counts what the daemon linked and why rustc linked the rest", counted and int(counted[1]) > 0, counted[0] if counted else seen[:200])
     back = open(os.path.join(home, "config.toml")).read()
     check("after `rustd disable` the configuration is the user's again, byte for byte", back == before)
     touch("off")
@@ -1182,13 +1323,12 @@ def plain(work):
     mine, how, wrong = same("run", "off")
     check("and plain cargo is cargo alone again, through the user's wrappers", mine.returncode == 0 and not wrong and not re.search(r"^rustd:|\[rustd\]", mine.stderr, re.M) and not any("rustd-rustc" in c for c in calls("outer")[n:]) and len(calls("outer")) > n, f"exit {mine.returncode}, {wrong or 'same as cargo'}, {len(calls('outer')) - n} calls of the wrapper, by rustd's {[c[:200] for c in calls('outer')[n:] if 'rustd-rustc' in c][:2]}; {mine.stderr.strip()[-300:]}")
     subprocess.run([RUSTD, "stop"], env=env, capture_output=True)
-    subprocess.run([os.path.join(other, "rustd"), "stop"], env=env, capture_output=True)
     return checks
 
 
 def worktree(ours, row, build, run, edits, work):
     """A second checkout of the project's repository, at the commit the first started from:
-    built from nothing, which is cargo's, then edited as the first was and built again. What
+    built from nothing, then edited as the first was and built again. What
     its program says after the edit has to be what the first one's says."""
     git = lambda *args: subprocess.run(["git", "-c", "user.name=rustd", "-c", "user.email=rustd@localhost", *args], cwd=ours.ws, capture_output=True, text=True)
     # One place for each way of building: a daemon still loading the first writes there
@@ -1207,6 +1347,8 @@ def worktree(ours, row, build, run, edits, work):
         took, ran = there.cargo(command, *args)
         row["times"][label] = (round(took, 2), None)
         row["built"][label] = there.how_built(ran.stderr)
+        if not ours.plain and by_cargo(row["built"][label]):
+            row["wrong"].append(f"{label}: the build was cargo's")
         print(f"  {label:12} rustd {took:7.2f}s  {row['built'][label]:8.80}  exit {ran.returncode}", flush=True)
         return ran
 
@@ -1239,7 +1381,7 @@ def table(rows):
         for step in steps:
             ours, theirs = row["times"].get(step, (None, None))
             who = row["built"].get(step, "")
-            mark = "" if who in ("daemon", "cargo") or "warm-up" in step else " (c)" if who.startswith("cargo") else ""
+            mark = " (c)" if who.startswith("cargo") else " (o)" if TESTS_OPEN in who else ""
             if "warm-up" in step:
                 mark = "" if who and all(s == "ready" for s in who.split("; ")) else " (f)"
             cells.append("-" if ours is None else f"{ours:.2f}{mark}" if theirs is None else f"{'**' if who == 'daemon' else ''}{ours:.2f}{'**' if who == 'daemon' else ''}{mark} / {theirs:.2f}")
@@ -1273,23 +1415,24 @@ def main():
         result["flags"], result["flags_status"] = rows, counted
         result["wrong"] += wrong
         print("daemon:", flush=True)
-        result["daemon"] = daemon(work)
+        result["daemon"] = daemon(work) + incremental(work)
         result["wrong"] += [f"daemon: {name} {detail}" for name, held, detail in result["daemon"] if not held]
         print("plain cargo:", flush=True)
         result["plain"] = plain(work)
         result["wrong"] += [f"plain cargo: {name} {detail}" for name, held, detail in result["plain"] if not held]
     # A run of some of it leaves the rows of the rest as the run before wrote them.
     llvm = os.environ.get("RUSTD_BACKEND") == "llvm"
-    stored = os.path.join(HERE, "cargo_rustd_llvm.json" if llvm else "cargo_rustd.json")
+    reports = os.environ.get("RUSTD_REPORTS") or HERE
+    stored = os.path.join(reports, "cargo_rustd_llvm.json" if llvm else "cargo_rustd.json")
     before = json.load(open(stored)) if os.path.exists(stored) else {}
     rows = {(row["project"], row.get("mode", "rustd")): row for row in before.get("projects", []) + result["projects"]}
     result["projects"] = [rows[name, mode] for name in PROJECTS for mode in MODES if (name, mode) in rows]
     if "--only-projects" in argv:
         result.update({part: before.get(part, []) for part in ("flags", "flags_status", "daemon", "plain")})
     json.dump(result, open(stored, "w"), indent=1)
-    with open(os.path.join(HERE, "CARGO-RUSTD-LLVM.md" if llvm else "CARGO-RUSTD.md"), "w") as md:
+    with open(os.path.join(reports, "CARGO-RUSTD-LLVM.md" if llvm else "CARGO-RUSTD.md"), "w") as md:
         md.write(f"# cargo rustd against cargo, {'LLVM at -O2' if llvm else 'Cranelift'}\n\nGenerated by `harness/cargo_rustd.py`. Seconds, rustd / cargo alone for the same step; the steps in the second checkout (`tree`) are rustd's only. "
-                 "Bold is a build the daemon did; `(c)` one cargo did in its place, with the reason below; `(f)` a warm-up that failed. "
+                 "Bold is a build the daemon did; `(c)` one cargo did in its place, which fails the run; `(o)` a command that builds tests, which the daemon does not build yet; `(f)` a warm-up that failed. "
                  "Differences counts the steps whose program output, exit status or test results were not cargo's.\n\n")
         for mode, title in MODES.items():
             md.write(f"## {title}\n\n" + table([r for r in result["projects"] if r.get("mode", "rustd") == mode]) + "\n\n")

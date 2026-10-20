@@ -9,6 +9,7 @@ use std::{
 };
 
 use ide_db::base_db::Env;
+use paths::AbsPath;
 use project_model::{CargoConfig, ProjectWorkspace, ProjectWorkspaceKind, TargetKind};
 use rustc_hash::{FxHashMap, FxHasher};
 
@@ -32,23 +33,38 @@ struct Checkout {
     scripts: Option<Scripts>,
 }
 
+/// The directories of a package where cargo finds programs, tests, examples and benches by
+/// their place, without the manifest naming them.
+const TARGET_DIRS: [&str; 4] = ["src/bin", "tests", "examples", "benches"];
+
+/// What of a watched path says it changed.
+#[derive(Clone, Copy)]
+enum Stamp {
+    /// The file, or each file below the directory.
+    Whole,
+    /// Each file below the directory of a package, but for what a build wrote and the
+    /// packages inside.
+    Package,
+    /// Which targets cargo finds in the directory: its Rust files and the directories with a
+    /// `main.rs`.
+    Targets,
+}
+
 /// A file or a directory, and what it was when the daemon read it.
 struct Watched {
     path: PathBuf,
-    /// Whether the directory is a package, of which cargo leaves out what a build wrote and
-    /// the packages inside.
-    package: bool,
+    kind: Stamp,
     stamp: u64,
 }
 
 impl Watched {
-    fn new(path: PathBuf, package: bool) -> Watched {
-        let stamp = stamp(&path, package);
-        Watched { path, package, stamp }
+    fn new(path: PathBuf, kind: Stamp) -> Watched {
+        let stamp = stamp(&path, kind);
+        Watched { path, kind, stamp }
     }
 
     fn changed(&self) -> bool {
-        stamp(&self.path, self.package) != self.stamp
+        stamp(&self.path, self.kind) != self.stamp
     }
 }
 
@@ -81,19 +97,25 @@ impl Inputs {
         let mut files = Vec::new();
         for dir in root.ancestors() {
             for name in ["config.toml", "config"] {
-                files.push(Watched::new(dir.join(".cargo").join(name), false));
+                files.push(Watched::new(dir.join(".cargo").join(name), Stamp::Whole));
             }
         }
         for name in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rust-toolchain"] {
-            files.push(Watched::new(root.join(name), false));
+            files.push(Watched::new(root.join(name), Stamp::Whole));
         }
         if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind {
             for package in cargo.packages().filter(|&it| cargo[it].is_local) {
                 let manifest: &Path = cargo[package].manifest.as_ref();
-                files.push(Watched::new(manifest.to_owned(), false));
+                files.push(Watched::new(manifest.to_owned(), Stamp::Whole));
                 // A script that appears there is run without the manifest naming it.
-                files.push(Watched::new(manifest.with_file_name("build.rs"), false));
+                files.push(Watched::new(manifest.with_file_name("build.rs"), Stamp::Whole));
+                // As are the programs, tests and examples cargo finds there by their place.
+                let found = TARGET_DIRS.iter().map(|it| manifest.with_file_name(it));
+                files.extend(found.map(|it| Watched::new(it, Stamp::Targets)));
             }
+            // And the crates of examples `cargo rustd test` has rust-analyzer add.
+            let examples = cargo.target_directory().join(crate::doctest::DIR);
+            files.push(Watched::new(examples.into(), Stamp::Targets));
         }
         let flags = FLAGS.iter().map(|&it| (it, run_with(config, it))).collect();
         let scripts = Scripts::of(workspace, config);
@@ -151,12 +173,15 @@ impl Scripts {
             }
             let script = cargo[package].targets.iter().map(|&it| &cargo[it]);
             let script = script.filter(|it| it.kind == TargetKind::BuildScript);
-            files.extend(script.map(|it| Watched::new(PathBuf::from(it.root.as_str()), false)));
+            files.extend(
+                script.map(|it| Watched::new(PathBuf::from(it.root.as_str()), Stamp::Whole)),
+            );
             match said.watches {
                 // A script that names nothing is run again when any file of its package changes.
-                false => files.push(Watched::new(root.to_owned(), true)),
-                true => files
-                    .extend(said.files.into_iter().map(|it| Watched::new(root.join(it), false))),
+                false => files.push(Watched::new(root.to_owned(), Stamp::Package)),
+                true => files.extend(
+                    said.files.into_iter().map(|it| Watched::new(root.join(it), Stamp::Whole)),
+                ),
             }
         }
         variables.sort();
@@ -177,9 +202,18 @@ impl Scripts {
         if !files && !variables {
             return Ok(false);
         }
-        let ProjectWorkspaceKind::Cargo { build_scripts: loaded, .. } = &self.workspace.kind else {
+        let ProjectWorkspaceKind::Cargo { cargo, build_scripts: loaded, .. } = &self.workspace.kind
+        else {
             return Ok(false);
         };
+        // The scripts may have run in cargo's own build so far, the daemon's first build being
+        // one: their first run here starts from what that build left, and builds none again.
+        let target: &paths::Utf8Path = cargo.target_directory().as_ref();
+        let own = self.config.target_dir_config.target_dir(Some(target));
+        let own = own.filter(|it| *it == target.join("rust-analyzer")).map(|it| it.into_owned());
+        if own.is_some() {
+            crate::seed_own_target(target.as_ref());
+        }
         let mut config = self.config.clone();
         for (name, was) in &self.variables {
             let value = env.map_or_else(|| was.clone(), |env| env.get(name));
@@ -189,11 +223,14 @@ impl Scripts {
         if let Some(error) = said.error() {
             anyhow::bail!("a build script failed: {}", error.trim().replace('\n', " "));
         }
-        if said != *loaded {
+        // Cargo's own build ran them last in other directories, whose files are the same
+        // when what they say is.
+        let alike = |a: &AbsPath, b: &AbsPath| own.is_some() && same_files(a.as_ref(), b.as_ref());
+        if !said.says_as(loaded, alike) {
             return Ok(true);
         }
         for file in &mut self.files {
-            file.stamp = stamp(&file.path, file.package);
+            file.stamp = stamp(&file.path, file.kind);
         }
         for (name, was) in &mut self.variables {
             *was = config.extra_env.get(name).cloned().flatten();
@@ -201,6 +238,35 @@ impl Scripts {
         self.config = config;
         Ok(false)
     }
+}
+
+/// Whether the file or the tree of files at `a` is the one at `b`.
+fn same_files(a: &Path, b: &Path) -> bool {
+    let (Ok(at_a), Ok(at_b)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if (at_a.dev(), at_a.ino()) == (at_b.dev(), at_b.ino()) {
+            return true;
+        }
+    }
+    if at_a.is_dir() && at_b.is_dir() {
+        let names = |dir: &Path| -> Option<Vec<std::ffi::OsString>> {
+            let mut names = std::fs::read_dir(dir).ok()?.map(|it| Some(it.ok()?.file_name()));
+            let mut names = names.by_ref().collect::<Option<Vec<_>>>()?;
+            names.sort();
+            Some(names)
+        };
+        let Some(names) = names(a).filter(|it| Some(it) == names(b).as_ref()) else {
+            return false;
+        };
+        return names.iter().all(|it| same_files(&a.join(it), &b.join(it)));
+    }
+    at_a.is_file()
+        && at_a.len() == at_b.len()
+        && std::fs::read(a).is_ok_and(|it| std::fs::read(b).is_ok_and(|other| it == other))
 }
 
 /// What a build script asked cargo to watch.
@@ -235,9 +301,24 @@ impl Said {
 
 /// A number that changes when the file at `path`, or a file below the directory there, is
 /// written, added or removed.
-fn stamp(path: &Path, package: bool) -> u64 {
+fn stamp(path: &Path, kind: Stamp) -> u64 {
     let mut hasher = FxHasher::default();
-    stamp_into(path, package, &mut hasher);
+    match kind {
+        Stamp::Whole => stamp_into(path, false, &mut hasher),
+        Stamp::Package => stamp_into(path, true, &mut hasher),
+        Stamp::Targets => {
+            let entries = std::fs::read_dir(path).into_iter().flatten().flatten();
+            let mut targets: Vec<PathBuf> = entries
+                .map(|it| it.path())
+                .filter(|it| match it.is_dir() {
+                    true => it.join("main.rs").exists(),
+                    false => it.extension().is_some_and(|it| it == "rs"),
+                })
+                .collect();
+            targets.sort();
+            targets.hash(&mut hasher);
+        }
+    }
     hasher.finish()
 }
 

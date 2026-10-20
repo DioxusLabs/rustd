@@ -12,6 +12,7 @@ rust-version.workspace = true
 [dependencies]
 memchr = "2"
 anyhow.workspace = true
+either.workspace = true
 serde.workspace = true
 serde_derive.workspace = true
 serde_json.workspace = true
@@ -39,6 +40,7 @@ typed-arena = "2.0.2"
 hir.workspace = true
 hir-def.workspace = true
 hir-ty.workspace = true
+hir-expand.workspace = true
 ide-db.workspace = true
 ide-diagnostics.workspace = true
 pulldown-cmark.workspace = true

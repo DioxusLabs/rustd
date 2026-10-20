@@ -4,7 +4,6 @@
 use std::io::IsTerminal as _;
 
 const GREEN: &str = "\x1b[1m\x1b[92m";
-const YELLOW: &str = "\x1b[1m\x1b[93m";
 const RED: &str = "\x1b[1m\x1b[91m";
 const RESET: &str = "\x1b[0m";
 
@@ -24,12 +23,6 @@ pub(crate) fn status(quiet: bool, word: &str, rest: &str) {
             painted(GREEN, word)
         );
     }
-}
-
-/// Why cargo does what the daemon would have. Never quiet: a build that went another way
-/// than asked says so.
-pub(crate) fn fallback(reason: &str, then: &str) {
-    eprintln!("{} {reason}; {then}", painted(YELLOW, "rustd:"));
 }
 
 pub(crate) fn error(text: &str) {

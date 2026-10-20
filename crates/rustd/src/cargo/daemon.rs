@@ -39,6 +39,8 @@ const TICK: Duration = Duration::from_secs(1);
 
 /// How often a worker that is loading is looked at.
 const POLL: Duration = Duration::from_millis(20);
+/// How long a worker that hung up on a request is given to end.
+const ENDING: Duration = Duration::from_secs(2);
 
 /// The variable that has a worker end when its standard input does, which is when the
 /// daemon that started it is gone.
@@ -58,6 +60,8 @@ pub(crate) enum Request {
     /// Bring the programs of a checkout up to date with its source, if the daemon is warm
     /// for it.
     Sync(Checkout),
+    /// Clippy's lints of the crates of the programs of a checkout the daemon is warm for.
+    Lint(Checkout),
     /// Load a checkout that cargo has just built, for the builds to come.
     Warm(Checkout),
     /// Load a checkout cargo has just built what stands in for the crates of, and answer
@@ -74,6 +78,13 @@ pub(crate) enum Request {
     },
     /// No build follows the [`Request::Ahead`] of this [`WorkerConfig::id`].
     Forget(String),
+    /// What the daemon keeps of the tests of a program last run, by its object.
+    Results(String),
+    /// Keep these results of the tests of the program of this object, until the next.
+    Keep {
+        object: String,
+        results: String,
+    },
     Status,
     Stop,
 }
@@ -94,6 +105,8 @@ pub(crate) enum Reply {
         programs: Vec<Result<String, String>>,
     },
     Warming,
+    /// The results of [`Request::Results`], none when it keeps none.
+    Results(Option<String>),
     Status(Status),
     Stopping,
 }
@@ -199,14 +212,14 @@ impl Checkout {
         self.root.join(&self.config.project)
     }
 
-    /// The line that asks a worker for `plan`.
-    fn sync_line(&self, plan: &Plan) -> String {
+    /// The line that asks a worker for `plan`, to `verb` it.
+    fn sync_line(&self, plan: &Plan, verb: &str) -> String {
         let named =
             |path: &PathBuf| path.strip_prefix(&self.root).unwrap_or(path).display().to_string();
         // Each with a comma after it: the program is of these crates and no others.
         let crates: String = plan.crates.iter().map(|it| named(it) + ",").collect();
         let mut line = format!(
-            "sync\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{verb}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.project().display(),
             crates,
             plan.object.display(),
@@ -293,11 +306,15 @@ impl Worker {
         args.push("--symbols-in".into());
         args.push(symbols.into());
         let mut env = crate::process::own();
-        for (name, value) in &config.env {
+        // What the build tells its programs of where it puts them, which `env!` reads as
+        // the first build compiles them.
+        let told_env: BTreeMap<String, String> =
+            config.env.iter().chain(&checkout.env).map(|(k, v)| (k.clone(), v.clone())).collect();
+        for (name, value) in &told_env {
             env.set(name, value);
         }
         env.set(ENDS_WITH_INPUT, "1");
-        let told = spare.and_then(|it| it.told(&args, &checkout.config, &checkout.root, false));
+        let told = spare.and_then(|it| it.told(&args, &told_env, &checkout.root, false));
         let child = match told {
             Some(spare) => {
                 log = spare.log;
@@ -312,7 +329,7 @@ impl Worker {
                 };
                 let output =
                     private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
-                command.envs(&config.env).env(ENDS_WITH_INPUT, "1");
+                command.envs(&told_env).env(ENDS_WITH_INPUT, "1");
                 command.current_dir(&checkout.root);
                 command.stdin(Stdio::piped()).stdout(output.try_clone()?).stderr(output);
                 command.spawn().context("starting a worker")?
@@ -389,7 +406,7 @@ impl Worker {
         // A source written since cargo built is the daemon's like any edit: it compiles
         // every function and static of the workspace from what it reads.
         for plan in checkout.programs.iter().skip(usize::from(started_on)) {
-            self.ask(checkout, plan)?.map_err(anyhow::Error::msg)?;
+            self.ask(checkout, plan, "sync")?.map_err(anyhow::Error::msg)?;
         }
         Ok(())
     }
@@ -411,17 +428,31 @@ impl Worker {
 
     /// Asks the process for `plan` of `checkout`. The outer error is the worker's failing,
     /// the inner one its answer that it does not build this.
-    fn ask(&self, checkout: &Checkout, plan: &Plan) -> anyhow::Result<Result<String, String>> {
-        let failed = || match self.ended() {
-            Some(how) => format!("the daemon's worker ended ({how})"),
-            None => "the daemon's worker did not answer".to_owned(),
+    fn ask(
+        &self,
+        checkout: &Checkout,
+        plan: &Plan,
+        verb: &str,
+    ) -> anyhow::Result<Result<String, String>> {
+        // A worker that hangs up is ending, and why is what the client is told.
+        let failed = || {
+            let asked = Instant::now();
+            loop {
+                match self.ended() {
+                    Some(how) => return format!("the daemon's worker ended ({how})"),
+                    None if asked.elapsed() > ENDING => {
+                        return "the daemon's worker did not answer".to_owned();
+                    }
+                    None => std::thread::sleep(POLL),
+                }
+            }
         };
         let mut stream = self.connected()?;
         let mut env = self.env.clone();
         for (name, value) in &checkout.env {
             env.set(name, value);
         }
-        stream.write_all(checkout.sync_line(plan).as_bytes()).with_context(failed)?;
+        stream.write_all(checkout.sync_line(plan, verb).as_bytes()).with_context(failed)?;
         stream
             .write_all(format!("{}\n", crate::process::encode(&env)).as_bytes())
             .with_context(failed)?;
@@ -437,13 +468,13 @@ impl Worker {
     }
 
     /// Brings the programs of `checkout` up to date, all at once: the worker builds the
-    /// requests that wait for it together.
-    fn sync(&self, checkout: &Checkout) -> Reply {
+    /// requests that wait for it together. `verb` is `lint` for their lints instead.
+    fn sync(&self, checkout: &Checkout, verb: &str) -> Reply {
         let asked: Vec<anyhow::Result<Result<String, String>>> = std::thread::scope(|scope| {
             let asking: Vec<_> = checkout
                 .programs
                 .iter()
-                .map(|plan| scope.spawn(|| self.ask(checkout, plan)))
+                .map(|plan| scope.spawn(|| self.ask(checkout, plan, verb)))
                 .collect();
             let panicked = || Err(anyhow::anyhow!("asking the worker panicked"));
             asking.into_iter().map(|it| it.join().unwrap_or_else(|_| panicked())).collect()
@@ -511,15 +542,14 @@ impl Spare {
     fn told(
         mut self,
         args: &[OsString],
-        config: &WorkerConfig,
+        env: &BTreeMap<String, String>,
         cwd: &Path,
         ahead: bool,
     ) -> Option<Spare> {
         let told = || {
             let args: Option<Vec<String>> =
                 args.iter().map(|it| it.to_str().map(str::to_owned)).collect();
-            let told =
-                crate::Told { args: args?, env: config.env.clone(), cwd: cwd.to_owned(), ahead };
+            let told = crate::Told { args: args?, env: env.clone(), cwd: cwd.to_owned(), ahead };
             let mut line = serde_json::to_string(&told).ok()?;
             line.push('\n');
             Some(line)
@@ -567,6 +597,9 @@ struct Daemon {
     /// How many spare workers were started: each has a directory of its own.
     spares: AtomicUsize,
     asked: Mutex<Instant>,
+    /// The results of the tests of each program run, by its object: for which ones need
+    /// not run again. They go with the daemon.
+    results: Mutex<FxHashMap<String, String>>,
 }
 
 /// Where the daemon of this user keeps its socket, its lock, its log and its workers.
@@ -641,6 +674,7 @@ pub(crate) fn serve() -> anyhow::Result<()> {
         ahead: Mutex::default(),
         spares: AtomicUsize::new(0),
         asked: Mutex::new(Instant::now()),
+        results: Mutex::default(),
     });
     daemon.spare();
     eprintln!(
@@ -689,7 +723,8 @@ impl Daemon {
     fn handle(&self, request: Request) -> Reply {
         *lock(&self.asked) = Instant::now();
         match request {
-            Request::Sync(checkout) => self.sync(&checkout),
+            Request::Sync(checkout) => self.sync(&checkout, "sync"),
+            Request::Lint(checkout) => self.sync(&checkout, "lint"),
             Request::Warm(checkout) => match self.warm(checkout) {
                 Ok(()) => Reply::Warming,
                 Err(why) => Reply::Cold { reason: format!("{why:#}") },
@@ -714,6 +749,11 @@ impl Daemon {
                 Ok(()) => self.built(&checkout),
                 Err(why) => Reply::Cold { reason: format!("{why:#}") },
             },
+            Request::Results(object) => Reply::Results(lock(&self.results).get(&object).cloned()),
+            Request::Keep { object, results } => {
+                lock(&self.results).insert(object, results);
+                Reply::Warming
+            }
             Request::Status => Reply::Status(Status {
                 pid: std::process::id(),
                 version: self.version.clone(),
@@ -724,7 +764,7 @@ impl Daemon {
         }
     }
 
-    fn sync(&self, checkout: &Checkout) -> Reply {
+    fn sync(&self, checkout: &Checkout, verb: &str) -> Reply {
         let worker = lock(&self.workers).get(&checkout.config.id()).cloned();
         let Some(worker) = worker else {
             return Reply::Cold { reason: "the daemon has not loaded this workspace".to_owned() };
@@ -738,7 +778,7 @@ impl Daemon {
             ),
         };
         match warmth {
-            Warmth::Ready => worker.sync(checkout),
+            Warmth::Ready => worker.sync(checkout, verb),
             Warmth::Loading(since) => Reply::Cold {
                 reason: format!(
                     "the daemon is still loading the workspace ({:.0?} so far)",
@@ -749,14 +789,14 @@ impl Daemon {
         }
     }
 
-    /// What the worker that loads `checkout` has to say of its programs once it has.
+    /// What the worker that loads `checkout` has to say of its programs once it has. Asked
+    /// once the load is over: a load that ends between the two would leave a "still
+    /// loading" for the answer.
     fn built(&self, checkout: &Checkout) -> Reply {
-        loop {
-            match self.sync(checkout) {
-                Reply::Cold { .. } if self.loads(checkout) => std::thread::sleep(POLL),
-                reply => return reply,
-            }
+        while self.loads(checkout) {
+            std::thread::sleep(POLL);
         }
+        self.sync(checkout, "sync")
     }
 
     /// Whether a worker is loading this build of `checkout`.
@@ -870,7 +910,7 @@ impl Daemon {
         let Some(spare) = lock(&self.spare).take() else { return };
         let mut args = ahead.config.args(&ahead.root, &ahead.crates);
         args.extend(["--out".into(), "none".into()]);
-        if let Some(spare) = spare.told(&args, &ahead.config, &ahead.root, true)
+        if let Some(spare) = spare.told(&args, &ahead.config.env, &ahead.root, true)
             && let Some(mut other) = lock(&self.ahead).insert(id, spare)
         {
             other.stop();

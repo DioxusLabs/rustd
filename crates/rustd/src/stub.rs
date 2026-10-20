@@ -97,20 +97,29 @@ fn stand_in(args: &[OsString]) -> Option<(usize, String)> {
     Some((source, text_of(&args, program)))
 }
 
-/// Whether rustc is asked for a program and nothing else. `None` when it is asked for
-/// neither that nor a Rust library alone: nothing stands in for the crate then.
+/// Whether rustc is asked for a program and nothing else, a test executable being one.
+/// `None` when it is asked for neither that nor a Rust library alone: nothing stands in
+/// for the crate then.
 pub(crate) fn is_program<S: AsRef<str>>(args: &[S]) -> Option<bool> {
     let kinds = args.windows(2).filter(|it| it[0].as_ref() == "--crate-type");
     match *kinds.map(|it| it[1].as_ref()).collect::<Vec<_>>() {
-        ["bin"] => Some(true),
+        // Cargo names no type for a test target, which is a program to rustc.
+        ["bin"] | [] => Some(true),
         ["lib" | "rlib"] => Some(false),
         _ => None,
     }
 }
 
+/// Whether rustc is asked for a test executable, whose `main` is the harness rustc writes.
+fn is_test<S: AsRef<str>>(args: &[S]) -> bool {
+    args.iter().any(|it| it.as_ref() == "--test")
+}
+
 /// The source that stands in for the crate rustc is given `args` for: it names the
-/// libraries the crate is linked against and has no code.
+/// libraries the crate is linked against and has no code. The `main` of a test executable
+/// is the harness rustc writes, of no tests here: the daemon's harness takes its place.
 pub(crate) fn text_of<S: AsRef<str>>(args: &[S], program: bool) -> String {
+    let program = program && !is_test(args);
     let mut text = String::from("#![allow(warnings)]\n");
     if program {
         text.push_str("#![no_main]\n");

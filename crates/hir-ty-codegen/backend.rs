@@ -117,23 +117,19 @@ impl Backend {
         recorder: &mut Recorder<'_>,
         context: &mut cranelift_codegen::Context,
     ) -> Result<Code> {
-        let tally = Tally::global();
         match Self::from_env().map_err(CodegenError::Backend)? {
-            Backend::Cranelift => {}
+            Backend::Cranelift => Self::emit_with_cranelift(recorder, context),
             #[cfg(feature = "llvm")]
-            Backend::Llvm(optimization) => {
-                let start = Instant::now();
-                match Self::emit_with_llvm(recorder, &context.func, optimization) {
-                    Ok(code) => {
-                        tally.llvm.add(start.elapsed(), code.bytes.len());
-                        return Ok(code);
-                    }
-                    Err(unhandled) => tally.fell_back(start.elapsed(), &unhandled.to_string()),
-                }
-            }
+            Backend::Llvm(optimization) => Self::emit_with_llvm(recorder, context, optimization),
             #[cfg(not(feature = "llvm"))]
-            Backend::Llvm(_) => {}
+            Backend::Llvm(_) => Self::emit_with_cranelift(recorder, context),
         }
+    }
+
+    fn emit_with_cranelift(
+        recorder: &mut Recorder<'_>,
+        context: &mut cranelift_codegen::Context,
+    ) -> Result<Code> {
         let start = Instant::now();
         let pairs = super::float_pair::lower(recorder, &mut context.func);
         let mut code = super::emit(context)?;
@@ -143,7 +139,7 @@ impl Backend {
         if let Some(pairs) = pairs {
             pairs.hold(context, &mut code)?;
         }
-        tally.cranelift.add(start.elapsed(), code.bytes.len());
+        Tally::global().cranelift.add(start.elapsed(), code.bytes.len());
         Ok(code)
     }
 }
@@ -151,29 +147,42 @@ impl Backend {
 #[cfg(feature = "llvm")]
 impl Backend {
     /// What LLVM makes of the function, from the store if the same IR was compiled at the
-    /// same level before.
+    /// same level before. A function LLVM does not handle is Cranelift's, which the IR alone
+    /// decides, so its code is kept under the same key.
     fn emit_with_llvm(
         recorder: &mut Recorder<'_>,
-        func: &cranelift_codegen::ir::Function,
+        context: &mut cranelift_codegen::Context,
         optimization: Optimization,
-    ) -> std::result::Result<Code, super::llvm::Unhandled> {
+    ) -> Result<Code> {
         use super::{cached::StoredCode, store::Store};
-        let Some((store, key)) = Store::global().zip(StoredCode::key(
+        let key = StoredCode::key(
             optimization,
-            func,
+            &context.func,
             recorder.named_slots(),
             recorder.constants(),
-        )) else {
-            return super::llvm::emit(recorder, func, optimization);
-        };
-        if let Some(stored) = store.lookup(&key).and_then(|it| StoredCode::decode(&it))
+        );
+        let store = Store::global().zip(key);
+        if let Some((store, key)) = store
+            && let Some(stored) = store.lookup(&key).and_then(|it| StoredCode::decode(&it))
             && let Some(code) = stored.restore(recorder)
         {
             return Ok(code);
         }
         let mark = recorder.mark();
-        let code = super::llvm::emit(recorder, func, optimization)?;
-        if let Some(stored) = StoredCode::of(&code, recorder, mark).and_then(|it| it.encode()) {
+        let start = Instant::now();
+        let code = match super::llvm::emit(recorder, &context.func, optimization) {
+            Ok(code) => {
+                Tally::global().llvm.add(start.elapsed(), code.bytes.len());
+                code
+            }
+            Err(unhandled) => {
+                Tally::global().fell_back(start.elapsed(), &unhandled.to_string());
+                Self::emit_with_cranelift(recorder, context)?
+            }
+        };
+        if let Some((store, key)) = store
+            && let Some(stored) = StoredCode::of(&code, recorder, mark).and_then(|it| it.encode())
+        {
             store.insert(&key, &stored);
         }
         Ok(code)

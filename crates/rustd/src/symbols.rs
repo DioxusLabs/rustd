@@ -12,19 +12,22 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 #[derive(Default)]
 pub(crate) struct SymbolTable {
-    /// More than one symbol for the items that print as one path: of two `const _` blocks of
-    /// a module, or of one name in one function. Linking one to another's symbol is a
-    /// miscompile.
-    by_path: FxHashMap<String, Vec<Placed>>,
-    /// Symbols of items nested in closures and anonymous constants, by their path without the
-    /// `{closure#0}`-like segments, with the numbers of the closures among those.
-    nested: FxHashMap<String, Vec<NestedSymbol>>,
+    /// The symbols any object of the link can refer to, by path.
+    linkable: Paths,
+    /// The writable statics only the object that defines them can refer to, by path.
+    private_statics: Paths,
+    /// The file and the member of it that defines each of `private_statics`, by symbol.
+    held_in: FxHashMap<String, (usize, usize)>,
+    /// The files read, which `held_in` indexes.
+    files: Vec<PathBuf>,
+    /// Every symbol an object refers to and leaves to another to define, hashed.
+    referred: FxHashSet<u64>,
     /// rustc's `StableCrateId` of each crate named in a symbol. `None` when two crates share
     /// the name, two versions of one package say.
     crates: FxHashMap<String, Option<u64>>,
     /// The `StableCrateId` of the crate whose source starts at a file, for the crates that
     /// share a name. Their paths keep the `name[id]` rustc mangled into the symbol.
-    by_root: FxHashMap<PathBuf, u64>,
+    by_root: FxHashMap<Build, u64>,
     /// The crates of the link, each by its name and the file it starts at.
     linked: FxHashSet<(String, PathBuf)>,
     /// Every symbol defined or referred to, hashed: two that hash alike are not expected.
@@ -40,6 +43,29 @@ pub(crate) struct SymbolTable {
     /// The crates that made a copy of an instance of a function, by the function's name
     /// alone: what there is to go by for an instance whose types cannot be spelled.
     makers: FxHashMap<String, FxHashSet<u64>>,
+}
+
+/// Symbols by the paths they demangle to.
+#[derive(Default)]
+pub(crate) struct Paths {
+    /// More than one symbol for the items that print as one path: of two `const _` blocks of
+    /// a module, or of one name in one function. Linking one to another's symbol is a
+    /// miscompile.
+    by_path: FxHashMap<String, Vec<Placed>>,
+    /// Symbols of items nested in closures and anonymous constants, by their path without the
+    /// `{closure#0}`-like segments, with the numbers of the closures among those.
+    nested: FxHashMap<String, Vec<NestedSymbol>>,
+}
+
+/// Who can refer to a symbol an object defines.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// Any object of the link.
+    Linkable,
+    /// Only its own object: a function.
+    PrivateFunction,
+    /// Only its own object: a writable static.
+    PrivateStatic,
 }
 
 struct NestedSymbol {
@@ -60,8 +86,7 @@ struct Placed {
 
 /// A linkable symbol: its mangled name and its path with and without crate ids.
 struct Symbol {
-    /// Whether only the object that defines it can link to it.
-    private: bool,
+    reach: Reach,
     name: String,
     place: Option<u64>,
     around: Vec<u64>,
@@ -109,21 +134,24 @@ fn content(file: &Path) -> Option<u64> {
 /// A symbol of an object, and how it demangles when it is one of Rust's.
 struct Named {
     name: String,
-    /// Whether only the object that defines it can link to it.
-    private: bool,
+    reach: Reach,
+    /// The member of the archive it is defined in, `0` in an object.
+    member: usize,
+    /// Whether the object refers to it and leaves it to another to define.
+    undefined: bool,
     /// With the ids of the crates it names, and without them.
     demangled: Option<(String, String)>,
 }
 
 impl Named {
-    fn new(name: &str, private: bool) -> Named {
+    fn new(name: &str, reach: Reach, member: usize) -> Named {
         // The memory a static points to is a symbol that demangles to the static's path.
         let demangled = (!name.starts_with("_RNn"))
             .then(|| rustc_demangle::try_demangle(name).ok())
             .flatten()
             // `{:#}` drops the crate disambiguator hashes.
             .map(|it| (it.to_string(), format!("{it:#}")));
-        Named { name: name.to_owned(), private, demangled }
+        Named { name: name.to_owned(), reach, member, undefined: false, demangled }
     }
 }
 
@@ -152,16 +180,16 @@ fn names_of_file(file: &Path) -> anyhow::Result<Vec<Named>> {
     let mut names = Vec::new();
     match ArchiveFile::parse(&*data) {
         Ok(archive) => {
-            for member in archive.members() {
-                names_of_object(member?.data(&*data)?, &mut names);
+            for (at, member) in archive.members().enumerate() {
+                names_of_object(member?.data(&*data)?, at, &mut names);
             }
         }
-        Err(_) => names_of_object(&data, &mut names),
+        Err(_) => names_of_object(&data, 0, &mut names),
     }
     Ok(names)
 }
 
-fn names_of_object(data: &[u8], names: &mut Vec<Named>) {
+fn names_of_object(data: &[u8], member: usize, names: &mut Vec<Named>) {
     // rlibs also hold `lib.rmeta`, which isn't an object file.
     let Ok(object) = object::File::parse(data) else { return };
     for symbol in object.symbols() {
@@ -172,20 +200,54 @@ fn names_of_object(data: &[u8], names: &mut Vec<Named>) {
             && symbol.section() == object::SymbolSection::Unknown;
         let defined = symbol.section_index().is_some() || symbol.is_common() || in_segment;
         let linkable = symbol.is_undefined() || (defined && symbol.is_global());
-        let private = defined && symbol.is_local() && symbol.kind() == SymbolKind::Text;
-        if !linkable && !private {
+        let private = defined && symbol.is_local();
+        let reach = match symbol.kind() {
+            _ if linkable => Reach::Linkable,
+            SymbolKind::Text if private => Reach::PrivateFunction,
+            SymbolKind::Data | SymbolKind::Tls if private && is_writable(&object, &symbol) => {
+                Reach::PrivateStatic
+            }
+            _ => continue,
+        };
+        let Ok(name) = symbol.name() else { continue };
+        let name = unprefixed(&object, name);
+        if reach == Reach::PrivateStatic && !name.starts_with("_R") {
             continue;
         }
-        let Ok(name) = symbol.name() else { continue };
-        // Mach-O spells every name of C and Rust with an underscore in front, which the
-        // writer of an object adds back.
-        let name = match object.format() {
-            object::BinaryFormat::MachO => name.strip_prefix('_').unwrap_or(name),
-            _ => name,
-        };
-        names.push(Named::new(name, private));
+        let mut named = Named::new(name, reach, member);
+        named.undefined = symbol.is_undefined();
+        names.push(named);
     }
 }
+
+/// Mach-O spells every name of C and Rust with an underscore in front, which the writer of an
+/// object adds back.
+fn unprefixed<'a>(object: &object::File, name: &'a str) -> &'a str {
+    match object.format() {
+        object::BinaryFormat::MachO => name.strip_prefix('_').unwrap_or(name),
+        _ => name,
+    }
+}
+
+fn is_writable<'data>(object: &object::File<'data>, symbol: &object::Symbol<'data, '_>) -> bool {
+    use object::{ObjectSection, SectionKind};
+    let Some(section) = symbol.section_index().and_then(|it| object.section_by_index(it).ok())
+    else {
+        return false;
+    };
+    matches!(
+        section.kind(),
+        SectionKind::Data
+            | SectionKind::UninitializedData
+            | SectionKind::Tls
+            | SectionKind::UninitializedTls
+    )
+}
+
+/// A crate rustc built: the file its source starts at, and whether it is the program itself,
+/// linked from its objects, or a library of it. The unit tests of a library are the first
+/// of its source, and link the second when what they use uses the library.
+type Build = (PathBuf, bool);
 
 impl SymbolTable {
     /// `root` is what the paths in cargo's dep-info files are relative to.
@@ -193,13 +255,20 @@ impl SymbolTable {
         let mut table = SymbolTable { read: Some(SystemTime::now()), ..SymbolTable::default() };
         let mut symbols = Vec::new();
         let mut owners = Vec::new();
-        for (file, names) in files.iter().zip(names_of(files)) {
+        for (at, (file, names)) in files.iter().zip(names_of(files)).enumerate() {
             let first = symbols.len();
             for name in names? {
+                if name.undefined {
+                    table.referred.insert(Self::hashed(&name.name));
+                }
+                if name.reach == Reach::PrivateStatic {
+                    table.held_in.insert(name.name.clone(), (at, name.member));
+                }
                 table.add_name(name, &mut symbols);
             }
             if let Some((name, sources)) = crate_sources(file, root) {
-                owners.push((name, sources[0].clone(), first..symbols.len()));
+                let program = file.extension().is_none_or(|it| it != "rlib");
+                owners.push((name, (sources[0].clone(), program), first..symbols.len()));
                 let sources = sources.into_iter().map(Source::new).collect();
                 table.built_from.push((file.clone(), sources));
             }
@@ -208,9 +277,9 @@ impl SymbolTable {
         // instantiates the generics of its library) besides itself, and never one that depends
         // on it: the id that is left once the others have theirs is its own. A crate may be
         // several files, when it is linked from its objects.
-        let mut unplaced: FxHashMap<PathBuf, FxHashMap<u64, usize>> = FxHashMap::default();
+        let mut unplaced: FxHashMap<Build, FxHashMap<u64, usize>> = FxHashMap::default();
         for (name, source, range) in owners {
-            table.linked.insert((name.clone(), source.clone()));
+            table.linked.insert((name.clone(), source.0.clone()));
             if table.crates.get(&name) != Some(&None) {
                 continue;
             }
@@ -223,6 +292,7 @@ impl SymbolTable {
         }
         table.place(unplaced);
         table.index(symbols);
+        table.files = files.to_vec();
         Ok(table)
     }
 
@@ -232,7 +302,7 @@ impl SymbolTable {
         let mut table = SymbolTable::default();
         let mut symbols = Vec::new();
         for name in names {
-            table.add_name(Named::new(name, false), &mut symbols);
+            table.add_name(Named::new(name, Reach::Linkable, 0), &mut symbols);
         }
         table.index(symbols);
         table
@@ -241,37 +311,17 @@ impl SymbolTable {
     /// Files the symbols under their paths, once every crate named in one is known.
     fn index(&mut self, symbols: Vec<Symbol>) {
         let table = self;
-        for Symbol { private, name, place, around, with_ids, path } in symbols {
+        for Symbol { reach, name, place, around, with_ids, path } in symbols {
             let shared = |krate: &str| table.crates.get(krate) == Some(&None);
             let path = if crate_ids(&with_ids).any(|(krate, _)| shared(krate)) {
                 without_ids(&with_ids, |krate| !shared(krate))
             } else {
                 path
             };
-            if private {
-                table.private.insert(Self::hashed(&path));
-                continue;
-            }
-            // A closure is not an item nested in itself.
-            let unnamed = path.rsplit("::").next().is_some_and(|last| last.starts_with('{'));
-            if path.contains("::{") && !unnamed {
-                let named: Vec<_> = path.split("::").filter(|it| !it.starts_with('{')).collect();
-                let closures = path
-                    .split("::")
-                    .filter_map(|it| it.strip_prefix("{closure#")?.strip_suffix('}')?.parse().ok())
-                    .collect();
-                let symbols = table.nested.entry(named.join("::")).or_default();
-                if symbols.iter().all(|it| it.name != name) {
-                    let around = around.clone();
-                    symbols.push(NestedSymbol { name: name.clone(), closures, place, around });
-                }
-            }
-            let known = table.by_path.entry(path).or_default();
-            let same = |it: &Placed| {
-                without_instantiating_crate(&it.name) == without_instantiating_crate(&name)
-            };
-            if !known.iter().any(same) {
-                known.push(Placed { name, place, around });
+            match reach {
+                Reach::Linkable => table.linkable.insert(path, name, place, around),
+                Reach::PrivateFunction => _ = table.private.insert(Self::hashed(&path)),
+                Reach::PrivateStatic => table.private_statics.insert(path, name, place, around),
             }
         }
     }
@@ -291,9 +341,12 @@ impl SymbolTable {
     }
 
     fn add_name(&mut self, named: Named, symbols: &mut Vec<Symbol>) {
-        let Named { name, private, demangled } = named;
+        let Named { name, reach, demangled, .. } = named;
         let instance = without_instantiating_crate(&name);
-        if !private && self.names.insert(Self::hashed(&name)) && instance.len() != name.len() {
+        if reach == Reach::Linkable
+            && self.names.insert(Self::hashed(&name))
+            && instance.len() != name.len()
+        {
             self.copies.entry(instance.to_owned()).or_default().push(name.clone());
         }
         let Some((with_ids, path)) = demangled else { return };
@@ -314,21 +367,28 @@ impl SymbolTable {
         }
         let place = V0::place(&name);
         let around = V0::places_around(&name).unwrap_or_default();
-        symbols.push(Symbol { private, name, place, around, with_ids, path });
+        symbols.push(Symbol { reach, name, place, around, with_ids, path });
     }
 
     /// How paths spell the crate named `name` whose source starts at `root`: `name[id]` when
-    /// another crate has the name too.
-    pub(crate) fn crate_path(&self, name: &str, root: &Path) -> Option<String> {
+    /// another crate has the name too. `program` is whether it is the program's own crate.
+    pub(crate) fn crate_path(&self, name: &str, root: &Path, program: bool) -> Option<String> {
         match self.crates.get(name) {
-            Some(None) => Some(format!("{name}[{:x}]", self.by_root.get(root)?)),
+            Some(None) => Some(format!("{name}[{:x}]", self.id_by_root(root, program)?)),
             _ => Some(name.to_owned()),
         }
     }
 
+    /// The id of the build of the source at `root` that is the program's own crate or is
+    /// not, and of the only build of it when there is one.
+    fn id_by_root(&self, root: &Path, program: bool) -> Option<u64> {
+        let of = |program: bool| self.by_root.get(&(root.to_owned(), program)).copied();
+        of(program).or_else(|| of(!program))
+    }
+
     /// Gives each crate that shares its name the id that is its own, from how often its symbols
     /// mention each id of that name.
-    fn place(&mut self, mut unplaced: FxHashMap<PathBuf, FxHashMap<u64, usize>>) {
+    fn place(&mut self, mut unplaced: FxHashMap<Build, FxHashMap<u64, usize>>) {
         loop {
             let taken: FxHashSet<u64> = self.by_root.values().copied().collect();
             let before = unplaced.len();
@@ -388,10 +448,98 @@ impl SymbolTable {
         })
     }
 
-    pub(crate) fn stable_crate_id(&self, name: &str, root: &Path) -> Option<u64> {
+    pub(crate) fn stable_crate_id(&self, name: &str, root: &Path, program: bool) -> Option<u64> {
         match *self.crates.get(name)? {
             Some(id) => Some(id),
-            None => self.by_root.get(root).copied(),
+            None => self.id_by_root(root, program),
+        }
+    }
+
+    /// The symbol of the one item at `path`, as [`Paths::get`] says, that any object can link.
+    pub(crate) fn get(&self, path: &str) -> Option<&str> {
+        self.linkable.get(path)
+    }
+
+    pub(crate) fn get_at(&self, path: &str, place: u64, around: &[u64]) -> Option<&str> {
+        self.linkable.get_at(path, place, around)
+    }
+
+    pub(crate) fn get_nested(
+        &self,
+        named: &str,
+        closures: &[u32],
+        place: u64,
+        around: &[u64],
+    ) -> Option<&str> {
+        self.linkable.get_nested(named, closures, place, around)
+    }
+
+    /// The symbols any object of the link can refer to.
+    pub(crate) fn linkable(&self) -> &Paths {
+        &self.linkable
+    }
+
+    /// The writable statics rustc keeps to the objects that define them.
+    pub(crate) fn private_statics(&self) -> &Paths {
+        &self.private_statics
+    }
+
+    /// The symbols rustc's copy of the private static `symbol` is reached from, in its own
+    /// object, that any object can refer to: rustc's copy is only used when one of those is
+    /// called. `None` when something else reaches it too: another object, or a section the
+    /// linker keeps whatever refers to it.
+    pub(crate) fn only_reached_from(&self, symbol: &str) -> Option<Vec<String>> {
+        let &(file, member) = self.held_in.get(symbol)?;
+        let data = std::fs::read(self.files.get(file)?).ok()?;
+        let object = match ArchiveFile::parse(&*data) {
+            Ok(archive) => archive.members().nth(member)?.ok()?.data(&*data).ok()?,
+            Err(_) => &data,
+        };
+        let reached = reached_from(&object::File::parse(object).ok()?, symbol)?;
+        let referred = |it: &String| self.referred.contains(&Self::hashed(it));
+        (!reached.iter().any(referred)).then_some(reached)
+    }
+
+    /// The copies of the instance `symbol` is one of, each with rustc's `StableCrateId` of
+    /// the crate that compiled it. None for a symbol that is of one crate only.
+    pub(crate) fn copies(&self, symbol: &str) -> impl Iterator<Item = (&str, u64)> {
+        let copies = self.copies.get(without_instantiating_crate(symbol));
+        copies.into_iter().flatten().filter_map(|it| Some((&**it, V0::instantiating_crate(it)?)))
+    }
+
+    /// rustc's `StableCrateId` of each crate that made a copy of an instance of a function
+    /// named `function`, in any module and of any type.
+    pub(crate) fn makers(&self, function: &str) -> impl Iterator<Item = u64> {
+        self.makers.get(function).into_iter().flatten().copied()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.linkable.by_path.len()
+    }
+}
+
+impl Paths {
+    fn insert(&mut self, path: String, name: String, place: Option<u64>, around: Vec<u64>) {
+        // A closure is not an item nested in itself.
+        let unnamed = path.rsplit("::").next().is_some_and(|last| last.starts_with('{'));
+        if path.contains("::{") && !unnamed {
+            let named: Vec<_> = path.split("::").filter(|it| !it.starts_with('{')).collect();
+            let closures = path
+                .split("::")
+                .filter_map(|it| it.strip_prefix("{closure#")?.strip_suffix('}')?.parse().ok())
+                .collect();
+            let symbols = self.nested.entry(named.join("::")).or_default();
+            if symbols.iter().all(|it| it.name != name) {
+                let around = around.clone();
+                symbols.push(NestedSymbol { name: name.clone(), closures, place, around });
+            }
+        }
+        let known = self.by_path.entry(path).or_default();
+        let same = |it: &Placed| {
+            without_instantiating_crate(&it.name) == without_instantiating_crate(&name)
+        };
+        if !known.iter().any(same) {
+            known.push(Placed { name, place, around });
         }
     }
 
@@ -454,23 +602,116 @@ impl SymbolTable {
         let symbol = symbols.next()?;
         symbols.next().is_none().then_some(&*symbol.name)
     }
+}
 
-    /// The copies of the instance `symbol` is one of, each with rustc's `StableCrateId` of
-    /// the crate that compiled it. None for a symbol that is of one crate only.
-    pub(crate) fn copies(&self, symbol: &str) -> impl Iterator<Item = (&str, u64)> {
-        let copies = self.copies.get(without_instantiating_crate(symbol));
-        copies.into_iter().flatten().filter_map(|it| Some((&**it, V0::instantiating_crate(it)?)))
+/// The symbols that any object can refer to of the code and data of `object` that reach the
+/// static `symbol` through what they refer to: what uses it. `None` when one of those is
+/// something the linker keeps whatever refers to it.
+///
+/// What is told apart is what a linker can leave out apart: a section of an ELF or COFF object,
+/// and in a section of a Mach-O one, the run from one symbol that is not a temporary label to
+/// the next.
+fn reached_from<'data>(object: &object::File<'data>, symbol: &str) -> Option<Vec<String>> {
+    use object::{ObjectSection, RelocationTarget, SectionFlags, SectionKind};
+    // A section and where in it the piece starts; `u64::MAX` for what refers to the section
+    // and not to a piece of it.
+    type Piece = (object::SectionIndex, u64);
+    const WHOLE: u64 = u64::MAX;
+    let macho = object.format() == object::BinaryFormat::MachO;
+    let named = |it: &object::Symbol<'data, '_>| it.name().map(|name| unprefixed(object, name));
+    let mut starts = FxHashMap::<object::SectionIndex, Vec<u64>>::default();
+    if macho {
+        for it in object.symbols() {
+            let temporary = it.name().is_ok_and(|name| name.starts_with(['l', 'L']));
+            if let Some(section) = it.section_index().filter(|_| !temporary) {
+                starts.entry(section).or_default().push(it.address());
+            }
+        }
+        starts.values_mut().for_each(|it| {
+            it.sort_unstable();
+            it.dedup();
+        });
     }
-
-    /// rustc's `StableCrateId` of each crate that made a copy of an instance of a function
-    /// named `function`, in any module and of any type.
-    pub(crate) fn makers(&self, function: &str) -> impl Iterator<Item = u64> {
-        self.makers.get(function).into_iter().flatten().copied()
+    let piece = |section: object::SectionIndex, address: u64| -> Piece {
+        let Some(starts) = starts.get(&section) else { return (section, 0) };
+        let at = starts.partition_point(|it| *it <= address);
+        (section, at.checked_sub(1).map_or(0, |at| starts[at]))
+    };
+    let start = object.symbols().find(|it| named(it) == Ok(symbol))?;
+    let start = piece(start.section_index()?, start.address());
+    let mut defined = FxHashMap::<Piece, Vec<String>>::default();
+    for it in object.symbols() {
+        if let (Some(section), true, Ok(name)) = (it.section_index(), it.is_global(), named(&it)) {
+            defined.entry(piece(section, it.address())).or_default().push(name.to_owned());
+        }
     }
-
-    pub(crate) fn len(&self) -> usize {
-        self.by_path.len()
+    // What the unwinder and a debugger read refers to everything, and uses nothing.
+    let read_aside = |name: &str| {
+        [".debug", ".eh_frame", "__debug", "__eh_frame", "__compact_unwind", ".pdata", ".xdata"]
+            .iter()
+            .any(|it| name.starts_with(it))
+    };
+    let mut referrers = FxHashMap::<Piece, FxHashSet<Piece>>::default();
+    for section in object.sections() {
+        if read_aside(section.name().unwrap_or_default()) {
+            continue;
+        }
+        for (offset, relocation) in section.relocations() {
+            let target = match relocation.target() {
+                RelocationTarget::Symbol(it) => {
+                    let it = object.symbol_by_index(it).ok()?;
+                    let whole = it.kind() == SymbolKind::Section;
+                    it.section_index().map(|section| match whole {
+                        true => (section, WHOLE),
+                        false => piece(section, it.address()),
+                    })
+                }
+                RelocationTarget::Section(it) => Some((it, WHOLE)),
+                _ => None,
+            };
+            let by = piece(section.index(), section.address() + offset);
+            if let Some(target) = target.filter(|it| *it != by && *it != (by.0, WHOLE)) {
+                referrers.entry(target).or_default().insert(by);
+            }
+        }
     }
+    // SHF_GNU_RETAIN.
+    const RETAIN: u64 = 0x20_0000;
+    let mut seen = FxHashSet::from_iter([start]);
+    let mut todo = vec![start];
+    let mut reached = Vec::new();
+    while let Some(at) = todo.pop() {
+        let section = object.section_by_index(at.0).ok()?;
+        let kept =
+            matches!(section.flags(), SectionFlags::Elf { sh_flags } if sh_flags & RETAIN != 0);
+        let used = matches!(
+            section.kind(),
+            SectionKind::Text
+                | SectionKind::Data
+                | SectionKind::ReadOnlyData
+                | SectionKind::ReadOnlyDataWithRel
+                | SectionKind::ReadOnlyString
+                | SectionKind::UninitializedData
+                | SectionKind::Tls
+                | SectionKind::UninitializedTls
+        );
+        let name = section.name().unwrap_or_default();
+        // Constructors run whether or not anything calls them.
+        let run = [".init_array", ".fini_array", ".ctors", ".dtors", "__mod_init_func", ".CRT$"]
+            .iter()
+            .any(|it| name.starts_with(it));
+        if kept || run || !used {
+            return None;
+        }
+        reached.extend(defined.get(&at).into_iter().flatten().cloned());
+        let by = [at, (at.0, WHOLE)].into_iter().flat_map(|it| referrers.get(&it)).flatten();
+        for &by in by {
+            if seen.insert(by) {
+                todo.push(by);
+            }
+        }
+    }
+    Some(reached)
 }
 
 /// The name of the function a demangled symbol is an instance of: the last of its path that
@@ -815,11 +1056,13 @@ mod tests {
         let mut table = SymbolTable::default();
         let unplaced: FxHashMap<_, _> = crates
             .iter()
-            .map(|(root, mentions)| (PathBuf::from(root), mentions.iter().copied().collect()))
+            .map(|(root, mentions)| {
+                ((PathBuf::from(root), false), mentions.iter().copied().collect())
+            })
             .collect();
         table.place(unplaced);
         let mut placed: Vec<_> =
-            table.by_root.iter().map(|(root, id)| (root.display().to_string(), *id)).collect();
+            table.by_root.iter().map(|(root, id)| (root.0.display().to_string(), *id)).collect();
         placed.sort();
         placed
     }

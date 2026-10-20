@@ -18,6 +18,7 @@ use cranelift_module::{DataId, FuncId, ModuleReloc, ModuleRelocTarget};
 use hir_def::{
     DefWithBodyId, FunctionId, StaticId, TraitId,
     hir::{BindingId, ExprId},
+    signatures::{StaticFlags, StaticSignature},
 };
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::IntoKind;
@@ -263,6 +264,8 @@ pub(super) struct Recorder<'db> {
     shared: FxHashMap<ConstBlob, DataId>,
     vtables: FxHashMap<(StoredTy, Option<(TraitId, StoredGenericArgs)>), DataId>,
     statics: FxHashMap<StaticId, DataId>,
+    /// The statics asked for by the name the linker knows them by.
+    linked: FxHashMap<intern::Symbol, DataId>,
     pub(super) layouts: Option<RefCell<FxHashMap<Ty<'db>, (u64, u64)>>>,
     pub(super) builder_ctx: FunctionBuilderContext,
     /// The assembly of the function, when it is a `#[naked]` one, and what each operand of
@@ -306,6 +309,7 @@ impl<'db> Recorder<'db> {
             shared: FxHashMap::default(),
             vtables: FxHashMap::default(),
             statics: FxHashMap::default(),
+            linked: FxHashMap::default(),
             layouts: std::env::var_os("RUSTD_LAYOUTS").map(|_| Default::default()),
             builder_ctx: FunctionBuilderContext::new(),
             naked: None,
@@ -463,7 +467,21 @@ impl<'db> Recorder<'db> {
         if let Some(&data) = self.statics.get(&id) {
             return data;
         }
-        let data = self.data(DataRequest::Static(id));
+        // Statics the linker knows by one name are one object, which LLVM otherwise takes to
+        // be at two addresses. The request is for the one that defines it.
+        let symbol = super::static_symbol(self.db, id);
+        let data = match symbol.as_ref().and_then(|it| self.linked.get(it)) {
+            Some(&data) => {
+                if !StaticSignature::of(self.db, id).flags.contains(StaticFlags::EXTERN) {
+                    self.requests.datas[data.as_u32() as usize] = DataRequest::Static(id);
+                }
+                data
+            }
+            None => self.data(DataRequest::Static(id)),
+        };
+        if let Some(symbol) = symbol {
+            self.linked.insert(symbol, data);
+        }
         self.statics.insert(id, data);
         data
     }

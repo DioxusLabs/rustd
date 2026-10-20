@@ -58,10 +58,10 @@ jobs:
           mkdir "$name"
           cp LICENSE-APACHE LICENSE-MIT README.md "$name"
           if [ "$RUNNER_OS" = Windows ]; then
-            cp target/release/{rustd,cargo-rustd,rustd-rustc}.exe "$name"
+            cp target/release/{rustd,cargo-rustd,rustd-rustc,rustd-rustc-first}.exe "$name"
             7z a "$name.zip" "$name"
           else
-            cp target/release/{rustd,cargo-rustd,rustd-rustc} "$name"
+            cp target/release/{rustd,cargo-rustd,rustd-rustc,rustd-rustc-first} "$name"
             tar czf "$name.tar.gz" "$name"
           fi
           "$name/rustd" --help > /dev/null

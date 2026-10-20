@@ -28,8 +28,8 @@ the code of the functions that actually changed.
 built. Where they differ, rustd is wrong.
 
 **Never guess; refuse visibly.** The code generator returns "unsupported" with a reason for
-anything it has no explicit lowering for. A refused function is left to rustc's copy when
-that copy is current, and otherwise the build goes to cargo. A refusal is printed, counted
+anything it has no explicit lowering for. A refused function fails the build, with the
+function and the reason; it is never left to cargo. A refusal is printed, counted
 and listed (`--report`, `cargo rustd status`); it is treated as a bug to fix, not as a
 normal path. What must not happen is a best-effort lowering of input the generator does not
 understand, because that is wrong code nobody sees.
@@ -37,15 +37,16 @@ understand, because that is wrong code nobody sees.
 The same rule shapes the smaller pieces. `type_id.rs` computes `TypeId` hashes the way the
 pinned rustc does and returns `None` for a type whose hash needs something it does not
 reproduce. The splice returns an error for anything it has no answer for and the caller
-links in full. `cargo rustd` hands the build to cargo when an input it does not model has
-changed.
+links in full. When an input cargo acts on changes (a manifest, the lockfile, a build script), `cargo rustd`
+has cargo run again for the dependencies and the scripts, and the daemon reloads the
+workspace and builds its crates.
 
 ## Processes
 
     cargo rustd build ──► rustd cargo (client) ──► rustd daemon ──► worker: rustd <project> --socket
                               │                         │                │
                               └── cargo + rustc         └── more workers └── one database
-                                  (first build, fallback)
+                                  (dependencies, build scripts)
 
 The **client** (`crates/rustd/src/cargo/`, entry in `mod.rs`) is what `cargo rustd` runs.
 It parses the command line (`cli.rs`), decides whether the daemon can serve it (`state.rs`),

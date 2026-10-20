@@ -46,7 +46,7 @@ use cranelift_object::{
     ObjectProduct,
     object::{
         BinaryFormat, RelocationEncoding, RelocationFlags, RelocationKind, SectionKind,
-        write::{Relocation, SymbolId},
+        write::{Relocation, StandardSegment, SymbolId},
     },
 };
 use rustc_hash::{FxHashMap, FxHasher};
@@ -372,10 +372,10 @@ pub(super) enum DebugContext {
 
 impl DebugContext {
     /// The tables of an object for `isa` whose files are named from `directory`, or `None`
-    /// where they are not written yet: ELF has DWARF and COFF has CodeView. DWARF leaves
-    /// the variables of the functions out unless `variables` asks for them, and keeps its
-    /// entries apart from what is linked when `apart` names the file a debugger reads them
-    /// from; CodeView has neither yet.
+    /// where they are not written yet: ELF and Mach-O have DWARF and COFF has CodeView.
+    /// DWARF leaves the variables of the functions out unless `variables` asks for them, and
+    /// on ELF keeps its entries apart from what is linked when `apart` names the file a
+    /// debugger reads them from; Mach-O links none of it, and CodeView has neither yet.
     pub(super) fn new(
         isa: &dyn TargetIsa,
         directory: &str,
@@ -388,6 +388,10 @@ impl DebugContext {
         match isa.triple().binary_format {
             target_lexicon::BinaryFormat::Elf => {
                 let dwarf = Dwarf::new(isa, directory, variables, apart);
+                Some(DebugContext::Dwarf(Box::new(dwarf)))
+            }
+            target_lexicon::BinaryFormat::Macho => {
+                let dwarf = Dwarf::new(isa, directory, variables, None);
                 Some(DebugContext::Dwarf(Box::new(dwarf)))
             }
             target_lexicon::BinaryFormat::Coff => {
@@ -459,7 +463,7 @@ impl Describer {
         drop(self.functions);
         match self.described.join().map_err(|_| "describing the functions panicked")? {
             Described::Sections(sections) => {
-                if product.object.format() == BinaryFormat::Elf {
+                if matches!(product.object.format(), BinaryFormat::Elf | BinaryFormat::MachO) {
                     place(product, sections?)?;
                 }
                 Ok(Vec::new())
@@ -1087,7 +1091,7 @@ impl Dwarf {
     /// Answers the files of what is kept apart from it.
     fn emit(mut self, product: &mut ObjectProduct) -> Result<Vec<Sidecar>, String> {
         self.end_unit();
-        if product.object.format() != BinaryFormat::Elf {
+        if !matches!(product.object.format(), BinaryFormat::Elf | BinaryFormat::MachO) {
             return Ok(Vec::new());
         }
         let Some((name, apart)) = self.apart.take() else {
@@ -1117,8 +1121,12 @@ pub struct Sidecar {
     pub bytes: Vec<u8>,
 }
 
-/// Writes the sections into the object, each with what the linker is to fill in.
+/// Writes the sections into the object, each with what the linker is to fill in. A Mach-O
+/// linker leaves the sections in the object, where a debugger reads them through the debug
+/// map: an offset into another section is written as it is, and an address is relocated
+/// against its section, which [`settle_macho`] adds the address of once the object is laid out.
 fn place(product: &mut ObjectProduct, sections: Vec<Section>) -> Result<(), String> {
+    let macho = product.object.format() == BinaryFormat::MachO;
     let mut placed = FxHashMap::default();
     let mut linked = Vec::new();
     // A section with nothing in it is still there when another says where in it to read.
@@ -1136,7 +1144,13 @@ fn place(product: &mut ObjectProduct, sections: Vec<Section>) -> Result<(), Stri
             SectionId::DebugStr | SectionId::DebugLineStr => SectionKind::DebugString,
             _ => SectionKind::Debug,
         };
-        let at = product.object.add_section(Vec::new(), id.name().as_bytes().to_vec(), kind);
+        let (segment, name) = if macho {
+            let segment = product.object.segment_name(StandardSegment::Debug).to_vec();
+            (segment, format!("__{}", &id.name()[1..]).into_bytes())
+        } else {
+            (Vec::new(), id.name().as_bytes().to_vec())
+        };
+        let at = product.object.add_section(segment, name, kind);
         product.object.section_mut(at).set_data(written.bytes.slice().to_vec(), 1);
         placed.insert(id, at);
         linked.push((id, at, written.relocs));
@@ -1149,6 +1163,15 @@ fn place(product: &mut ObjectProduct, sections: Vec<Section>) -> Result<(), Stri
                     let Some(&section) = placed.get(&section) else {
                         return Err(format!("{} points to a section left out", id.name()));
                     };
+                    if macho {
+                        let size = usize::from(reloc.size);
+                        let field = (product.object.section_mut(at).data_mut())
+                            .get_mut(reloc.offset as usize..)
+                            .and_then(|it| it.get_mut(..size))
+                            .ok_or_else(|| format!("{} has an offset outside it", id.name()))?;
+                        field.copy_from_slice(&reloc.addend.to_le_bytes()[..size]);
+                        continue;
+                    }
                     (product.object.section_symbol(section), 0)
                 }
             };
@@ -1161,6 +1184,37 @@ fn place(product: &mut ObjectProduct, sections: Vec<Section>) -> Result<(), Stri
                 Relocation { offset: reloc.offset, symbol, flags, addend: addend + reloc.addend };
             product.object.add_relocation(at, relocation).map_err(|e| e.to_string())?;
         }
+    }
+    Ok(())
+}
+
+/// Adds to each address in the debug sections of the Mach-O `object` the address its section
+/// was laid out at, as a relocation against a section has it.
+pub(super) fn settle_macho(object: &mut [u8]) -> Result<(), String> {
+    use object::{Object, ObjectSection, RelocationTarget};
+    let file = object::File::parse(&*object).map_err(|e| e.to_string())?;
+    let mut settled = Vec::new();
+    for section in file.sections() {
+        if section.segment_name().ok().flatten() != Some("__DWARF") {
+            continue;
+        }
+        let Some((start, _)) = section.file_range() else { continue };
+        for (offset, relocation) in section.relocations() {
+            let RelocationTarget::Section(target) = relocation.target() else { continue };
+            let address = file.section_by_index(target).map_err(|e| e.to_string())?.address();
+            settled.push((start + offset, usize::from(relocation.size() / 8), address));
+        }
+    }
+    drop(file);
+    for (at, size, address) in settled {
+        let field = object
+            .get_mut(at as usize..)
+            .and_then(|it| it.get_mut(..size))
+            .ok_or("a debug section with a relocation outside it")?;
+        let mut held = [0; 8];
+        held[..size].copy_from_slice(field);
+        let value = u64::from_le_bytes(held).wrapping_add(address);
+        field.copy_from_slice(&value.to_le_bytes()[..size]);
     }
     Ok(())
 }

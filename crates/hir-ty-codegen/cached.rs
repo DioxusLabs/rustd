@@ -1087,7 +1087,7 @@ mod tests {
             .collect();
         chain.variables[0].scope = Some(39_999);
         let isa = Target::selected().and_then(|it| it.isa("backtracking", false)).unwrap();
-        // Only ELF has the tables.
+        // Only ELF and Mach-O have the tables.
         let Some(mut context) = DebugContext::new(&*isa, "/", true, None) else { return };
         for (at, debug) in [deep.debug.unwrap(), ring, chain].iter().enumerate() {
             context.add_function(FuncId::from_u32(at as u32), 8, debug);

@@ -25,7 +25,7 @@ and the run fails on any WRONG row and on any row that is not what its `case.jso
   artifact  the name of the target that is run, when it is not the selected one or the package
   archive   the build is an archive and has no link line: rustd's objects are given to `run`
   unbuilt   why nothing of rustd can be asked to build this at all: the row is that refusal
-  doctests  the case is `cargo test --doc` of the package: once with rustdoc, once with rustd
+  doctests  the case is `cargo test --doc` of the package, and `cargo rustd test --doc`
             as cargo's RUSTDOC, and what the test harness prints and returns is compared
   link      more arguments to cargo for the build rustd links against, which the reference
             is built without
@@ -104,8 +104,12 @@ class Case:
         cross = CROSS.get(self.target, {}) if self.target != host() else {}
         self.runner = cross.get("runner", [])
         self.env = {**os.environ, **self.spec.get("env", {})}
+        variable = "CARGO_TARGET_" + (self.target or "").upper().replace("-", "_")
         if "linker" in cross:
-            self.env["CARGO_TARGET_" + self.target.upper().replace("-", "_") + "_LINKER"] = cross["linker"]
+            self.env[variable + "_LINKER"] = cross["linker"]
+        # What cargo and rustd run the programs of the target under, doc tests among them.
+        if self.runner:
+            self.env[variable + "_RUNNER"] = " ".join(self.runner)
         if backend == "llvm":
             self.env.update(RUSTD_BACKEND="llvm", RUSTD_OPT="2", RUSTD_EMIT="fast")
         else:
@@ -402,25 +406,36 @@ class Case:
         return (step["what"], "same", f"{len(answers)} clients mid-reload: {len(answers) - new} old, {new} new")
 
     def doctests(self, env):
-        """`cargo test --doc` with rustdoc and with rustd in its place."""
-        def tested(target_dir, **more):
-            run = subprocess.run(["cargo", "test", "--doc", *self.select[:2], *self.cargo_args, "--", *self.spec.get("args", [])],
+        """`cargo test --doc` with rustdoc and `cargo rustd test --doc`."""
+        def tested(target_dir, *rustd, **more):
+            run = subprocess.run(["cargo", *rustd, "test", "--doc", *self.select[:2], *self.cargo_args, "--", *self.spec.get("args", [])],
                                  cwd=self.ws, capture_output=True, text=True, timeout=900,
                                  env={**env, "CARGO_TARGET_DIR": os.path.join(self.ws, target_dir), **more})
             return run.returncode, doctest_report(run.stdout), run.stderr
         want = tested("target-ref")
-        got = tested("target", RUSTDOC=RUSTD, RUSTD_RUSTDOC="rustdoc")
-        left = re.search(r"rustd: the doctests are left to rustdoc: (.*)", got[2])
-        if left:
-            raise Refused(left.group(1))
+        # The worker sockets live under the home, and a socket's path has to be short.
+        home = tempfile.mkdtemp(prefix="bm-")
+        rustd_env = {"RUSTD_HOME": home, "PATH": os.path.dirname(RUSTD) + os.pathsep + env["PATH"]}
+        try:
+            got = tested("target", "rustd", **rustd_env)
+        finally:
+            subprocess.run(["cargo", "rustd", "stop"], cwd=self.ws, capture_output=True, env={**env, **rustd_env})
+            shutil.rmtree(home, ignore_errors=True)
         if want[:2] != got[:2]:
+            refused = re.search(r"^error: (.*)", got[2], re.M)
+            if refused and not any(l.startswith("test ") for l in got[1]):
+                raise Refused(refused.group(1)[:300])
+            # An example rustd cannot build fails, with the reason in place of its output.
+            text = "\n".join(got[1])
+            ran = [(w, g) for w, g in zip(want[1], got[1]) if w != g and w.startswith("test ") and not w.startswith("test result")]
+            failed = [w.split(" ... ")[0][5:] for w, g in ran if w.endswith(" ok") and g == w[:-2] + "FAILED"]
+            reasons = [re.search(rf"^---- {re.escape(name)} stdout ----\n(.*rustd.*)$", text, re.M) for name in failed]
+            if failed and len(failed) == len(ran) and all(reasons):
+                raise Refused(reasons[0].group(1)[:300])
             lines = [f"cargo's `{w}`, rustd's `{g}`" for w, g in zip(want[1], got[1]) if w != g]
             raise Wrong((lines[0] if lines else f"cargo's ends with {want[0]} after {len(want[1])} lines, rustd's with {got[0]} after {len(got[1])}")[:300])
-        built = re.findall(r"doctests: compiled (\d+) of (\d+) fns", got[2])
-        if not built:
-            raise Wrong("rustd did not say what it built for the doctests")
         tests = sum(l.startswith("test ") and not l.startswith("test result") for l in want[1])
-        return ("supported", f"{tests} doctests the same, {sum(int(n) for n, _ in built)} of {sum(int(n) for _, n in built)} functions of the library", [])
+        return ("supported", f"{tests} doctests the same", [])
 
     def row(self):
         """The case's line of the table."""
@@ -470,6 +485,9 @@ def doctest_report(stdout):
     # that took; rustd builds each alone.
     out = re.sub(r"\nall doctests ran in [0-9.]+s; merged doctests compilation took [0-9.]+s\n", "\n", out)
     out = re.sub(r"thread '(.*?)' \(\d+\) panicked", r"thread '\1' panicked", out)
+    # rustdoc names a line of the example as if it were the file; rustd the line of the file it
+    # writes the examples into.
+    out = re.sub(r"panicked at \S+:\d+:\d+:", "panicked at EXAMPLE:", out)
     blocks = re.split(r"\n(?=---- )", out)
     # The last failure is followed by the names of all of them and the result.
     ends = []

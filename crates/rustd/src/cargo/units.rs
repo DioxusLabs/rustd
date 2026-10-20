@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 /// The directory of the records, in the directory cargo builds a profile in.
 const RECORDS: &str = ".rustd-units";
 
+/// The file in the record of a unit that says rustc built what stands in for the crate.
+pub(crate) const STANDS_IN: &str = "stands-in";
+
 /// The directories of a profile that cargo has rustc write to.
 const PLACES: [&str; 3] = ["deps", "examples", "build"];
 
@@ -137,9 +140,10 @@ impl Record {
         self.values("--crate-type").collect()
     }
 
-    /// Whether rustc links an executable from the crate.
+    /// Whether rustc links an executable from the crate: a test target without a harness
+    /// names no type, and a program is what rustc builds of one.
     pub(crate) fn is_linked(&self) -> bool {
-        self.is_test() || self.crate_types() == ["bin"]
+        self.is_test() || matches!(*self.crate_types(), ["bin"] | [])
     }
 
     pub(crate) fn is_rlib(&self) -> bool {
@@ -183,11 +187,21 @@ impl Record {
     /// The source files rustc read and the environment variables it asked for, from the
     /// dep-info cargo had it write.
     pub(crate) fn inputs(&self) -> Inputs {
+        if self.stood_in() {
+            return Inputs { files: rust_sources_under(&self.source), env: Vec::new() };
+        }
         let path = self
             .out_dir()
             .map(|it| it.join(format!("{}{}.d", self.crate_name, self.extra_filename())));
         let text = path.and_then(|it| std::fs::read_to_string(it).ok()).unwrap_or_default();
         Inputs::parse(&text, &self.cwd)
+    }
+
+    /// Whether rustc built what stands in for the crate, which reads none of its sources:
+    /// those are the daemon's to read.
+    fn stood_in(&self) -> bool {
+        let records = self.out_dir().map(|it| Record::dir_for(&it));
+        records.is_some_and(|it| it.join(&self.id).join(STANDS_IN).exists())
     }
 
     /// The copy of `original`, when it is a file of this unit.
@@ -294,6 +308,34 @@ pub(crate) fn places_named(used: &[Record]) -> Result<BTreeMap<String, String>, 
     Ok(env)
 }
 
+/// The Rust files in the directory of a crate's root file and below it, which are what the
+/// daemon may read of the crate: rustc did not read them, so there is no dep-info to say.
+/// A directory cargo builds in, which it tags as a cache, a hidden one, and one with a
+/// package of its own are not the crate's.
+fn rust_sources_under(root: &Path) -> Vec<PathBuf> {
+    let mut files = vec![root.to_owned()];
+    let mut dirs: Vec<PathBuf> = root.parent().map(Path::to_owned).into_iter().collect();
+    while let Some(dir) = dirs.pop() {
+        if dir.join("CACHEDIR.TAG").exists() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let hidden = entry.file_name().to_string_lossy().starts_with('.');
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() && !hidden && !path.join("Cargo.toml").exists() => {
+                    dirs.push(path)
+                }
+                Ok(_) if path.extension().is_some_and(|it| it == "rs") => files.push(path),
+                _ => {}
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +363,20 @@ mod tests {
             Inputs::parse("/t/a.d: src/cut\\", Path::new("/ws")).files,
             Vec::<PathBuf>::new()
         );
+    }
+
+    #[test]
+    fn sources_of_a_stand_in_stop_at_another_package() {
+        let dir = std::env::temp_dir().join(format!("rustd-units-under-{}", std::process::id()));
+        let files = ["lib.rs", "a/mod.rs", "a/b.rs", "notes.txt", "member/Cargo.toml"];
+        let files = files.into_iter().chain(["member/src/lib.rs", "target/debug/gen.rs"]);
+        for file in files.chain([".git/hook.rs", "target/CACHEDIR.TAG"]) {
+            std::fs::create_dir_all(dir.join(file).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(file), "").unwrap();
+        }
+        let found = rust_sources_under(&dir.join("lib.rs"));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(found, ["a/b.rs", "a/mod.rs", "lib.rs"].map(|it| dir.join(it)));
     }
 
     #[test]

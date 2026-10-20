@@ -43,6 +43,11 @@ pub(super) fn pause() -> String {
     format!(".globl {SYMBOL}\n{SYMBOL}:\npause\nret\n")
 }
 
+/// AArch64's instruction barrier, of the whole system as `__isb(SY)` asks for it.
+pub(super) fn isb() -> String {
+    format!(".globl {SYMBOL}\n{SYMBOL}:\nisb\nret\n")
+}
+
 /// Returns its first float argument with the second left in the register it was passed in,
 /// which is where a pair of floats is returned.
 pub(super) fn join_floats() -> String {

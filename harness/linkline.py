@@ -76,6 +76,10 @@ def ahead(link, objects, rustd):
     copies = subprocess.check_output([rustd, "weaken", *(link[i] for i in theirs)], text=True).splitlines()
     for i, copy in zip(theirs, copies):
         link[i] = copy
-    # A splice adds two segments to the header, which the linker leaves no room for.
-    link[first:first] = [*objects, "-Wl,-headerpad,0x200"]
+    # A splice adds two segments to the header, which the linker leaves no room for, and
+    # grows the tables of the unwinder into a section of zeros the linker puts ahead of them.
+    room = os.path.join(os.path.dirname(os.path.abspath(objects[0])), "rustd.room")
+    with open(room, "wb") as f:
+        f.write(bytes(0x10000))
+    link[first:first] = [*objects, "-Wl,-headerpad,0x200", f"-Wl,-sectcreate,__TEXT,__rustd_room,{room}"]
     return link

@@ -1,13 +1,19 @@
 # rustd: the daemon's own checks, on its branches. The harnesses compare what rustd builds
-# with what rustc builds, under both producers, on Linux x86-64, Linux AArch64, Windows
-# x86-64 and macOS arm64: each on a machine of its own kind, so nothing is cross-compiled
-# or emulated but what `buildmodel.py` builds for other targets.
+# with what rustc builds, under both backends, on Linux x86-64, Linux AArch64, Windows x86-64
+# and macOS arm64: each on a machine of its own kind, so nothing is cross-compiled or
+# emulated but what `buildmodel.py` builds for other targets. One binary has both backends;
+# RUSTD_BACKEND picks the one a job checks.
+#
+# Every job is named `kind (platform, ...)`. The harnesses a job runs are listed once, in
+# harness/ci.sh, and the toolchain, LLVM and the build are .github/actions/rustd.
 name: rustd
 on:
   push:
     branches: ["main"]
     paths-ignore: ["site/**", "**.md", ".github/workflows/release.yaml", ".github/workflows/site.yaml"]
+  # Not while a pull request is a draft: it runs when it is marked ready.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 concurrency:
@@ -17,80 +23,87 @@ concurrency:
 env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
-  LLVM_SYS_201_PREFIX: /usr/lib/llvm-20
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  checks:
-    name: fmt and tests${{ matrix.suffix }}
-    runs-on: ${{ matrix.os }}
+  tests:
+    name: tests (${{ matrix.platform }})
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
+        platform: [linux-x64, linux-arm64, macos-arm64, windows-x64]
         include:
-          - os: warp-ubuntu-latest-x64-8x
-            suffix: ""
-          - os: warp-ubuntu-latest-arm64-4x
-            suffix: " (aarch64)"
+          - { platform: linux-x64, runner: warp-ubuntu-latest-x64-8x }
+          - { platform: linux-arm64, runner: warp-ubuntu-latest-arm64-8x }
+          - { platform: macos-arm64, runner: warp-macos-latest-arm64-6x }
+          - { platform: windows-x64, runner: warp-windows-2025-x64-8x }
     steps:
+      - run: git config --global core.autocrlf false
       - uses: actions/checkout@v6
         with:
           submodules: true
-      - run: rustup toolchain install 1.99.0 --profile minimal -c rustfmt -c rust-src && rustup default 1.99.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/rustd
         with:
-          cache-provider: "warpbuild"
+          components: -c rustfmt
+          build: false
       - run: cargo fmt --all -- --check
+        if: matrix.platform == 'linux-x64'
       - run: cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd
 
+  # Every harness under both backends at once, on one large machine per platform: see
+  # harness/ci.sh.
   harness:
-    name: harness (${{ matrix.backend }}${{ matrix.suffix }}, ${{ matrix.part }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    name: harness (${{ matrix.platform }})
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        backend: [cranelift, llvm]
-        part: [core, keys, store]
-        os: [warp-ubuntu-latest-x64-8x, warp-ubuntu-latest-arm64-4x]
         include:
-          - os: warp-ubuntu-latest-x64-8x
-            suffix: ""
-          - os: warp-ubuntu-latest-arm64-4x
-            suffix: ", aarch64"
+          - { platform: linux-x64, runner: warp-ubuntu-latest-x64-32x }
+          - { platform: linux-arm64, runner: warp-ubuntu-latest-arm64-32x }
+          - { platform: macos-arm64, runner: warp-macos-latest-arm64-12x }
+          - { platform: windows-x64, runner: warp-windows-2025-x64-32x }
     env:
-      RUSTD_BACKEND: ${{ matrix.backend }}
       RUSTD_OPT: 2
       RUSTD_EMIT: fast
-      PART: ${{ matrix.part }}
     steps:
+      - run: git config --global core.autocrlf false
       - uses: actions/checkout@v6
         with:
           submodules: true
-      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
+      - uses: ./.github/actions/rustd
+      - name: Linux tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y valgrind gdb
       # What `buildmodel.py` builds for besides the host.
-      - run: rustup target add aarch64-unknown-linux-gnu x86_64-unknown-linux-musl
-        if: matrix.os == 'warp-ubuntu-latest-x64-8x'
-      - name: LLVM 20
+      - name: Cross tools
+        if: matrix.platform == 'linux-x64'
         run: |
-          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
-          sudo apt-get install -y llvm-20-dev libpolly-20-dev valgrind gdb
+          rustup target add aarch64-unknown-linux-gnu x86_64-unknown-linux-musl
+          sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools qemu-user
       # `debuginfo.py` has perf unwind what rustd built, which it says it did not run where
       # there is no perf or the kernel does not let this user sample.
       - name: perf
+        if: runner.os == 'Linux'
         continue-on-error: true
         run: |
           sudo apt-get install -y linux-tools-common "linux-tools-$(uname -r)" || sudo apt-get install -y linux-tools-generic
           perf --version || sudo ln -sf "$(ls /usr/lib/linux-tools/*/perf | tail -n 1)" /usr/local/bin/perf
           perf --version
           sudo sysctl kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
-      - name: Cross tools
-        if: matrix.os == 'warp-ubuntu-latest-x64-8x'
-        run: sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools qemu-user
       # MinIO as one program in the home directory, which is where remote.py looks for it and
       # needs it: it kills the service and starts it again. The image is the one that is still
       # published, for both architectures; the runner's docker takes a file out of it without
       # root.
       - name: MinIO
+        if: runner.os == 'Linux'
         run: |
           image=cgr.dev/chainguard/minio@sha256:c93745c56fccdaf0e5dcb88999a96a65a136428beb045ef5d546255a80d747a7
           mkdir -p "$HOME/s3tools"
@@ -98,331 +111,47 @@ jobs:
           docker cp "$container:/usr/bin/minio" "$HOME/s3tools/minio"
           docker rm "$container"
           "$HOME/s3tools/minio" --version
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-provider: "warpbuild"
-      - run: cargo build -p rustd --release --features llvm
       - name: Harnesses
-        working-directory: harness
-        run: |
-          export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
-          failed=
-          # The harnesses are split over three machines by how long they take: keys.py alone, the
-          # ones of the store and the daemon under load, and the rest.
-          part() { case "$1" in keys.py) echo keys;; store*|remote.py|stress.py|selects.py) echo store;; *) echo core;; esac; }
-          run() { [ "$(part "$1")" = "$PART" ] || return 0; echo "::group::$*"; python3 "$@" || { failed="$failed [$*]"; echo "::error::$* failed"; }; echo "::endgroup::"; }
-          run difftest.py corpus --bin runner --crate cases --layouts
-          run programs.py
-          run stress.py
-          run breakers.py
-          run unwinds.py
-          run splices.py
-          # A branch reaches 128 MB on AArch64, and the splice has to get past that.
-          if [ "$(uname -m)" = aarch64 ]; then RUSTD_SPLICE=1 run farsplices.py; fi
-          run asmedits.py
-          run includes.py
-          run worktrees.py
-          run keys.py
-          # Generated programs on fixed seeds. Only x86-64 has been fuzzed so far.
-          if [ "$(uname -m)" = x86_64 ]; then run fuzz/fuzz.py smoke --backends "$RUSTD_BACKEND"; fi
-          # Generated edits under a daemon against cold builds, and the sequences that found faults.
-          if [ "$(uname -m)" = x86_64 ]; then run fuzz/edits.py smoke --backends "$RUSTD_BACKEND"; fi
-          # How much of the corpus LLVM compiled itself, and what it left to Cranelift and why.
-          if [ "$RUSTD_BACKEND" = llvm ]; then run backends.py corpus runner cases --bin runner --levels 2f; fi
-          run debuginfo.py
-          # It runs both producers itself. The cases that are of an x86-64 host (another libc
-          # of it, one of its processors) say so, and are not run on AArch64.
-          if [ "$RUSTD_BACKEND" = cranelift ]; then run buildmodel.py; fi
-          run storekills.py --kills 100
-          run storecorrupts.py --rounds 4
-          run storefull.py
-          run storeshared.py
-          run storeguards.py
-          run selects.py
-          if [ -x "$HOME/s3tools/minio" ]; then run remote.py; fi
-          echo "failed:${failed:- none}"
-          test -z "$failed"
+        run: bash harness/ci.sh
 
-  # `cargo rustd` in place of cargo on projects as they are published, natively on AArch64:
-  # what the programs print and what every test says has to be what cargo gives.
+  # `cargo rustd` in place of cargo on projects as they are published, under both backends at
+  # once: what the programs print and what every test says has to be what cargo gives. `small`
+  # is ripgrep, fd and hyperfine with the flags, the daemon's life and plain cargo; Linux
+  # AArch64 builds the larger projects.
   projects:
-    name: projects (${{ matrix.backend }}, aarch64, ${{ matrix.projects }})
-    runs-on: warp-ubuntu-latest-arm64-4x
-    timeout-minutes: 180
+    name: projects (${{ matrix.platform }})
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        backend: [cranelift, llvm]
-        # Each group on a machine of its own: one after another they take most of an hour.
-        projects: ["ripgrep fd bat hyperfine", "just axum", "nushell"]
+        include:
+          - { platform: linux-x64, runner: warp-ubuntu-latest-x64-16x, groups: '"small"' }
+          - { platform: macos-arm64, runner: warp-macos-latest-arm64-12x, groups: '"small"' }
+          - { platform: linux-arm64, runner: warp-ubuntu-latest-arm64-32x, groups: '"ripgrep fd" "bat hyperfine" "just axum" "nushell"' }
     env:
-      RUSTD_BACKEND: ${{ matrix.backend }}
       RUSTD_OPT: 2
       RUSTD_EMIT: fast
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: true
-      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
-      - name: LLVM 20
-        run: |
-          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
-          sudo apt-get install -y llvm-20-dev libpolly-20-dev
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-provider: "warpbuild"
-      - run: cargo build -p rustd --release --features llvm
-      - name: cargo rustd
-        working-directory: harness
-        run: |
-          export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
-          status=0
-          # The projects a hosted runner has the time and the memory for: the ten after these
-          # take more than its three hours, and it was shut down loading rust-analyzer.
-          python3 cargo_rustd.py ${{ matrix.projects }} || status=$?
-          cat CARGO-RUSTD.md
-          exit $status
-
-  windows-checks:
-    name: fmt and tests (windows)
-    runs-on: warp-windows-2025-x64-8x
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - run: git config --global core.autocrlf false
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-      - run: rustup toolchain install 1.99.0 --profile minimal -c rustfmt -c rust-src && rustup default 1.99.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-provider: "warpbuild"
-      - run: cargo fmt --all -- --check
-      - run: cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd
-
-  windows-harness:
-    name: harness (windows, ${{ matrix.backend }}, ${{ matrix.part }})
-    runs-on: warp-windows-2025-x64-8x
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      matrix:
-        backend: [cranelift, llvm]
-        part: [core, keys, store]
-    defaults:
-      run:
-        shell: bash
-    env:
-      RUSTD_BACKEND: ${{ matrix.backend }}
-      PART: ${{ matrix.part }}
-      RUSTD_OPT: 2
-      RUSTD_EMIT: fast
-      LLVM_VERSION: 20.1.8
-      LLVM_SYS_201_PREFIX: C:\llvm20
-    steps:
-      - run: git config --global core.autocrlf false
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-      # The harnesses run the linker themselves, with the environment the compiler has. In
-      # this shell the `link` of coreutils comes before the linker, so it goes.
-      - uses: ilammy/msvc-dev-cmd@v1
-      - run: rm -f /usr/bin/link.exe
-      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src -c llvm-tools && rustup default 1.99.0
-      - uses: actions/cache@v4
-        id: llvm
-        with:
-          path: C:\llvm20
-          key: llvm-${{ env.LLVM_VERSION }}-x86_64-pc-windows-msvc-pdbutil
-      # The release has the libraries, the headers and `llvm-config`, which is all the build
-      # reads, and `llvm-pdbutil`, which debuginfo.py reads a PDB with. Its libraries want a static libxml2 that it does not have and that nothing
-      # here calls into, so an archive of nothing stands in for it.
-      - name: LLVM 20
-        if: steps.llvm.outputs.cache-hit != 'true'
-        run: |
-          name="clang+llvm-$LLVM_VERSION-x86_64-pc-windows-msvc"
-          curl -sSfL --retry 5 -o llvm.tar.xz "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/$name.tar.xz"
-          mkdir -p /c/llvm20
-          tar -xJf llvm.tar.xz -C /c/llvm20 --strip-components=1 --wildcards "$name/lib/*.lib" "$name/include" "$name/bin/llvm-config.exe" "$name/bin/llvm-pdbutil.exe"
-          rm llvm.tar.xz
-          echo '#![no_std]' > nothing.rs
-          rustc --crate-type=lib --emit=obj -Cpanic=abort -o nothing.o nothing.rs
-          "$(rustc --print sysroot)/lib/rustlib/x86_64-pc-windows-msvc/bin/llvm-ar.exe" rc /c/llvm20/lib/libxml2s.lib nothing.o
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-provider: "warpbuild"
-      # The release is built against the static C runtime, and names libraries of the SDK
-      # that the linker is not otherwise shown.
-      - name: Build
-        run: |
-          sdk=$(ls -d "/c/Program Files (x86)/Windows Kits/10/Lib/"*/um/x64 | tail -n 1)
-          export CARGO_ENCODED_RUSTFLAGS=$(printf '%s\x1f%s\x1f%s\x1f%s' -C target-feature=+crt-static -L "native=$(cygpath -w "$sdk")")
-          cargo build -p rustd --release --features llvm
-      - name: Harnesses
-        working-directory: harness
-        run: |
-          export RUSTD_BIN="$(cygpath -w "$GITHUB_WORKSPACE")\target\release\rustd.exe"
-          failed=
-          # The harnesses are split over three machines by how long they take: keys.py alone, the
-          # ones of the store and the daemon under load, and the rest.
-          part() { case "$1" in keys.py) echo keys;; store*|remote.py|stress.py|selects.py) echo store;; *) echo core;; esac; }
-          run() { [ "$(part "$1")" = "$PART" ] || return 0; echo "::group::$*"; python "$@" || { failed="$failed [$*]"; echo "::error::$* failed"; }; echo "::endgroup::"; }
-          run difftest.py corpus --bin runner --crate cases --layouts
-          run programs.py
-          run stress.py
-          run breakers.py
-          run unwinds.py
-          run splices.py
-          run asmedits.py
-          run includes.py
-          run worktrees.py
-          run keys.py
-          # How much of the corpus LLVM compiled itself, and what it left to Cranelift and why.
-          if [ "$RUSTD_BACKEND" = llvm ]; then run backends.py corpus runner cases --bin runner --levels 2f; fi
-          run debuginfo.py
-          # The two Linux cross targets of buildmodel.py are skipped here, and it says so.
-          if [ "${RUSTD_BACKEND:-cranelift}" = cranelift ]; then run buildmodel.py; fi
-          # Not run here: `farsplices.py` is about the reach of an AArch64 branch.
-          run storekills.py --kills 100
-          run storecorrupts.py --rounds 4
-          run storefull.py
-          run storeshared.py
-          echo "failed:${failed:- none}"
-          test -z "$failed"
-
-  macos:
-    name: macOS arm64 (${{ matrix.backend }}, ${{ matrix.part }})
-    runs-on: warp-macos-latest-arm64-6x
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        backend: [cranelift, llvm]
-        part: [core, keys, store]
-    env:
-      RUSTD_BACKEND: ${{ matrix.backend }}
-      RUSTD_OPT: 2
-      RUSTD_EMIT: fast
-      PART: ${{ matrix.part }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-      - run: rustup toolchain install 1.99.0 --profile minimal -c rustfmt -c rust-src && rustup default 1.99.0
-      - name: LLVM 20
-        run: |
-          brew install llvm@20
-          echo "LLVM_SYS_201_PREFIX=$(brew --prefix llvm@20)" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-provider: "warpbuild"
-      - run: cargo fmt --all -- --check
-        if: matrix.backend == 'cranelift' && matrix.part == 'core'
-      - run: cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p rustd
-        if: matrix.backend == 'cranelift' && matrix.part == 'core'
-      - run: cargo build -p rustd --release --features llvm
-      - name: Harnesses
-        working-directory: harness
-        run: |
-          export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
-          failed=
-          # The harnesses are split over three machines by how long they take: keys.py alone, the
-          # ones of the store and the daemon under load, and the rest.
-          part() { case "$1" in keys.py) echo keys;; store*|remote.py|stress.py|selects.py) echo store;; *) echo core;; esac; }
-          run() { [ "$(part "$1")" = "$PART" ] || return 0; echo "::group::$*"; python3 "$@" || { failed="$failed [$*]"; echo "::error::$* failed"; }; echo "::endgroup::"; }
-          run difftest.py corpus --bin runner --crate cases --layouts
-          run programs.py
-          run stress.py
-          run breakers.py
-          run unwinds.py
-          run splices.py
-          run asmedits.py
-          run includes.py
-          run worktrees.py
-          run worktrees.py --join --together
-          run worktrees.py --overlay
-          run keys.py
-          # How much of the corpus LLVM compiled itself, and what it left to Cranelift and why.
-          if [ "$RUSTD_BACKEND" = llvm ]; then run backends.py corpus runner cases --bin runner --levels 2f; fi
-          # Not run here: `debuginfo.py` reads DWARF with gdb out of an ELF executable;
-          # `buildmodel.py` builds for Linux targets; `storefull.py` mounts a tmpfs;
-          # `farsplices.py` splices, which is not done for Mach-O.
-          run storekills.py --kills 100
-          run storecorrupts.py --rounds 4
-          run storeshared.py
-          echo "failed:${failed:- none}"
-          test -z "$failed"
-
-  cargo-rustd:
-    name: cargo rustd (${{ matrix.backend }})
-    runs-on: warp-ubuntu-latest-x64-8x
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        backend: [cranelift, llvm]
-    env:
-      RUSTD_BACKEND: ${{ matrix.backend }}
-      RUSTD_OPT: 2
-      RUSTD_EMIT: fast
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
-      - name: LLVM 20
-        run: |
-          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
-          sudo apt-get install -y llvm-20-dev libpolly-20-dev
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-provider: "warpbuild"
-      - run: cargo build -p rustd --release --features llvm
-      # ripgrep, fd and hyperfine at pinned commits, the flags, and the daemon's life,
-      # the second user among it. Incremental compilation is left to the profile, as on a
-      # developer's machine: with it off the tests of every project are cargo's (the
-      # harness has that case among the flags).
+      - uses: ./.github/actions/rustd
       - name: cargo rustd against cargo
+        run: bash harness/ci.sh projects ${{ matrix.groups }}
+      # The lints are rust-analyzer's whatever the backend or the platform, so they are checked once.
+      - name: cargo rustd clippy against clippy
+        if: matrix.platform == 'linux-x64'
         working-directory: harness
-        run: RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd" env -u CARGO_INCREMENTAL python3 cargo_rustd.py --small
-
-  # The same on macOS arm64, where the link is Apple's and the cargo above the wrapper is
-  # read through libproc.
-  cargo-rustd-macos:
-    name: cargo rustd (macos, ${{ matrix.backend }})
-    runs-on: warp-macos-latest-arm64-6x
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        backend: [cranelift, llvm]
-    env:
-      RUSTD_BACKEND: ${{ matrix.backend }}
-      RUSTD_OPT: 2
-      RUSTD_EMIT: fast
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: true
-      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
-      - name: LLVM 20
-        run: |
-          brew install llvm@20
-          echo "LLVM_SYS_201_PREFIX=$(brew --prefix llvm@20)" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-provider: "warpbuild"
-      - run: cargo build -p rustd --release --features llvm
-      - name: cargo rustd against cargo
-        working-directory: harness
-        run: RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd" env -u CARGO_INCREMENTAL python3 cargo_rustd.py --small
+        run: rustup component add clippy --toolchain "$(cat toolchain)" && RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd" python3 clippy.py
 
   # Not required to pass yet: the baseline was measured on another machine than the runner, so
   # the threshold on times is wide, and what it holds exactly is who built each step, whether
   # it was spliced and how many functions were compiled.
   bench:
-    name: bench (ripgrep)
+    name: bench (linux-x64)
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: warp-ubuntu-latest-x64-8x
     timeout-minutes: 60
     continue-on-error: true
@@ -430,15 +159,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: true
-      - run: rustup toolchain install 1.99.0 --profile minimal -c rust-src && rustup default 1.99.0
-      - name: LLVM 20
-        run: |
-          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
-          sudo apt-get install -y llvm-20-dev libpolly-20-dev
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-provider: "warpbuild"
-      - run: cargo build -p rustd --release --features llvm
+      - uses: ./.github/actions/rustd
       - name: Bench
         working-directory: harness
         run: |

@@ -1,0 +1,76 @@
+name: rustd
+description: The pinned toolchain, LLVM 20, and the release build of rustd with both backends.
+inputs:
+  components:
+    description: More rustup components, as `-c name` each.
+    default: ""
+  build:
+    description: Whether to install LLVM and build rustd, or only the toolchain.
+    default: "true"
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        rustup toolchain install 1.99.0 --profile minimal -c rust-src ${{ runner.os == 'Windows' && '-c llvm-tools' || '' }} ${{ inputs.components }}
+        rustup default 1.99.0
+
+    - if: inputs.build == 'true' && runner.os == 'Linux'
+      shell: bash
+      run: |
+        wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
+        sudo apt-get install -y llvm-20-dev libpolly-20-dev
+        echo "LLVM_SYS_201_PREFIX=/usr/lib/llvm-20" >> "$GITHUB_ENV"
+
+    - if: inputs.build == 'true' && runner.os == 'macOS'
+      shell: bash
+      run: |
+        brew install llvm@20
+        echo "LLVM_SYS_201_PREFIX=$(brew --prefix llvm@20)" >> "$GITHUB_ENV"
+
+    # The harnesses run the linker themselves, with the environment the compiler has. In
+    # Git's bash the `link` of coreutils comes before the linker, so it goes.
+    - if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@v1
+    - if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        rm -f /usr/bin/link.exe
+        echo 'LLVM_SYS_201_PREFIX=C:\llvm20' >> "$GITHUB_ENV"
+    - if: inputs.build == 'true' && runner.os == 'Windows'
+      uses: actions/cache@v4
+      id: llvm
+      with:
+        path: C:\llvm20
+        key: llvm-20.1.8-x86_64-pc-windows-msvc-pdbutil
+    # The release has the libraries, the headers and `llvm-config`, which is all the build
+    # reads, and `llvm-pdbutil`, which debuginfo.py reads a PDB with. Its libraries want a
+    # static libxml2 that it does not have and that nothing here calls into, so an archive of
+    # nothing stands in for it.
+    - if: inputs.build == 'true' && runner.os == 'Windows' && steps.llvm.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        name=clang+llvm-20.1.8-x86_64-pc-windows-msvc
+        curl -sSfL --retry 5 -o llvm.tar.xz "https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.8/$name.tar.xz"
+        mkdir -p /c/llvm20
+        tar -xJf llvm.tar.xz -C /c/llvm20 --strip-components=1 --wildcards "$name/lib/*.lib" "$name/include" "$name/bin/llvm-config.exe" "$name/bin/llvm-pdbutil.exe"
+        rm llvm.tar.xz
+        echo '#![no_std]' > nothing.rs
+        rustc --crate-type=lib --emit=obj -Cpanic=abort -o nothing.o nothing.rs
+        "$(rustc --print sysroot)/lib/rustlib/x86_64-pc-windows-msvc/bin/llvm-ar.exe" rc /c/llvm20/lib/libxml2s.lib nothing.o
+        rm nothing.rs nothing.o
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        cache-provider: warpbuild
+
+    # On Windows the release is built against the static C runtime, and names libraries of
+    # the SDK that the linker is not otherwise shown.
+    - if: inputs.build == 'true'
+      shell: bash
+      run: |
+        if [ "$RUNNER_OS" = Windows ]; then
+          sdk=$(ls -d "/c/Program Files (x86)/Windows Kits/10/Lib/"*/um/x64 | tail -n 1)
+          export CARGO_ENCODED_RUSTFLAGS=$(printf '%s\x1f%s\x1f%s\x1f%s' -C target-feature=+crt-static -L "native=$(cygpath -w "$sdk")")
+        fi
+        cargo build -p rustd --release --features llvm

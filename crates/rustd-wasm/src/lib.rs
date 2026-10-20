@@ -29,7 +29,7 @@ use hir_def::{
     signatures::FunctionSignature,
 };
 use hir_ty::mir::codegen::{
-    CodegenError, CodegenUnit, Rejections, Roots, SymbolResolver, exported_symbol,
+    CodegenUnit, Rejections, Roots, SymbolResolver, exported_symbol,
 };
 use ide_db::{
     ChangeWithProcMacros, RootDatabase,

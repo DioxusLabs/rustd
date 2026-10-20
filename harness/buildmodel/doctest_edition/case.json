@@ -1,0 +1,9 @@
+{
+  "row": "doctests of another edition than the library's",
+  "package": "app",
+  "crates": [
+    "app"
+  ],
+  "doctests": true,
+  "expect": "refused"
+}

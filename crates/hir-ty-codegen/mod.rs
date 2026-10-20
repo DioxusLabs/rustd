@@ -97,9 +97,12 @@ mod debuginfo;
 pub use debuginfo::Sidecar;
 mod float_pair;
 mod fragment;
+mod reach;
+pub use reach::{Reached, reached};
 #[cfg(test)]
 mod fuzz;
 mod home;
+pub mod lints;
 pub use home::body_file;
 #[cfg(feature = "llvm")]
 mod llvm;
@@ -217,6 +220,12 @@ pub trait SymbolResolver {
     /// Whether rustc built the function under a symbol that only its own object can link to.
     fn private(&self, _func: FunctionId) -> bool {
         false
+    }
+    /// The function whose body declares a writable static that rustc keeps to its object,
+    /// when nothing of rustc's build reaches rustc's copy of the static but rustc's copy of
+    /// that function: a program that never calls that copy has only ours of the static.
+    fn private_static_owner(&self, _id: StaticId) -> Option<FunctionId> {
+        None
     }
     /// A non-generic function by path, e.g. `core::panicking::panic_bounds_check`.
     fn path(&self, path: &str) -> Option<String>;
@@ -353,6 +362,16 @@ enum PassMode {
     /// `padded`.
     OnStack {
         size: u32,
+        padded: bool,
+    },
+    /// A pair one half of which is a 128-bit integer that finds one integer register left on
+    /// System V x86-64. That half goes as the 16 bytes of an `OnStack` copy, `padded` the same
+    /// way, which takes no register, and the `other` half as `Direct`. `first` says the
+    /// copied half is the one at offset zero; the other is at `offset`.
+    PairSpilled {
+        first: bool,
+        other: AbiScalar,
+        offset: Size,
         padded: bool,
     },
 }
@@ -2803,6 +2822,20 @@ pub fn link_name(db: &dyn HirDatabase, func: FunctionId) -> Option<String> {
     Some(name.as_str().to_owned())
 }
 
+/// The name attributes give a static for the linker: the one of an `extern` block's static, or
+/// the one `#[no_mangle]` or `#[export_name]` exports.
+fn static_symbol(db: &dyn HirDatabase, id: StaticId) -> Option<intern::Symbol> {
+    let signature = StaticSignature::of(db, id);
+    if signature.flags.contains(StaticFlags::EXTERN) {
+        let name = AttrFlags::link_name(db, id.into());
+        return Some(name.unwrap_or_else(|| signature.name.symbol().clone()));
+    }
+    AttrFlags::export_name(db, id.into()).or_else(|| {
+        let unmangled = AttrFlags::query(db, id.into()).contains(AttrFlags::NO_MANGLE);
+        unmangled.then(|| signature.name.symbol().clone())
+    })
+}
+
 /// The symbol a static of an `extern` block links to.
 fn static_link_name(db: &dyn HirDatabase, id: StaticId) -> Option<String> {
     let signature = StaticSignature::of(db, id);
@@ -3336,7 +3369,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         } else {
             std::thread::spawn(move || drop(told));
         }
-        let object = product.emit().map_err(|e| CodegenError::Backend(e.to_string()))?;
+        let macho = product.object.format() == cranelift_object::object::BinaryFormat::MachO;
+        let mut object = product.emit().map_err(|e| CodegenError::Backend(e.to_string()))?;
+        if macho {
+            debuginfo::settle_macho(&mut object).map_err(CodegenError::Backend)?;
+        }
         Ok((object, apart))
     }
 
@@ -4483,17 +4520,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// The name the linker knows a static by: one of an `extern` block, or one that an
     /// attribute exports and rustc's build defines.
     fn linked_static(&self, id: StaticId) -> Result<Option<intern::Symbol>> {
-        let db = self.db;
-        let signature = StaticSignature::of(db, id);
-        if !signature.flags.contains(StaticFlags::EXTERN) {
-            let exported = AttrFlags::export_name(db, id.into()).or_else(|| {
-                let unmangled = AttrFlags::query(db, id.into()).contains(AttrFlags::NO_MANGLE);
-                unmangled.then(|| signature.name.symbol().clone())
-            });
-            return Ok(exported.filter(|name| self.symbols.defines(name.as_str())));
+        let name = static_symbol(self.db, id);
+        if StaticSignature::of(self.db, id).flags.contains(StaticFlags::EXTERN) {
+            return Ok(name);
         }
-        let name = AttrFlags::link_name(db, id.into());
-        Ok(Some(name.unwrap_or_else(|| signature.name.symbol().clone())))
+        Ok(name.filter(|name| self.symbols.defines(name.as_str())))
     }
 
     fn static_data(&mut self, id: StaticId) -> Result<DataId> {
@@ -4542,7 +4573,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             return Ok(data);
         }
         let compiled = compiled_static(db, id).as_ref().map_err(Clone::clone)?;
-        if compiled.writable && !self.own_statics.owns(db, id) {
+        if compiled.writable && !self.own_statics.owns(db, id) && !self.ours_alone(id) {
             let name = hir_def::signatures::StaticSignature::of(db, id).name.as_str();
             unsupported!("writable static `{name}` without a rustc symbol");
         }
@@ -4893,11 +4924,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             for &at in callers.get(callee).into_iter().flatten() {
                 let (caller, env) = &self.envs[at];
                 // rustc's copy stands in for one of these, which its callers then call.
-                let forwarded = self.forwarded.contains(caller)
-                    || matches!(caller.def, InstanceDef::Fn(func) if self
-                        .instance_path(func, caller.args.as_ref())
-                        .and_then(|path| self.symbols.path(&path))
-                        .is_some_and(|it| self.rustc_copy(it, caller.checked).is_some()));
+                let forwarded =
+                    self.forwarded.contains(caller) || self.rustc_stand_in(caller).is_some();
                 if !forwarded && seen.insert(caller.clone()) {
                     failed.push((caller.clone(), Rejected { env: env.clone(), why: why.clone() }));
                 }
@@ -4905,12 +4933,33 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
     }
 
+    /// Whether rustc's copy of a writable static of another crate is never used: only rustc's
+    /// copy of the function declaring it reaches it, and that function hands out a future, so
+    /// we call ours.
+    fn ours_alone(&self, id: StaticId) -> bool {
+        self.symbols.private_static_owner(id).is_some_and(|func| {
+            !self.own_statics.crates.contains(&func.krate(self.db))
+                && *returns_async_block(self.db, func)
+        })
+    }
+
+    /// The symbol of rustc's copy of `instance`, when that can stand in for ours.
+    fn rustc_stand_in(&self, instance: &Instance) -> Option<String> {
+        let InstanceDef::Fn(func) = instance.def else { return None };
+        // rustc's copy of a function of another crate would hand out rustc's future.
+        if !self.own_statics.crates.contains(&func.krate(self.db))
+            && *returns_async_block(self.db, func)
+        {
+            return None;
+        }
+        let symbol = self.symbols.path(&self.instance_path(func, instance.args.as_ref())?)?;
+        self.rustc_copy(symbol, instance.checked)
+    }
+
     /// Makes `id` a call of the copy of `instance` rustc compiled, when there is one: an
     /// instance we cannot compile is still one we can call.
     fn forward_to_rustc(&mut self, instance: &Instance, id: FuncId) -> Option<()> {
-        let InstanceDef::Fn(func) = instance.def else { return None };
-        let symbol = self.symbols.path(&self.instance_path(func, instance.args.as_ref())?)?;
-        let symbol = self.rustc_copy(symbol, instance.checked)?;
+        let symbol = self.rustc_stand_in(instance)?;
         let sig = self.module.declarations().get_function_decl(id).signature.clone();
         let target = self.import(&symbol, &sig).ok()?;
         let mut ctx = self.module.make_context();
@@ -6003,7 +6052,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let args = args
                 .into_iter()
                 .map(|ty| self.pass_mode(&*self.layout(ty)?, false))
-                .collect::<Result<_>>()?;
+                .collect::<Result<Vec<_>>>()?;
+            if self.cg.target.call_conv == isa::CallConv::SystemV
+                && self.cg.target.arch == Arch::X86_64
+            {
+                return Ok(FnAbi { args: self.sysv_wide_ints(ret, args), ret });
+            }
             return Ok(FnAbi { ret, args });
         }
         if self.cg.target.call_conv == isa::CallConv::WindowsFastcall {
@@ -6029,6 +6083,81 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             _ => unsupported!("calling convention {abi:?}"),
         }
+    }
+
+    /// The Rust convention's arguments on System V x86-64 where Cranelift and LLVM differ: a
+    /// 128-bit integer that finds one integer register left goes to the stack under both,
+    /// but LLVM gives that register to the next integer and Cranelift to none. Such an
+    /// integer is passed as a copy in memory instead, which takes no register.
+    fn sysv_wide_ints(&self, ret: PassMode, mut args: Vec<PassMode>) -> Vec<PassMode> {
+        struct Left {
+            ints: usize,
+            floats: usize,
+            /// How many bytes of the stack the arguments so far take, as Cranelift places them.
+            stack: u32,
+        }
+        impl Left {
+            fn take(&mut self, ty: Type) {
+                let regs = if ty.is_float() { &mut self.floats } else { &mut self.ints };
+                let wanted = ty.bytes().div_ceil(8) as usize;
+                if *regs >= wanted {
+                    *regs -= wanted;
+                } else if ty == types::I128 {
+                    self.stack = self.stack.next_multiple_of(16) + 16;
+                } else {
+                    self.stack += 8;
+                }
+            }
+            /// Whether a value of `ty` is the 128-bit integer that LLVM and Cranelift place
+            /// differently. If so it takes its copy's room on the stack, and says if that
+            /// is padded.
+            fn spill(&mut self, ty: Type) -> Option<bool> {
+                if ty != types::I128 || self.ints != 1 {
+                    return None;
+                }
+                let padded = self.stack % 16 != 0;
+                self.stack += 16 + if padded { 8 } else { 0 };
+                Some(padded)
+            }
+        }
+        let ints = if matches!(ret, PassMode::Indirect) { 5 } else { 6 };
+        let mut left = Left { ints, floats: 8, stack: 0 };
+        for mode in &mut args {
+            match *mode {
+                PassMode::Ignore => (),
+                PassMode::Direct(AbiScalar { ty, .. }) => {
+                    if let Some(padded) = left.spill(ty) {
+                        *mode = PassMode::OnStack { size: 16, padded };
+                    } else {
+                        left.take(ty);
+                    }
+                }
+                PassMode::Cast(ty) => left.take(ty),
+                PassMode::Pair(a, b, offset) => {
+                    if let Some(padded) = left.spill(a.ty) {
+                        left.take(b.ty);
+                        *mode = PassMode::PairSpilled { first: true, other: b, offset, padded };
+                        continue;
+                    }
+                    left.take(a.ty);
+                    if let Some(padded) = left.spill(b.ty) {
+                        *mode = PassMode::PairSpilled { first: false, other: a, offset, padded };
+                        continue;
+                    }
+                    left.take(b.ty);
+                }
+                PassMode::Indirect => left.take(ptr()),
+                PassMode::OnStack { size, padded } => {
+                    left.stack += size + if padded { 8 } else { 0 };
+                }
+                PassMode::CastPair(..)
+                | PassMode::Uniform { .. }
+                | PassMode::PairSpilled { .. } => {
+                    unreachable!("the Rust convention passes no aggregate in registers")
+                }
+            }
+        }
+        args
     }
 
     /// The C convention of the System V x86-64 psABI, as rustc's `callconv/x86_64.rs` has it.
@@ -6063,7 +6192,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 PassMode::Pair(a, b, _) => self.count_regs(&[a.ty, b.ty]),
                 PassMode::Cast(ty) => self.count_regs(&[ty]),
                 PassMode::CastPair(a, b) => self.count_regs(&[a, b]),
-                PassMode::Uniform { .. } => unreachable!("x86-64 has no uniform aggregate"),
+                PassMode::Uniform { .. } | PassMode::PairSpilled { .. } => {
+                    unreachable!("the C ABI of x86-64 makes neither")
+                }
             };
             let aggregate = matches!(mode, PassMode::Cast(_) | PassMode::CastPair(..));
             let in_registers = match (int_regs.checked_sub(ints), sse_regs.checked_sub(sses)) {
@@ -6508,6 +6639,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 params.extend(padded.then(|| copied(8)));
                 params.push(copied(size));
             }
+            PassMode::PairSpilled { first, other, padded, .. } => {
+                let copied = |size| AbiParam::special(ptr(), ArgumentPurpose::StructArgument(size));
+                params.extend((!first).then(|| other.param()));
+                params.extend(padded.then(|| copied(8)));
+                params.push(copied(16));
+                params.extend(first.then(|| other.param()));
+            }
         }
     }
 
@@ -6588,7 +6726,27 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
                 values.push(addr);
             }
+            PassMode::PairSpilled { first, other, offset, padded } => {
+                let (copied, at) = Self::spilled_halves(first, offset);
+                let other = self.builder.ins().load(other.ty, MEM, addr, at);
+                if !first {
+                    values.push(other);
+                }
+                if padded {
+                    values.push(self.scratch());
+                }
+                values.push(self.builder.ins().iadd_imm(addr, i64::from(copied)));
+                if first {
+                    values.push(other);
+                }
+            }
         }
+    }
+
+    /// Where the copied half and the other half of a `PassMode::PairSpilled` are.
+    fn spilled_halves(first: bool, offset: Size) -> (i32, i32) {
+        let offset = offset.bytes() as i32;
+        if first { (0, offset) } else { (offset, 0) }
     }
 
     /// Stores what `pass` or a return sent, taking the values off the front of `values`.
@@ -6620,6 +6778,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.builder.ins().store(MEM, a, addr, 0);
                 let rest = self.builder.ins().iadd_imm(addr, 8);
                 self.store_cast(b, rest, layout.size - Size::from_bytes(8));
+            }
+            PassMode::PairSpilled { first, offset, padded, .. } => {
+                let (copied, at) = Self::spilled_halves(first, offset);
+                let other = if first { None } else { Some(next()) };
+                if padded {
+                    next();
+                }
+                let copy = next();
+                let other = other.unwrap_or_else(&mut next);
+                let wide = self.builder.ins().load(types::I128, MEM, copy, 0);
+                self.builder.ins().store(MEM, wide, addr, copied);
+                self.builder.ins().store(MEM, other, addr, at);
             }
             PassMode::Uniform { unit, count, skipped } => {
                 for _ in 0..skipped {
@@ -11349,6 +11519,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let count = match mode {
             PassMode::Ignore => 0,
             PassMode::Pair(..) => 2,
+            PassMode::PairSpilled { padded, .. } => 2 + usize::from(padded),
             _ => 1,
         };
         let mut sig = sig.clone();
@@ -12023,6 +12194,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let value = self.builder.ins().load(scalar.ty, MEM, from, 0);
                 self.builder.ins().store(MEM, value, dst, 0);
             }
+            // Out of range is undefined, so `as`'s saturating cast is one of its meanings.
+            ("float_to_int_unchecked", [arg]) => {
+                let (value, from) = self.load_scalar(arg)?;
+                let to = self.scalar_of(dst_ty)?;
+                let value = self.float_cast(value, from, to)?;
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
             ("transmute" | "transmute_unchecked" | "black_box" | "likely" | "unlikely", [arg]) => {
                 self.cg.opaque |= name == "black_box";
                 let (src, ty) = self.operand(arg)?;
@@ -12111,6 +12289,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let (count, _) = self.load_scalar(count)?;
                 let bytes = self.builder.ins().imul_imm(count, size);
                 let value = self.builder.ins().iadd(ptr, bytes);
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            ("ptr_mask", [ptr, mask]) => {
+                let (ptr, _) = self.load_scalar(ptr)?;
+                let (mask, _) = self.load_scalar(mask)?;
+                let value = self.builder.ins().band(ptr, mask);
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             ("ptr_offset_from" | "ptr_offset_from_unsigned", [a, b]) => {
@@ -12838,9 +13022,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let value = self.builder.inst_results(call)[0];
                 self.builder.ins().store(MEM, value, dst, 0);
             }
-            ("x86.sse2.pause", []) => {
+            ("x86.sse2.pause", []) | ("aarch64.isb", [_]) => {
+                let text = if name == "aarch64.isb" { asm::isb() } else { asm::pause() };
                 let sig = self.cg.make_signature();
-                let callee = self.cg.assembly(asm::pause(), &sig);
+                let callee = self.cg.assembly(text, &sig);
                 let callee = self.cg.declare_func_in_func(callee, self.builder.func);
                 self.builder.ins().call(callee, &[]);
             }

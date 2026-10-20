@@ -33,11 +33,6 @@
 /// not a test
 /// ```
 ///
-/// ```rust,edition2015
-/// let async = app::double(3);
-/// assert_eq!(async, 6);
-/// ```
-///
 /// ```
 /// # let hidden = app::double(4);
 /// assert_eq!(hidden, 8);
