@@ -170,17 +170,24 @@ def main():
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
         # A program asked for twice in a step is asked for the second time after the others.
-        asking = {at: ask(at) for at in order} if together else {}
+        asking = {at: ask(at) for at in dict.fromkeys(order)} if together else {}
         for at in order:
             checkout = checkouts[at]
             began, reply = asking.pop(at, None) or ask(at)
-            reply = reply.communicate(timeout=120)[0].strip()
+            try:
+                reply = reply.communicate(timeout=120)[0].strip()
+            except subprocess.TimeoutExpired:
+                reply.kill()
+                print(open(log_path, errors="replace").read()[-6000:], flush=True)
+                reply = "no answer in 120 s"
             took = (time.time() - began) * 1000
             cargo = subprocess.run(["cargo", "build", "-q", "-p", "sapp", *TARGET_ARGS], cwd=checkout["ws"], capture_output=True,
                                    text=True, env={**os.environ, "CARGO_TARGET_DIR": checkout["reference"]})
             assert (cargo.returncode != 0) == (at in broken), cargo.stderr[-2000:]
             if daemon.poll() is not None:
                 verdict = "DAEMON DIED"
+            elif reply.startswith("no answer"):
+                verdict = "NO ANSWER"
             elif at in broken:
                 verdict = "refused" if not reply.startswith("ok") else "ANSWERED OK"
             elif not reply.startswith("ok"):
