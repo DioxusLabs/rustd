@@ -192,6 +192,7 @@ def main():
             wrong += verdict.isupper()
             print(f"    checkout {at} {verdict:16} {took:6.0f} ms  {reply[:90]}", flush=True)
             if daemon.poll() is not None:
+                print(open(log_path, errors="replace").read()[-6000:], flush=True)
                 raise SystemExit(f"the daemon died: {log_path}")
     daemon.kill()
     print(f"{asked - wrong} of {asked} right; log {log_path}")

@@ -388,7 +388,9 @@ jobs:
       - name: cargo rustd against cargo
         working-directory: harness
         run: RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd" env -u CARGO_INCREMENTAL python3 cargo_rustd.py --small
+      # The lints are rust-analyzer's whatever the backend, so they are checked once.
       - name: cargo rustd clippy against clippy
+        if: matrix.backend == 'cranelift'
         working-directory: harness
         run: rustup component add clippy --toolchain "$(cat toolchain)" && RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd" python3 clippy.py
 
