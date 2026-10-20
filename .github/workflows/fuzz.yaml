@@ -1,6 +1,7 @@
 # A long differential fuzz run every night: generated programs built by rustc and by rustd
-# under both producers, outputs compared. The seed is the run number, so every night covers
-# new programs and a failing night can be repeated with `fuzz.py run --seed N`.
+# under both producers, outputs compared, then generated edits under the daemon. The seed is
+# the run number, so every night covers new programs and a failing night can be repeated with
+# `fuzz.py run --seed N` or `edits.py run --seed N`.
 name: fuzz
 on:
   schedule:
@@ -12,7 +13,7 @@ on:
         required: false
       rounds:
         description: programs to generate
-        default: "200"
+        default: "400"
 
 env:
   CARGO_INCREMENTAL: 0
@@ -40,9 +41,19 @@ jobs:
         run: |
           export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
           python3 fuzz/fuzz.py run --seed "${{ inputs.seed || github.run_number }}" \
-            --rounds "${{ inputs.rounds || '200' }}" --backends cranelift,llvm \
+            --rounds "${{ inputs.rounds || '400' }}" --jobs 6 --backends cranelift,llvm \
             --out "$RUNNER_TEMP/fuzz-out" || status=$?
           python3 fuzz/fuzz.py report "$RUNNER_TEMP/fuzz-out" | tee -a "$GITHUB_STEP_SUMMARY"
+          exit "${status:-0}"
+      - name: Edits
+        if: always()
+        working-directory: harness
+        run: |
+          export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
+          python3 fuzz/edits.py run --seed "${{ inputs.seed || github.run_number }}" \
+            --rounds 40 --jobs 4 --backends cranelift,llvm \
+            --out "$RUNNER_TEMP/edits-out" || status=$?
+          python3 fuzz/edits.py report "$RUNNER_TEMP/edits-out" | tee -a "$GITHUB_STEP_SUMMARY"
           exit "${status:-0}"
       - uses: actions/upload-artifact@v4
         if: always()
@@ -50,4 +61,5 @@ jobs:
           name: fuzz-${{ github.run_number }}
           path: |
             ${{ runner.temp }}/fuzz-out
+            ${{ runner.temp }}/edits-out
             harness/fuzz/found
