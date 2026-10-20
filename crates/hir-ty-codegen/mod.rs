@@ -9616,6 +9616,22 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(())
     }
 
+    /// Copy already-evaluated constructor arguments into an aggregate's fields.
+    fn copy_fields(
+        &mut self,
+        dst: Value,
+        layout: &Layout,
+        values: &[(Value, Ty<'db>)],
+    ) -> Result<()> {
+        for (i, &(src, ty)) in values.iter().enumerate() {
+            let size = self.layout(ty)?.size;
+            let offset = layout.fields.offset(i).bytes() as i64;
+            let field = self.builder.ins().iadd_imm(dst, offset);
+            self.copy(field, src, size);
+        }
+        Ok(())
+    }
+
     fn binary_op(&mut self, op: &BinOp, lhs: &Operand, rhs: &Operand) -> Result<Value> {
         let (mut l_addr, mut ty) = self.operand(lhs)?;
         let (mut r_addr, mut r_ty) = self.operand(rhs)?;
@@ -10471,13 +10487,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         let Some(layout) = layout else {
                             return Ok(());
                         };
-                        for (i, &(src, ty)) in values.iter().enumerate() {
-                            let size = self.layout(ty)?.size;
-                            let offset = layout.fields.offset(i).bytes() as i64;
-                            let field = self.builder.ins().iadd_imm(dst, offset);
-                            self.copy(field, src, size);
-                        }
-                        return Ok(());
+                        return self.copy_fields(dst, &layout, &values);
                     }
                 };
                 if FunctionSignature::is_intrinsic(self.cg.db, func) {
@@ -11097,12 +11107,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         _ => Some(self.layout(dst_ty)?),
                     };
                     if let Some(layout) = layout {
-                        for (i, &(src, ty)) in values.iter().enumerate() {
-                            let size = self.layout(ty)?.size;
-                            let offset = layout.fields.offset(i).bytes() as i64;
-                            let field = self.builder.ins().iadd_imm(dst, offset);
-                            self.copy(field, src, size);
-                        }
+                        self.copy_fields(dst, &layout, &values)?;
                     }
                 }
             },

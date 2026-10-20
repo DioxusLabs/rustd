@@ -15,6 +15,8 @@ pub mod link;
 pub mod macros;
 mod names;
 pub mod pack;
+#[path = "../../rustd/src/symbol_path.rs"]
+mod symbol_path;
 // The table `rustd` reads from the rlibs of a build, here made from the names in a module.
 #[allow(dead_code)]
 #[path = "../../rustd/src/symbols.rs"]
