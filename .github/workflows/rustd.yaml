@@ -29,7 +29,7 @@ jobs:
         include:
           - os: warp-ubuntu-latest-x64-8x
             suffix: ""
-          - os: warp-ubuntu-latest-arm64-4x
+          - os: warp-ubuntu-latest-arm64-8x
             suffix: " (aarch64)"
     steps:
       - uses: actions/checkout@v6
@@ -50,12 +50,12 @@ jobs:
       fail-fast: false
       matrix:
         backend: [cranelift, llvm]
-        part: [core, keys, store]
-        os: [warp-ubuntu-latest-x64-8x, warp-ubuntu-latest-arm64-4x]
+        part: [core, keys, store, model]
+        os: [warp-ubuntu-latest-x64-8x, warp-ubuntu-latest-arm64-8x]
         include:
           - os: warp-ubuntu-latest-x64-8x
             suffix: ""
-          - os: warp-ubuntu-latest-arm64-4x
+          - os: warp-ubuntu-latest-arm64-8x
             suffix: ", aarch64"
     env:
       RUSTD_BACKEND: ${{ matrix.backend }}
@@ -107,9 +107,9 @@ jobs:
         run: |
           export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
           failed=
-          # The harnesses are split over three machines by how long they take: keys.py alone, the
-          # ones of the store and the daemon under load, and the rest.
-          part() { case "$1" in keys.py) echo keys;; store*|remote.py|stress.py|selects.py) echo store;; *) echo core;; esac; }
+          # The harnesses are split over machines by how long they take: keys.py alone,
+          # buildmodel.py alone, the ones of the store and the daemon under load, and the rest.
+          part() { case "$1" in keys.py) echo keys;; buildmodel.py) echo model;; store*|remote.py|stress.py|selects.py) echo store;; *) echo core;; esac; }
           run() { [ "$(part "$1")" = "$PART" ] || return 0; echo "::group::$*"; python3 "$@" || { failed="$failed [$*]"; echo "::error::$* failed"; }; echo "::endgroup::"; }
           run difftest.py corpus --bin runner --crate cases --layouts
           run programs.py
@@ -130,9 +130,9 @@ jobs:
           # How much of the corpus LLVM compiled itself, and what it left to Cranelift and why.
           if [ "$RUSTD_BACKEND" = llvm ]; then run backends.py corpus runner cases --bin runner --levels 2f; fi
           run debuginfo.py
-          # It runs both producers itself. The cases that are of an x86-64 host (another libc
-          # of it, one of its processors) say so, and are not run on AArch64.
-          if [ "$RUSTD_BACKEND" = cranelift ]; then run buildmodel.py; fi
+          # Each backend's half on its own machine. The cases that are of an x86-64 host
+          # (another libc of it, one of its processors) say so, and are not run on AArch64.
+          run buildmodel.py --backend "$RUSTD_BACKEND"
           run storekills.py --kills 100
           run storecorrupts.py --rounds 4
           run storefull.py
@@ -147,14 +147,15 @@ jobs:
   # what the programs print and what every test says has to be what cargo gives.
   projects:
     name: projects (${{ matrix.backend }}, aarch64, ${{ matrix.projects }})
-    runs-on: warp-ubuntu-latest-arm64-4x
+    runs-on: warp-ubuntu-latest-arm64-8x
     timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
         backend: [cranelift, llvm]
         # Each group on a machine of its own: one after another they take most of an hour.
-        projects: ["ripgrep fd bat hyperfine", "just axum", "nushell"]
+        # `checks` is the flags, the daemon and plain cargo, which do not depend on a project.
+        projects: ["ripgrep fd", "bat hyperfine", "just axum", "nushell", "checks"]
     env:
       RUSTD_BACKEND: ${{ matrix.backend }}
       RUSTD_OPT: 2
@@ -179,7 +180,8 @@ jobs:
           status=0
           # The projects a hosted runner has the time and the memory for: the ten after these
           # take more than its three hours, and it was shut down loading rust-analyzer.
-          python3 cargo_rustd.py ${{ matrix.projects }} || status=$?
+          if [ "${{ matrix.projects }}" = checks ]; then args=--only-checks; else args="${{ matrix.projects }} --only-projects"; fi
+          python3 cargo_rustd.py $args || status=$?
           cat CARGO-RUSTD.md
           exit $status
 
@@ -209,7 +211,7 @@ jobs:
       fail-fast: false
       matrix:
         backend: [cranelift, llvm]
-        part: [core, keys, store]
+        part: [core, keys, store, model]
     defaults:
       run:
         shell: bash
@@ -264,9 +266,9 @@ jobs:
         run: |
           export RUSTD_BIN="$(cygpath -w "$GITHUB_WORKSPACE")\target\release\rustd.exe"
           failed=
-          # The harnesses are split over three machines by how long they take: keys.py alone, the
-          # ones of the store and the daemon under load, and the rest.
-          part() { case "$1" in keys.py) echo keys;; store*|remote.py|stress.py|selects.py) echo store;; *) echo core;; esac; }
+          # The harnesses are split over machines by how long they take: keys.py alone,
+          # buildmodel.py alone, the ones of the store and the daemon under load, and the rest.
+          part() { case "$1" in keys.py) echo keys;; buildmodel.py) echo model;; store*|remote.py|stress.py|selects.py) echo store;; *) echo core;; esac; }
           run() { [ "$(part "$1")" = "$PART" ] || return 0; echo "::group::$*"; python "$@" || { failed="$failed [$*]"; echo "::error::$* failed"; }; echo "::endgroup::"; }
           run difftest.py corpus --bin runner --crate cases --layouts
           run programs.py
@@ -282,7 +284,7 @@ jobs:
           if [ "$RUSTD_BACKEND" = llvm ]; then run backends.py corpus runner cases --bin runner --levels 2f; fi
           run debuginfo.py
           # The two Linux cross targets of buildmodel.py are skipped here, and it says so.
-          if [ "${RUSTD_BACKEND:-cranelift}" = cranelift ]; then run buildmodel.py; fi
+          run buildmodel.py --backend "$RUSTD_BACKEND"
           # Not run here: `farsplices.py` is about the reach of an AArch64 branch.
           run storekills.py --kills 100
           run storecorrupts.py --rounds 4
@@ -327,9 +329,9 @@ jobs:
         run: |
           export RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd"
           failed=
-          # The harnesses are split over three machines by how long they take: keys.py alone, the
-          # ones of the store and the daemon under load, and the rest.
-          part() { case "$1" in keys.py) echo keys;; store*|remote.py|stress.py|selects.py) echo store;; *) echo core;; esac; }
+          # The harnesses are split over machines by how long they take: keys.py alone,
+          # buildmodel.py alone, the ones of the store and the daemon under load, and the rest.
+          part() { case "$1" in keys.py) echo keys;; buildmodel.py) echo model;; store*|remote.py|stress.py|selects.py) echo store;; *) echo core;; esac; }
           run() { [ "$(part "$1")" = "$PART" ] || return 0; echo "::group::$*"; python3 "$@" || { failed="$failed [$*]"; echo "::error::$* failed"; }; echo "::endgroup::"; }
           run difftest.py corpus --bin runner --crate cases --layouts
           run programs.py

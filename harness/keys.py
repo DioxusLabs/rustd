@@ -9,6 +9,7 @@ path, as a second worktree or another machine would have it.
 
 usage: keys.py [case ...]
 """
+from concurrent.futures import ProcessPoolExecutor
 import os, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -105,56 +106,69 @@ def build(ws, env, args):
         shutil.rmtree(fx.work, ignore_errors=True)
 
 
+def case(index, mode, at):
+    """One case built in a process of its own, since `build` sets the environment: what it
+    prints, whether it is wrong, whether an open case is right now, and the functions refused."""
+    name, change, line = CASES[index]
+    lines = []
+    store, first = os.path.join(at, "store"), os.path.join(at, "first")
+    os.makedirs(store)
+    shutil.copytree(os.path.join(HERE, "keys"), first, ignore=shutil.ignore_patterns("target"))
+    env, args = {"RUSTD_CACHE": store}, []
+    want, got, _ = build(first, env, args)
+    problems = [] if want == got else ["the first build differs"]
+    filled = size(store)
+    second = first
+    if mode == "elsewhere":
+        second = os.path.join(at, "second")
+        shutil.copytree(first, second, ignore=shutil.ignore_patterns("target"))
+    before = want
+    change(second, env, args)
+    want, got, left = build(second, env, args)
+    if want != got:
+        problems.append("the second build differs")
+    if line and before == want:
+        problems.append("cargo's program is the same after the change")
+    # Where the crates differ in overflow checks, rustd leaves to rustc a function that
+    # calls a copy it cannot tell the checks of. The function the case is about has to
+    # be rustd's all the same, or the case shows nothing.
+    refused = [row for row in left if REFUSED in row[2] and row[1].split("::")[-1] != line]
+    if len(left) > len(refused):
+        problems.append(f"{len(left) - len(refused)} functions left to rustc")
+    known = name in OPEN
+    lines.append(f"{'same     ' if not problems else 'open     ' if known else 'DIFFERENT'} {mode:9} {name}: store {filled} bytes, {size(store) - filled} more")
+    lines += [f"    {problem}" for problem in problems]
+    lines += [f"    refused {row[1]}: {row[2][:160]}" for row in refused]
+    if want != got:
+        ours, theirs = (it[1].decode(errors="replace").splitlines() for it in (got, want))
+        for a, b in zip(theirs, ours):
+            if a != b:
+                lines.append(f"    rustc: {a}\n    rustd: {b}")
+        if len(ours) != len(theirs):
+            lines.append(f"    rustd: status {got[0]}, {len(ours)} lines of {len(theirs)}; {got[2].decode(errors='replace').strip()[-300:]}")
+    return "\n".join(lines), bool(problems) and not known, known and not problems, len(refused)
+
+
 def main():
     work = os.path.realpath(tempfile.mkdtemp(prefix="rustd-keys-"))
     chosen = sys.argv[1:]
-    wrong = total = fixed = refusals = 0
-    for name, change, line in CASES:
-        if chosen and not any(it in name for it in chosen):
-            continue
-        for mode in ("again", "elsewhere"):
-            total += 1
-            at = os.path.join(work, str(total))
-            store, first = os.path.join(at, "store"), os.path.join(at, "first")
-            os.makedirs(store)
-            shutil.copytree(os.path.join(HERE, "keys"), first, ignore=shutil.ignore_patterns("target"))
-            env, args = {"RUSTD_CACHE": store}, []
-            want, got, _ = build(first, env, args)
-            problems = [] if want == got else ["the first build differs"]
-            filled = size(store)
-            second = first
-            if mode == "elsewhere":
-                second = os.path.join(at, "second")
-                shutil.copytree(first, second, ignore=shutil.ignore_patterns("target"))
-            before = want
-            change(second, env, args)
-            want, got, left = build(second, env, args)
-            if want != got:
-                problems.append("the second build differs")
-            if line and before == want:
-                problems.append("cargo's program is the same after the change")
-            # Where the crates differ in overflow checks, rustd leaves to rustc a function that
-            # calls a copy it cannot tell the checks of. The function the case is about has to
-            # be rustd's all the same, or the case shows nothing.
-            refused = [row for row in left if REFUSED in row[2] and row[1].split("::")[-1] != line]
-            if len(left) > len(refused):
-                problems.append(f"{len(left) - len(refused)} functions left to rustc")
-            refusals += len(refused)
-            known = name in OPEN
-            fixed += known and not problems
-            wrong += bool(problems) and not known
-            print(f"{'same     ' if not problems else 'open     ' if known else 'DIFFERENT'} {mode:9} {name}: store {filled} bytes, {size(store) - filled} more", flush=True)
-            for problem in problems:
-                print(f"    {problem}")
-            for row in refused:
-                print(f"    refused {row[1]}: {row[2][:160]}")
-            if want != got:
-                ours, theirs = (it[1].decode(errors="replace").splitlines() for it in (got, want))
-                for a, b in zip(theirs, ours):
-                    if a != b:
-                        print(f"    rustc: {a}\n    rustd: {b}")
-                if len(ours) != len(theirs):
-                    print(f"    rustd: status {got[0]}, {len(ours)} lines of {len(theirs)}; {got[2].decode(errors='replace').strip()[-300:]}")
+    runs = [
+        (index, mode)
+        for index, (name, _, _) in enumerate(CASES)
+        if not chosen or any(it in name for it in chosen)
+        for mode in ("again", "elsewhere")
+    ]
+    total = len(runs)
+    wrong = fixed = refusals = 0
+    # Each case has a store and checkouts of its own, and its builds use a few cores.
+    jobs = max(1, (os.cpu_count() or 2) // 2)
+    with ProcessPoolExecutor(jobs) as pool:
+        ats = [os.path.join(work, str(n)) for n in range(1, total + 1)]
+        for said, bad, mended, refused in pool.map(case, *zip(*runs), ats) if runs else []:
+            print(said, flush=True)
+            wrong += bad
+            fixed += mended
+            refusals += refused
     still = sum(2 for name, _, _ in CASES if name in OPEN and (not chosen or any(it in name for it in chosen))) - fixed
     print(f"{total - wrong - still} of {total - still} right, {still} open, {refusals} functions refused; {work}")
     if fixed:
