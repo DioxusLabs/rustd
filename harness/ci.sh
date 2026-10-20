@@ -28,8 +28,7 @@ export RUSTD_BIN
 linux() { [ "$os" = Linux ]; }
 macos() { [ "$os" = Darwin ]; }
 backends="cranelift llvm"
-# buildmodel.py builds for Linux targets.
-if macos; then parts="core keys store"; else parts="core keys store model"; fi
+parts="codegen keys store model"
 
 names=() pids=()
 # A lane's directory is its number: a daemon's worker sockets are deep under it, and a socket's
@@ -100,9 +99,15 @@ fi
 
 export RUSTD_BACKEND=$1
 want=$2
-# Parts are by how long they take, about the same each: keys.py with the daemon under load,
-# buildmodel.py alone, the store's own, and the rest with the remote store.
-part() { case "$1" in keys.py | stress.py | selects.py) echo keys ;; buildmodel.py) echo model ;; store*) echo store ;; *) echo core ;; esac; }
+# Parts are by how long they take, about the same each, the longest harness of each first.
+part() {
+    case "$1" in
+    storekills.py | difftest.py | programs.py | storefull.py | fuzz/fuzz.py) echo store ;;
+    keys.py | remote.py | stress.py) echo keys ;;
+    buildmodel.py | storecorrupts.py | storeshared.py | fuzz/edits.py | storeguards.py | worktrees.py | selects.py) echo model ;;
+    *) echo codegen ;;
+    esac
+}
 failed=
 run() {
     [ "$(part "$1")" = "$want" ] || return 0
