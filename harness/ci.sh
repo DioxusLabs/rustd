@@ -20,9 +20,9 @@ export RUSTD_BIN
 linux() { [ "$os" = Linux ]; }
 macos() { [ "$os" = Darwin ]; }
 
-# Parts are by how long they take: keys.py alone, buildmodel.py alone, the store and the
-# daemon under load, and the rest.
-part() { case "$1" in keys.py) echo keys ;; buildmodel.py) echo model ;; store* | remote.py | stress.py | selects.py) echo store ;; *) echo core ;; esac; }
+# Parts are by how long they take, about the same each: keys.py with the daemon under load,
+# buildmodel.py alone, the store's own, and the rest with the remote store.
+part() { case "$1" in keys.py | stress.py | selects.py) echo keys ;; buildmodel.py) echo model ;; store*) echo store ;; *) echo core ;; esac; }
 failed=
 run() {
     [ "$(part "$1")" = "$want" ] || return 0

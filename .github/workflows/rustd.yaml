@@ -108,7 +108,7 @@ jobs:
       # published, for both architectures; the runner's docker takes a file out of it without
       # root.
       - name: MinIO
-        if: runner.os == 'Linux' && matrix.part == 'store'
+        if: runner.os == 'Linux' && matrix.part == 'core'
         run: |
           image=cgr.dev/chainguard/minio@sha256:c93745c56fccdaf0e5dcb88999a96a65a136428beb045ef5d546255a80d747a7
           mkdir -p "$HOME/s3tools"
