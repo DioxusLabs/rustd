@@ -5262,6 +5262,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
         cold = build(&db, &table, &args, &mut known, &listed)?;
     }
     if let Some(unfit) = &cold.unfit {
+        report(&cold);
         bail!("{unfit}");
     }
     eprint!("cold: ");
