@@ -1209,20 +1209,10 @@ def memory_cache(work):
     checks = []
     every = ["ignored", "memory_directory", "ordinary"]
     reports = os.path.join(env["RUSTD_HOME"], "memory")
-    samples = os.path.join(work, "memory-samples")
-    os.makedirs(samples, exist_ok=True)
 
     def check(name, directory, cached, failed=()):
-        changed = {} if directory is None else {"RUSTD_MEMORY": directory}
         _, cargo = reference.cargo("test", "--lib", env={"RUSTD_MEMORY": reports if directory is None else directory})
-        if sys.platform == "linux":
-            label = f"step-{len(checks)}"
-            command = [sys.executable, os.path.join(HERE, "memory_run.py"), label, "--", *side.argv("test", "--lib")]
-            _, sampled = timed(command, ws, dict(side.env, RUSTD_REPORTS=samples, **changed))
-            output = open(os.path.join(samples, label, "command.log")).read()
-            ran = subprocess.CompletedProcess(command, sampled.returncode, output, sampled.stderr)
-        else:
-            _, ran = side.cargo("test", "--lib", env={"RUSTD_MEMORY": reports if directory is None else directory})
+        _, ran = side.cargo("test", "--lib", env={"RUSTD_MEMORY": reports if directory is None else directory})
         results = dict(re.findall(r"^test tests::(\w+) \.\.\. (.+)$", ran.stdout, re.M))
         found = sorted(name for name, result in results.items() if result.endswith("(cached)"))
         failing = sorted(name for name, result in results.items() if result.startswith("FAILED"))
