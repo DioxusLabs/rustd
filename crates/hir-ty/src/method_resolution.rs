@@ -549,8 +549,8 @@ pub(crate) fn find_matching_impl<'db>(
 /// .unwrap())` parses an `f64` until serde_json's `impl PartialEq<Value> for f64` is seen, and
 /// a test of a crate whose benches use criterion depends on serde_json.
 ///
-/// Named is by the identifiers of `krate`'s files, which is more than rustc resolves (a local
-/// of the same name does) and less where a macro of another crate alone names the dependency.
+/// Named is by the identifiers of `krate`'s files and module macro expansions, which is
+/// more than rustc resolves (a local of the same name does).
 #[salsa::tracked(returns(deref))]
 pub(crate) fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
     let _p = tracing::info_span!("loaded_crates").entered();
@@ -564,8 +564,16 @@ pub(crate) fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> 
         })
         .collect();
     // Few files name a dependency, and a file's text tells which may without its tree.
-    let mut files =
-        crate_def_map(db, krate).modules(db).filter_map(|(_, module)| module.origin.file_id());
+    let def_map = crate_def_map(db, krate);
+    let mut files = def_map.modules(db).filter_map(|(_, module)| module.origin.file_id());
+    let identifiers = |syntax: syntax::SyntaxNode| {
+        syntax
+            .descendants_with_tokens()
+            .filter_map(|it| it.into_token())
+            .filter(|it| it.kind() == SyntaxKind::IDENT)
+            .map(|it| Symbol::intern(it.text()))
+            .collect::<FxHashSet<_>>()
+    };
     while !unnamed.is_empty()
         && let Some(file) = files.next()
     {
@@ -573,15 +581,15 @@ pub(crate) fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> 
         if !unnamed.iter().any(|dep| text.contains(dep.name.symbol().as_str())) {
             continue;
         }
-        let identifiers: FxHashSet<_> = file
-            .parse(db)
-            .syntax_node()
-            .descendants_with_tokens()
-            .filter_map(|it| it.into_token())
-            .filter(|it| it.kind() == SyntaxKind::IDENT)
-            .map(|it| Symbol::intern(it.text()))
-            .collect();
-        unnamed.retain(|dep| !identifiers.contains(dep.name.symbol()));
+        let names = identifiers(file.parse(db).syntax_node());
+        unnamed.retain(|dep| !names.contains(dep.name.symbol()));
+    }
+    for call in def_map.modules(db).flat_map(|(_, module)| module.scope(db).all_macro_calls()) {
+        if unnamed.is_empty() {
+            break;
+        }
+        let names = identifiers(call.parse_macro_expansion(db).value.0.syntax_node());
+        unnamed.retain(|dep| !names.contains(dep.name.symbol()));
     }
     let mut loaded = FxHashSet::default();
     let mut ordered = vec![krate];
