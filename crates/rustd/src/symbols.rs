@@ -1050,7 +1050,7 @@ mod tests {
 
     use rustc_hash::FxHashMap;
 
-    use super::{SymbolTable, V0, function_name};
+    use super::{Paths, SymbolTable, V0, function_name};
 
     fn placed(crates: &[(&str, &[(u64, usize)])]) -> Vec<(String, u64)> {
         let mut table = SymbolTable::default();
@@ -1108,6 +1108,24 @@ mod tests {
         assert_eq!(V0::place(inner), Some(0));
         assert_eq!(V0::places_around(inner), Some(vec![1, 1]));
         assert_eq!(V0::places_around(third), Some(vec![0]));
+    }
+
+    #[test]
+    fn nested_statics_need_an_unambiguous_symbol() {
+        let mut paths = Paths::default();
+        let named = "<dep::Generic<_>>::visit::SITE";
+        assert_eq!(paths.get_at(named, 0, &[]), None);
+        assert_eq!(paths.get_nested(named, &[0], 0, &[]), None);
+        paths.insert(named.to_owned(), "first".to_owned(), Some(0), vec![]);
+        assert_eq!(paths.get_at(named, 0, &[]), Some("first"));
+        assert_eq!(paths.get_at(named, 1, &[]), None);
+        paths.insert(named.to_owned(), "second".to_owned(), Some(0), vec![]);
+        assert_eq!(paths.get_at(named, 0, &[]), None);
+        let nested = "<dep::Generic<_>>::visit::{closure#0}::SITE";
+        paths.insert(nested.to_owned(), "nested_first".to_owned(), Some(0), vec![0]);
+        assert_eq!(paths.get_nested(named, &[0], 0, &[]), Some("nested_first"));
+        paths.insert(nested.to_owned(), "nested_second".to_owned(), Some(0), vec![0]);
+        assert_eq!(paths.get_nested(named, &[0], 0, &[]), None);
     }
 
     #[test]

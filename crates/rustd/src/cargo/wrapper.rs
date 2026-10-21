@@ -28,6 +28,9 @@ pub(crate) const DRIVEN: &str = "RUSTD_CARGO_DRIVES";
 /// crates that are the daemon's to compile, as a list of paths.
 pub(crate) const STAGED: &str = "RUSTD_STAGED_CRATES";
 
+/// The roots of workspace crates that a build script or proc macro needs.
+pub(crate) const AT_BUILD: &str = "RUSTD_AT_BUILD_CRATES";
+
 /// What the variables that name the programs of a build start with.
 const PROGRAM_OF: &str = "CARGO_BIN_EXE_";
 /// The variable that names the directory cargo gives the integration tests of a build.
@@ -59,6 +62,10 @@ pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Resul
     };
     let dir = unit.records.join(&unit.id);
     if unit.is_staged() {
+        if let Some(why) = unit.unsupported() {
+            say::error(&why);
+            std::process::exit(super::FAILED);
+        }
         match unit.stood_in(&rustc, &dir) {
             Ok(code) => std::process::exit(code),
             // The crate is the daemon's to compile, and rustc is not asked in its place.
@@ -67,6 +74,13 @@ pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Resul
                 std::process::exit(1)
             }
         }
+    }
+    if std::env::var_os(STAGED).is_some() && !unit.runs_in_build() && !unit.listed_in(AT_BUILD) {
+        say::error(&format!(
+            "rustd does not build `{}`: cargo asked for a workspace crate not staged for the daemon",
+            unit.crate_name
+        ));
+        std::process::exit(super::FAILED);
     }
     // Plain cargo with rustd enabled: the workspace is the daemon's, and only `cargo rustd`
     // asks it for a build.
@@ -90,6 +104,38 @@ pub(crate) fn command(mut args: impl Iterator<Item = OsString>) -> anyhow::Resul
         eprintln!("warning: rustd did not record `{}`: {error:#}", unit.id);
     }
     std::process::exit(status.code().unwrap_or(1));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refuses_only_the_crate_types_cargo_actually_asks_for() {
+        for (kinds, refused) in [
+            (vec![], false),
+            (vec!["lib"], false),
+            (vec!["rlib"], false),
+            (vec!["bin"], false),
+            (vec!["cdylib"], true),
+            (vec!["cdylib", "rlib"], true),
+            (vec!["staticlib"], true),
+        ] {
+            let mut args =
+                vec!["--crate-name", "sample", "--out-dir", "target", "--emit=link", "src/lib.rs"];
+            for kind in &kinds {
+                args.extend(["--crate-type", kind]);
+            }
+            let args = args.into_iter().map(OsString::from).collect::<Vec<_>>();
+            let unit = Unit::of(&args).unwrap();
+            let why = unit.unsupported();
+            assert_eq!(why.is_some(), refused, "{kinds:?}");
+            if let Some(why) = why {
+                assert!(why.starts_with("`sample` is built as "));
+                assert!(why.contains("which the daemon does not link yet"));
+            }
+        }
+    }
 }
 
 /// Why plain cargo builds no crate of a workspace while rustd is enabled, and what does.
@@ -167,9 +213,24 @@ impl Unit {
 
     /// Whether the crate is one the first build of the workspace leaves to the daemon.
     fn is_staged(&self) -> bool {
-        let Some(staged) = std::env::var_os(STAGED) else { return false };
-        let lists = std::env::split_paths(&staged).any(|it| it == self.source);
-        lists && !self.script
+        self.listed_in(STAGED) && !self.script
+    }
+
+    fn listed_in(&self, variable: &str) -> bool {
+        std::env::var_os(variable)
+            .is_some_and(|paths| std::env::split_paths(&paths).any(|it| it == self.source))
+    }
+
+    fn unsupported(&self) -> Option<String> {
+        crate::stub::is_program(&self.args).is_none().then(|| {
+            let kinds = self.args.windows(2).filter(|it| it[0] == "--crate-type");
+            let kinds = kinds.map(|it| format!("`{}`", it[1])).collect::<Vec<_>>().join(" and ");
+            format!(
+                "`{}` is built as {kinds}, which the daemon does not link yet: it builds \
+                 a `lib`, an `rlib` or a `bin` alone",
+                self.crate_name
+            )
+        })
     }
 
     /// Has rustc do of the crate what it does in a build by the daemon: check it, and

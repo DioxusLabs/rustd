@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use hir::{AsAssocItem, AssocItemContainer, Crate, Module, ModuleDef};
-use hir_def::{FunctionId, ItemContainerId, Lookup, ModuleDefId, StaticId};
+use hir_def::{DefWithBodyId, FunctionId, ItemContainerId, Lookup, ModuleDefId, StaticId};
 use hir_ty::mir::codegen::{SymbolResolver, exported_symbol, link_name};
 use ide_db::{RootDatabase, base_db::SourceDatabase as _};
 use syntax::{AstNode, SyntaxNode, ast, ast::HasName, match_ast};
@@ -293,7 +293,7 @@ impl SymbolResolver for Resolver<'_> {
         self.rustc_crate_id(krate).or_else(|| self.own_crate_id(krate))
     }
 
-    fn declared_in(&self, adt: hir_def::AdtId) -> Option<FunctionId> {
+    fn declared_in(&self, adt: hir_def::AdtId) -> Option<(DefWithBodyId, u32)> {
         let adt = hir::Adt::from(adt);
         let sema = hir::Semantics::new(self.db);
         let source = sema.source(adt)?;
@@ -316,7 +316,9 @@ impl SymbolResolver for Resolver<'_> {
         if named_so.count() != 1 {
             return None;
         }
-        self.function_at(&sema, adt.module(self.db), &func)?.try_into().ok()
+        let func: FunctionId =
+            self.function_at(&sema, adt.module(self.db), &func)?.try_into().ok()?;
+        Some((func.into(), 0))
     }
 
     fn impl_place(&self, id: hir_def::ImplId) -> Option<u32> {

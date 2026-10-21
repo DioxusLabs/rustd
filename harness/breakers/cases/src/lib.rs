@@ -15,6 +15,11 @@ macro_rules! cases {
 }
 
 cases![
+    impl_local_type_id,
+    const_local_type_id,
+    explicit_and_glob_reexport,
+    chained_rpitit,
+    imported_callsite,
     niche_eq,
     simd_cast,
     big_frame,

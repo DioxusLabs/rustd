@@ -913,30 +913,61 @@ impl SymbolResolver for Resolver<'_> {
         self.contents.names_place((&*self.root, self.base.as_deref()), bytes)
     }
 
-    fn declared_in(&self, adt: hir_def::AdtId) -> Option<FunctionId> {
+    fn declared_in(&self, adt: hir_def::AdtId) -> Option<(DefWithBodyId, u32)> {
         let adt = hir::Adt::from(adt);
         let sema = hir::Semantics::new(self.db);
         let source = sema.source(adt)?;
+        sema.parse_or_expand(source.file_id);
         let mut around = sema.ancestors_with_macros(source.value.syntax().clone()).skip(1);
-        let func = ast::Fn::cast(around.find(is_definition)?)?;
+        let owner = around.find(is_definition)?;
+        let name = adt.name(self.db);
+        let named_so = |node: &SyntaxNode| {
+            let named = match_ast! {
+                match node {
+                    ast::Adt(it) => it.name(),
+                    ast::Trait(it) => it.name(),
+                    ast::TypeAlias(it) => it.name(),
+                    ast::Module(it) => it.name(),
+                    _ => None,
+                }
+            };
+            named.is_some_and(|it| it.text() == name.as_str())
+        };
+        if place_in_definition(&sema, source.value.syntax(), &named_so)? != 0 {
+            return None;
+        }
+        if let Some(konst) = ast::Const::cast(owner.clone()) {
+            if source.file_id.is_macro() {
+                return None;
+            }
+            let mut scope = konst.syntax().parent()?;
+            while !is_definition(&scope) {
+                let Some(parent) = scope.parent() else { break };
+                scope = parent;
+            }
+            if scope
+                .descendants()
+                .filter_map(ast::Item::cast)
+                .any(|it| has_attribute_macro(&sema, &it))
+            {
+                return None;
+            }
+            let name = konst.name().map(|it| it.text().to_string());
+            let earlier = place_in_definition(&sema, konst.syntax(), &|node| {
+                ast::Const::cast(node.clone())
+                    .is_some_and(|it| it.name().map(|it| it.text().to_string()) == name)
+            })?;
+            let id: hir_def::ConstId = sema.to_def(&konst)?.into();
+            return Some((id.into(), earlier));
+        }
+        let func = ast::Fn::cast(owner)?;
         // The body of an `async fn` is a closure to rustc.
         if func.async_token().is_some() {
             return None;
         }
-        let name = adt.name(self.db);
-        let named_so = func.syntax().descendants().filter_map(ast::Name::cast).filter(|it| {
-            it.text() == name.as_str()
-                && it.syntax().parent().is_some_and(|it| {
-                    ast::Adt::can_cast(it.kind())
-                        || ast::Trait::can_cast(it.kind())
-                        || ast::TypeAlias::can_cast(it.kind())
-                        || ast::Module::can_cast(it.kind())
-                })
-        });
-        if named_so.count() != 1 {
-            return None;
-        }
-        self.function_at(&sema, adt.module(self.db), &func)?.try_into().ok()
+        let func: FunctionId =
+            self.function_at(&sema, adt.module(self.db), &func)?.try_into().ok()?;
+        Some((func.into(), 0))
     }
 
     fn impl_place(&self, id: hir_def::ImplId) -> Option<u32> {
@@ -944,14 +975,21 @@ impl SymbolResolver for Resolver<'_> {
         let db = self.db;
         let it = hir::Impl::from(id);
         let source = it.source(db)?;
-        // FIXME: where rustc puts the `impl`s a macro makes among the ones written out.
+        // FIXME: the order among impls expanded from macros.
         if source.file_id.is_macro() {
             return None;
         }
         let start = |it: &hir::InFile<ast::Impl>| it.value.syntax().text_range().start();
         let mut earlier = 0;
+        // rustc collects written definitions before expanding macros.
         for other in it.module(db).impl_defs(db) {
+            if hir_def::ImplId::try_from(other).is_err() {
+                continue;
+            }
             let other = other.source(db)?;
+            if other.file_id.is_macro() {
+                continue;
+            }
             if other.file_id != source.file_id {
                 return None;
             }
@@ -1214,11 +1252,16 @@ impl LateImports {
 /// Whether an attribute of the item is a macro, which rustc expands the item with: `#[test]`
 /// is one, though it leaves the item as it is written.
 fn has_attribute_macro(sema: &hir::Semantics<'_, RootDatabase>, item: &ast::Item) -> bool {
-    sema.resolve_attr_macro_call(item).is_some()
+    let transforms = |found: hir::Macro| {
+        found.is_attr(sema.db)
+            && !(matches!(found.kind(sema.db), hir::MacroKind::AttrBuiltIn)
+                && matches!(found.name(sema.db).as_str(), "derive" | "derive_const"))
+    };
+    sema.resolve_attr_macro_call(item).is_some_and(transforms)
         || ast::HasAttrs::attrs(item).filter_map(|it| it.path()).any(|path| {
             matches!(
                 sema.resolve_path(&path),
-                Some(hir::PathResolution::Def(ModuleDef::Macro(found))) if found.is_attr(sema.db)
+                Some(hir::PathResolution::Def(ModuleDef::Macro(found))) if transforms(found)
             )
         })
 }
@@ -1342,7 +1385,7 @@ impl Count<'_, '_> {
 
     /// Whether a path finds the macro with no import: any but a `macro_rules!` one of this
     /// crate that is not exported, which is in no module but by an import of it, and
-    /// whether that import is a late one is not known.
+    /// whether that import is a late one is not always known.
     fn reached_by_path(&self, call: &ast::MacroCall) -> bool {
         let sema = self.sema;
         let Some(found) = sema.resolve_macro_call(call) else { return true };
@@ -1351,10 +1394,161 @@ impl Count<'_, '_> {
             return true;
         }
         match sema.source(found).and_then(|it| it.value.left()) {
-            Some(ast::Macro::MacroRules(rules)) => ast::HasAttrs::attrs(&rules)
-                .any(|it| it.simple_name().is_some_and(|name| name == "macro_export")),
+            Some(ast::Macro::MacroRules(rules)) => {
+                ast::HasAttrs::attrs(&rules)
+                    .any(|it| it.simple_name().is_some_and(|name| name == "macro_export"))
+                    || self.written_reexport(call, found).unwrap_or(false)
+            }
             _ => true,
         }
+    }
+
+    /// A path through written modules and imports to a written reexport of a local macro
+    /// is resolved in the first import pass, unlike an import expanded from a macro.
+    fn written_reexport(&self, call: &ast::MacroCall, found: hir::Macro) -> Option<bool> {
+        let sema = self.sema;
+        let definition = sema.source(found)?;
+        if definition.file_id.is_macro() {
+            return None;
+        }
+        let path = call.path()?;
+        let name = path.segment()?.syntax().text().to_string();
+        let qualifier = path.qualifier()?;
+        let hir::PathResolution::Def(ModuleDef::Module(module)) = sema.resolve_path(&qualifier)?
+        else {
+            return None;
+        };
+        if module != found.module(sema.db) {
+            return None;
+        }
+        let mut ancestor = module;
+        let mut canonical = Vec::new();
+        while let Some(parent) = ancestor.parent(sema.db) {
+            canonical.push(ancestor.name(sema.db)?.as_str().to_owned());
+            let source = ancestor.declaration_source(sema.db)?;
+            sema.parse_or_expand(source.file_id);
+            if source.file_id.is_macro()
+                || has_attribute_macro(sema, &ast::Item::Module(source.value))
+            {
+                return None;
+            }
+            ancestor = parent;
+        }
+        canonical.push("crate".to_owned());
+        canonical.reverse();
+        let used: Vec<_> = qualifier.segments().map(|it| it.syntax().text().to_string()).collect();
+        if used != canonical
+            && (used.len() != 1
+                || !self.written_module_import(call, module, &used[0], &canonical)?)
+        {
+            return None;
+        }
+        let source = module.definition_source(sema.db);
+        sema.parse_or_expand(source.file_id);
+        if source.file_id.is_macro() {
+            return None;
+        }
+        let cfg = ide_db::base_db::Crate::from(module.krate(sema.db)).cfg_options(sema.db);
+        let imports = source.value.node().descendants().filter_map(ast::Use::cast);
+        for import in imports {
+            if !is_cfg_enabled(import.syntax(), cfg)
+                || has_attribute_macro(sema, &ast::Item::Use(import.clone()))
+                || sema.scope(import.syntax())?.module() != module
+            {
+                continue;
+            }
+            for tree in import.syntax().descendants().filter_map(ast::UseTree::cast) {
+                if tree.use_tree_list().is_some() || tree.star_token().is_some() {
+                    continue;
+                }
+                if tree
+                    .syntax()
+                    .ancestors()
+                    .skip(1)
+                    .filter_map(ast::UseTree::cast)
+                    .any(|it| it.path().is_some())
+                {
+                    continue;
+                }
+                let path = tree.path()?;
+                if path.qualifier().is_some()
+                    || path.segment()?.syntax().text().to_string() != found.name(sema.db).as_str()
+                    || sema.hir_file_for(import.syntax()) != definition.file_id
+                    || definition.value.syntax().text_range().end()
+                        > import.syntax().text_range().start()
+                {
+                    continue;
+                }
+                let imported = tree
+                    .rename()
+                    .and_then(|it| it.name())
+                    .map(|it| it.text().to_string())
+                    .or_else(|| path.segment().map(|it| it.syntax().text().to_string()));
+                if imported.as_deref() == Some(&name)
+                    && matches!(sema.resolve_path(&path), Some(hir::PathResolution::Def(ModuleDef::Macro(it))) if it == found)
+                {
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
+    }
+
+    fn written_module_import(
+        &self,
+        call: &ast::MacroCall,
+        module: hir::Module,
+        name: &str,
+        canonical: &[String],
+    ) -> Option<bool> {
+        let sema = self.sema;
+        let cfg = ide_db::base_db::Crate::from(module.krate(sema.db)).cfg_options(sema.db);
+        for scope in sema.ancestors_with_macros(call.syntax().clone()) {
+            for import in scope.children().filter_map(ast::Use::cast) {
+                if sema.hir_file_for(import.syntax()).is_macro()
+                    || !is_cfg_enabled(import.syntax(), cfg)
+                    || module_is_expanded(sema, import.syntax())
+                    || sema
+                        .ancestors_with_macros(import.syntax().clone())
+                        .filter_map(ast::Item::cast)
+                        .any(|it| has_attribute_macro(sema, &it))
+                {
+                    continue;
+                }
+                for tree in import.syntax().descendants().filter_map(ast::UseTree::cast) {
+                    if tree.use_tree_list().is_some() || tree.star_token().is_some() {
+                        continue;
+                    }
+                    let path = tree.path()?;
+                    let imported = tree
+                        .rename()
+                        .and_then(|it| it.name())
+                        .map(|it| it.text().to_string())
+                        .or_else(|| path.segment().map(|it| it.syntax().text().to_string()));
+                    if imported.as_deref() != Some(name)
+                        || !matches!(sema.resolve_path(&path), Some(hir::PathResolution::Def(ModuleDef::Module(it))) if it == module)
+                    {
+                        continue;
+                    }
+                    let mut paths: Vec<_> = tree
+                        .syntax()
+                        .ancestors()
+                        .filter_map(ast::UseTree::cast)
+                        .filter_map(|it| it.path())
+                        .collect();
+                    paths.reverse();
+                    let imported: Vec<_> = paths
+                        .iter()
+                        .flat_map(|it| it.segments())
+                        .map(|it| it.syntax().text().to_string())
+                        .collect();
+                    if imported == canonical {
+                        return Some(true);
+                    }
+                }
+            }
+        }
+        Some(false)
     }
 
     /// Whether the macro is a `macro_rules!` one found by where it is written, which is
@@ -5111,6 +5305,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
         cold = build(&db, &table, &args, &mut known, &listed)?;
     }
     if let Some(unfit) = &cold.unfit {
+        report(&cold);
         bail!("{unfit}");
     }
     eprint!("cold: ");

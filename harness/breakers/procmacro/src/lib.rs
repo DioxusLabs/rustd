@@ -1,5 +1,15 @@
 //! What a proc macro gives that source text cannot.
 
+struct Item {
+    value: u8,
+}
+
+macros::key_method!(Item);
+
+pub fn generated_key(value: u8) -> u32 {
+    Item { value }.key()
+}
+
 /// The name of a number, matched against constants a macro wrote as negative literals.
 pub fn name(number: i8) -> &'static str {
     const NUMBERS: (i8, i16, f32) = macros::negative_numbers!();

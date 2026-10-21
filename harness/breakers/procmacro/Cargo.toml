@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+foreign = { path = "../foreign" }
 macros = { path = "macros" }
 sized = { path = "sized" }
 

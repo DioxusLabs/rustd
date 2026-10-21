@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "foreign"
+version = "0.0.0"
+
+[[package]]
 name = "macros"
 version = "0.0.0"
 dependencies = [
@@ -13,6 +17,7 @@ dependencies = [
 name = "procmacro"
 version = "0.0.0"
 dependencies = [
+ "foreign",
  "macros",
  "sized",
 ]

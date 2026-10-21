@@ -2,6 +2,15 @@
 
 use proc_macro::{Delimiter, Group, Literal, Punct, Spacing, TokenStream, TokenTree};
 
+#[proc_macro]
+pub fn key_method(input: TokenStream) -> TokenStream {
+    format!(
+        "impl {input} {{ fn key(&self) -> u32 {{ use foreign::keys::Key; self.value.key() }} }}"
+    )
+    .parse()
+    .unwrap()
+}
+
 /// Three negative numbers, each one literal token: `(-1, -20i16, -1.5,)`.
 #[proc_macro]
 pub fn negative_numbers(_: TokenStream) -> TokenStream {

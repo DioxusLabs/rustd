@@ -290,9 +290,9 @@ pub trait SymbolResolver {
         _ = bytes;
         false
     }
-    /// The function a type is declared in the body of, when nothing else is around it there
-    /// and no other type of the body has its name.
-    fn declared_in(&self, adt: hir_def::AdtId) -> Option<FunctionId> {
+    /// The function or constant whose body declares the type, and the owner's disambiguator.
+    /// The type itself must have disambiguator zero.
+    fn declared_in(&self, adt: hir_def::AdtId) -> Option<(DefWithBodyId, u32)> {
         _ = adt;
         None
     }

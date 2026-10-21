@@ -248,7 +248,22 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
         };
         let module = adt.module(db);
         let parent = if module.is_block_module(db) && !self.ours {
-            self.body_path(self.symbols.declared_in(adt)?)?
+            let (owner, earlier) = self.symbols.declared_in(adt)?;
+            match owner {
+                DefWithBodyId::FunctionId(func) => self.body_path(func)?,
+                DefWithBodyId::ConstId(konst) => {
+                    let parent = match konst.lookup(db).container {
+                        ItemContainerId::ModuleId(module) => self.module(module)?,
+                        ItemContainerId::ImplId(id) => self.impl_path(id)?,
+                        ItemContainerId::TraitId(trait_) => self.trait_path(trait_)?,
+                        ItemContainerId::ExternBlockId(_) => return None,
+                    };
+                    let signature = hir_def::signatures::ConstSignature::of(db, konst);
+                    let name = signature.name.as_ref().map_or("_", |it| it.as_str());
+                    parent.child_at(DefPathData::ValueNs(name), earlier)
+                }
+                _ => return None,
+            }
         } else {
             self.module(module)?
         };
