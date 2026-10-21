@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """cargo_rustd.py: `cargo rustd` against plain cargo on real projects, unmodified.
 
-    cargo_rustd.py [PROJECT...] [--small] [--only-projects] [--only-checks] [--rustd] [--plain] [--keep]
+    cargo_rustd.py [PROJECT...] [--small] [--only-projects] [--only-checks] [--only-recovery] [--rustd] [--plain] [--keep]
 
 Four parts, all of which have to pass.
 
@@ -40,7 +40,7 @@ Writes CARGO-RUSTD.md and cargo_rustd.json next to this file or in `RUSTD_REPORT
 CARGO-RUSTD-LLVM.md and cargo_rustd_llvm.json under `RUSTD_BACKEND=llvm`. A run of some projects replaces their rows
 and keeps the others. `--small` is the three projects of the CI job.
 """
-import collections, contextlib, glob, json, os, pathlib, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
+import collections, contextlib, glob, json, os, pathlib, re, shutil, signal, socket, subprocess, sys, tempfile, time, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -1167,6 +1167,7 @@ def daemon(work):
     here.cargo("stop")
     manners(work, ws, env, here, check, edit)
     abuse(work, ws, tree, env, check, status, alive)
+    recovery(work, check)
     return checks
 
 
@@ -1325,6 +1326,257 @@ def abuse(work, ws, tree, env, check, status, alive):
 CONNECT = "import socket, sys\ns = socket.socket(socket.AF_UNIX)\ns.settimeout(5)\ntry:\n    s.connect(sys.argv[1])\nexcept OSError as e:\n    print('connect:', e.strerror)\n    sys.exit()\ns.sendall(sys.argv[2].encode() + b'\\n')\ntry:\n    print('answer:', s.recv(65536).decode())\nexcept OSError as e:\n    print('answer:', e)\n"
 
 LISTEN = "import os, socket, sys\ns = socket.socket(socket.AF_UNIX)\ns.bind(sys.argv[1])\nos.chmod(sys.argv[1], 0o666)\ns.listen()\nprint('listening', flush=True)\ns.settimeout(20)\ntry:\n    c, _ = s.accept()\n    c.settimeout(5)\n    print('heard:', len(c.recv(65536)))\nexcept OSError as e:\n    print('heard: nothing,', e)\n"
+
+
+def wait_for(pred, timeout):
+    until = time.monotonic() + timeout
+    while time.monotonic() < until:
+        found = pred()
+        if found:
+            return found
+        time.sleep(0.1)
+    return None
+
+
+def recovery(work, check):
+    """Worker failures must fail the client, not the next build or the daemon."""
+    if not sys.platform.startswith("linux"):
+        print("  skip recovery: requires Linux /proc (not checked)", flush=True)
+        return
+
+    def case(name, disk=None):
+        root = os.path.join(disk or work, "r-" + name)
+        ws, home = os.path.join(root, "ws"), os.path.join(root, "home")
+        for file, text in FLAG_WORKSPACE.items():
+            path = os.path.join(ws, file)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as out:
+                out.write(text)
+        env = base_env(home)
+        env["RUSTD_CACHE"] = os.path.join(work, "recovery-cache-" + name)
+        if name == "hung":
+            env["RUSTD_HUNG_SECS"] = "3"
+        side = Side(ws, env, True)
+        clients, stopped = [], []
+        daemon = None
+
+        def status():
+            return side.cargo("status", timeout=10)[1].stdout
+
+        def pid():
+            found = re.search(r"^daemon: pid (\d+)", status(), re.M)
+            return int(found[1]) if found else None
+
+        def spare():
+            assigned = set(re.findall(r"worker: pid (\d+)", status()))
+            for entry in pathlib.Path("/proc").glob("[0-9]*/stat"):
+                try:
+                    fields = entry.read_text().rsplit(")", 1)[1].split()
+                    words = entry.with_name("cmdline").read_bytes().split(b"\0")
+                    if int(fields[1]) == daemon and fields[0] != "Z" and b"--spare" in words and entry.parent.name not in assigned:
+                        return int(entry.parent.name)
+                except (OSError, ValueError):
+                    pass
+            return None
+
+        def spawn():
+            process = subprocess.Popen(side.argv("build"), cwd=ws, env=env,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **OWN_GROUP)
+            clients.append(process)
+            return process
+
+        def finish(process, timeout=35):
+            try:
+                out, err = process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                kill_all(process)
+                out, err = process.communicate()
+                err += f"\nharness: timed out after {timeout}s"
+            return subprocess.CompletedProcess(process.args, process.returncode, out, err)
+
+        def detail(ran):
+            return f"exit {ran.returncode}, how_built={how_built(ran.stderr)}, stderr tail={ran.stderr[-1200:]!r}"
+
+        def record(label, held, ran=None, extra=""):
+            check(f"recovery {name}: {label}", held, (detail(ran) if ran else "") + extra)
+            if not held:
+                print(f"    status:\n{status()}", flush=True)
+                log = os.path.join(home, "daemon.log")
+                print(f"    {log}:\n{pathlib.Path(log).read_text(errors='replace')[-4000:] if os.path.exists(log) else '(missing)'}", flush=True)
+
+        def edit():
+            path = os.path.join(ws, "app/src/main.rs")
+            with open(path, "r+") as source:
+                text = source.read()
+                source.seek(0)
+                source.write(text.replace('"world"', '"earth"') if '"world"' in text else text.replace('"earth"', '"world"'))
+
+        def next_build(label="next build"):
+            ran = finish(spawn())
+            now = pid()
+            record(label, ran.returncode == 0 and how_built(ran.stderr) == "daemon" and
+                   now is not None and now == daemon, ran, f", daemon {daemon} -> {now}")
+            return ran
+
+        def full_error(ran):
+            return ran.returncode != 0 and not by_cargo(how_built(ran.stderr)) and disk in ran.stderr and bool(
+                re.search(r"no space left on device|disk (?:is )?full", ran.stderr, re.I))
+
+        def fill():
+            with open(os.path.join(root, "filler"), "wb", buffering=0) as out:
+                for size in (1 << 20, 4096):
+                    while True:
+                        try:
+                            out.write(bytes(size))
+                        except OSError as error:
+                            if error.errno != 28:
+                                raise
+                            break
+
+        try:
+            if name == "load":
+                os.makedirs(home, mode=0o700, exist_ok=True)
+                with open(os.path.join(home, "daemon.log"), "a") as log:
+                    started = subprocess.Popen([RUSTD, "daemon"], cwd=ws, env=env,
+                                               stdout=log, stderr=log, **OWN_GROUP)
+                daemon = started.pid
+                worker = wait_for(spare, 30)
+                if not worker:
+                    raise RuntimeError("no live spare before first build")
+                os.kill(worker, signal.SIGSTOP)
+                stopped.append(worker)
+                process = spawn()
+                loading = wait_for(lambda: f"    {ws}: loading" in status(), 30)
+                record("stopped spare becomes loading worker", bool(loading), extra=f", worker {worker}")
+                os.kill(worker, signal.SIGKILL)
+                ran = finish(process)
+                record("client names signal 9", ran.returncode != 0 and bool(re.search(r"signal:? 9", ran.stderr)), ran)
+                next_build()
+            else:
+                first = finish(spawn(), 120)
+                daemon = pid()
+                wait_warm(side, ws)
+                record("warm setup", first.returncode == 0 and how_built(first.stderr) == "daemon", first)
+                text = status()
+                workers = re.findall(r"worker: pid (\d+)", text)
+                if not workers:
+                    raise RuntimeError("no worker after warm setup")
+                worker = int(workers[0])
+                if name == "spare":
+                    old = wait_for(spare, 30)
+                    if not old:
+                        raise RuntimeError("no spare after warm setup")
+                    os.kill(old, signal.SIGKILL)
+                    fresh = wait_for(lambda: (new if (new := spare()) != old else None), 8)
+                    record("dead spare replaced", bool(fresh), extra=f", spare {old} -> {fresh}")
+                elif name == "idle":
+                    os.kill(worker, signal.SIGKILL)
+                    time.sleep(2)
+                    text = status()
+                    record("status names signal 9, not ready", bool(re.search(r"signal:? 9", text)) and f"{ws}: ready" not in text,
+                           extra=f", status={text!r}")
+                    sockets = glob.glob(os.path.join(home, "workers", "*", "sock"))
+                    record("dead worker socket removed", not sockets, extra=f", sockets={sockets}")
+                elif name in ("build", "hung"):
+                    edit()
+                    os.kill(worker, signal.SIGSTOP)
+                    stopped.append(worker)
+                    process = spawn()
+                    if name == "build":
+                        blocked = wait_for(lambda: process.poll() is None and "building:" in status(), 10)
+                        record("request waits for stopped worker", bool(blocked))
+                        os.kill(worker, signal.SIGKILL)
+                    ran = finish(process, 30)
+                    named = "signal 9" if name == "build" else "hung"
+                    record(f"client names {named}", ran.returncode != 0 and bool(re.search(r"signal:? 9" if name == "build" else "hung", ran.stderr)) and
+                           "harness: timed out" not in ran.stderr, ran)
+                elif name == "disk":
+                    fill()
+                    edit()
+                    ran = finish(spawn())
+                    record("full disk error names path", full_error(ran), ran)
+                    os.remove(os.path.join(root, "filler"))
+                    next_build()
+                    wait_warm(side, ws)
+                    worker = int(re.search(r"worker: pid (\d+)", status())[1])
+                    log = os.readlink(f"/proc/{worker}/fd/2")
+                    with open(log, "w"):
+                        pass
+                    fill()
+                    edit()
+                    ran = finish(spawn())
+                    record("full worker log error names path", full_error(ran) and
+                           os.stat(log).st_size == 0 and
+                           ran.stderr.count("the disk is full:") == 1, ran)
+                    os.remove(os.path.join(root, "filler"))
+                    next_build("full worker log recovers")
+                    wait_warm(side, ws)
+                    worker = int(re.search(r"worker: pid (\d+)", status())[1])
+                    os.kill(worker, signal.SIGSTOP)
+                    stopped.append(worker)
+                    sock = glob.glob(os.path.join(home, "workers", "*", "sock"))[0]
+                    os.remove(sock)
+                    with socket.socket(socket.AF_UNIX) as listener:
+                        listener.bind(sock)
+                        os.chmod(sock, 0o600)
+                        listener.listen()
+                        listener.settimeout(15)
+                        fill()
+                        edit()
+                        process = spawn()
+                        stream, _ = listener.accept()
+                        stream.close()
+                        ran = finish(process)
+                    record("unanswered request on full disk names path", full_error(ran) and
+                           "did not answer" in ran.stderr and
+                           ran.stderr.count("the disk is full:") == 1, ran)
+                    os.remove(os.path.join(root, "filler"))
+                    next_build("unanswered request recovers")
+                    wait_warm(side, ws)
+                    fill()
+                    side.cargo("stop", timeout=15)
+                    edit()
+                    ran = finish(spawn())
+                    record("cold start on full disk names path", full_error(ran), ran)
+                    daemon = pid()
+                    os.remove(os.path.join(root, "filler"))
+                    next_build("cold start recovers after freeing disk")
+                    return
+                next_build()
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+            record("scenario completed", False, extra=f", {error}")
+        finally:
+            for process in clients:
+                if process.poll() is None:
+                    kill_all(process)
+                    process.communicate()
+            for worker in stopped:
+                try:
+                    os.kill(worker, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            try:
+                side.cargo("stop", timeout=15)
+            except subprocess.TimeoutExpired:
+                if daemon and alive(daemon):
+                    kill(daemon)
+
+    for name in ("load", "build", "idle", "spare", "hung"):
+        case(name)
+    if shutil.which("sudo") is None or subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode:
+        print("  skip recovery disk: passwordless sudo unavailable (not checked)", flush=True)
+        return
+    disk = os.path.join(work, "disk")
+    os.mkdir(disk)
+    mounted = subprocess.run(["sudo", "-n", "mount", "-t", "tmpfs", "-o", f"size=512m,uid={os.getuid()}", "tmpfs", disk], capture_output=True, text=True)
+    if mounted.returncode:
+        check("recovery disk: mount tmpfs", False, mounted.stderr)
+        return
+    try:
+        case("disk", disk)
+    finally:
+        unmounted = subprocess.run(["sudo", "-n", "umount", disk], capture_output=True, text=True)
+        check("recovery disk: unmount tmpfs", unmounted.returncode == 0, unmounted.stderr)
 
 
 def stranger(home, check):
@@ -1592,6 +1844,14 @@ def main():
     # The path of a socket is at most 104 bytes on macOS, and its temporary directory is long.
     work = os.path.realpath(tempfile.mkdtemp(prefix="rustd-cargo-", dir="/tmp" if sys.platform == "darwin" else None))
     print(f"work {work}; rustd {RUSTD}", flush=True)
+    if "--only-recovery" in argv:
+        checks = []
+        def check(name, held, detail=""):
+            checks.append(bool(held))
+            print(f"  {'ok ' if held else 'NOT'} {name}  {detail}", flush=True)
+        recovery(work, check)
+        print(f"recovery: {sum(checks)}/{len(checks)} checks held; work {work}", flush=True)
+        raise SystemExit(0 if all(checks) else 1)
     result = dict(rustd=RUSTD, toolchain=TOOLCHAIN, projects=[], flags=[], daemon=[], wrong=[])
     if "--only-checks" not in argv:
         for name in names:
