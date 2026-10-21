@@ -4343,14 +4343,15 @@ impl Builds {
             return Ok(());
         };
         (program.interrupted, program.moved) = (0, false);
-        let answer = answer?;
         for (_, _, client) in clients {
             // A client that hangs up before the answer is not the daemon's problem.
             let _ = match &answer {
-                Ok(built) => writeln!(&client, "ok {built}"),
-                Err(why) => writeln!(&client, "error: {}", why.replace('\n', " ")),
+                Ok(Ok(built)) => writeln!(&client, "ok {built}"),
+                Ok(Err(why)) => writeln!(&client, "error: {}", why.replace('\n', " ")),
+                Err(why) => writeln!(&client, "error: {}", format!("{why:#}").replace('\n', " ")),
             };
         }
+        let _ = answer?;
         Ok(())
     }
 

@@ -398,6 +398,7 @@ impl Worker {
         if let Some(reason) = &*lost {
             return reason.clone();
         }
+        let reason = self.disk_error(reason);
         self.stop();
         log!("{reason}");
         *lost = Some(reason.clone());
@@ -405,10 +406,11 @@ impl Worker {
     }
 
     fn disk_error(&self, mut reason: String) -> String {
-        if disk_full(&reason) {
+        let full = self.paths.iter().find(|path| no_space(path));
+        if disk_full(&reason) || full.is_some() {
             reason = format!("the disk is full: {reason}");
         }
-        if let Some(path) = self.paths.iter().find(|path| no_space(path))
+        if let Some(path) = full
             && !reason.contains(path.to_string_lossy().as_ref())
         {
             reason.push_str(&format!(" (no space left at {})", path.display()));
@@ -435,11 +437,11 @@ impl Worker {
                 return format!("{reason}; its log is {}", self.log.display());
             }
         }
-        self.disk_error(format!(
+        format!(
             "the daemon's worker (pid {pid}) ended ({status}: {}); its log is {}",
             self.last_words(),
             self.log.display()
-        ))
+        )
     }
 
     fn sample(&self) {
@@ -459,10 +461,12 @@ impl Worker {
             Ok(None) => None,
             Ok(Some(status)) => {
                 let reason = self.death(status);
-                let refused = status.code().is_some_and(|code| code != 0) && !disk_full(&reason);
+                let refused = status.code().is_some_and(|code| code != 0)
+                    && !disk_full(&reason)
+                    && !self.paths.iter().any(|path| no_space(path));
                 Some(End { reason, refused })
             }
-            Err(error) => Some(End { reason: self.disk_error(error.to_string()), refused: false }),
+            Err(error) => Some(End { reason: error.to_string(), refused: false }),
         }
     }
 
@@ -507,8 +511,7 @@ impl Worker {
                 if self.end().is_some_and(|end| end.refused) {
                     Warmth::Failed(reason, SystemTime::now())
                 } else {
-                    self.lose(reason.clone());
-                    Warmth::Failed(reason, SystemTime::now())
+                    Warmth::Failed(self.lose(reason), SystemTime::now())
                 }
             }
         };
@@ -632,8 +635,10 @@ impl Worker {
         }
         let reply = String::from_utf8(reply)?;
         let reply = reply.trim_end();
-        if disk_full(reply) {
-            anyhow::bail!(self.lose(self.disk_error(reply.to_owned())));
+        if disk_full(reply)
+            || (!reply.starts_with("ok") && self.paths.iter().any(|path| no_space(path)))
+        {
+            anyhow::bail!(self.lose(reply.to_owned()));
         }
         match reply.strip_prefix("error: ") {
             _ if reply.is_empty() => Err(anyhow::anyhow!(failed())),
@@ -673,16 +678,22 @@ impl Worker {
 
     fn status(&self) -> WorkerStatus {
         self.sample();
-        let state = self.end().map(|end| format!("lost: {}", end.reason)).or_else(|| {
-            let requests = lock(&self.requests);
-            requests.iter().min().map(|since| {
-                format!(
-                    "building: {} request(s) for {:.0}s",
-                    requests.len(),
-                    since.elapsed().as_secs_f64()
-                )
+        let state = self
+            .end()
+            .map(|end| {
+                let reason = if end.refused { end.reason } else { self.lose(end.reason) };
+                format!("lost: {reason}")
             })
-        });
+            .or_else(|| {
+                let requests = lock(&self.requests);
+                requests.iter().min().map(|since| {
+                    format!(
+                        "building: {} request(s) for {:.0}s",
+                        requests.len(),
+                        since.elapsed().as_secs_f64()
+                    )
+                })
+            });
         let checkouts = lock(&self.checkouts);
         WorkerStatus {
             pid: lock(&self.child).id(),
@@ -974,7 +985,8 @@ impl Daemon {
             return Reply::Cold { reason: "the daemon has not loaded this workspace".to_owned() };
         };
         if let Some(end) = worker.end() {
-            return Reply::Cold { reason: end.reason };
+            let reason = if end.refused { end.reason } else { worker.lose(end.reason) };
+            return Reply::Cold { reason };
         }
         *lock(&worker.asked) = Instant::now();
         let warmth = match lock(&worker.checkouts).get(&checkout.key) {

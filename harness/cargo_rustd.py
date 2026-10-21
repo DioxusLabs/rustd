@@ -40,7 +40,7 @@ Writes CARGO-RUSTD.md and cargo_rustd.json next to this file or in `RUSTD_REPORT
 CARGO-RUSTD-LLVM.md and cargo_rustd_llvm.json under `RUSTD_BACKEND=llvm`. A run of some projects replaces their rows
 and keeps the others. `--small` is the three projects of the CI job.
 """
-import collections, contextlib, glob, json, os, pathlib, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
+import collections, contextlib, glob, json, os, pathlib, re, shutil, signal, socket, subprocess, sys, tempfile, time, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -1371,6 +1371,41 @@ def recovery(work, check):
                     record("full disk error names path", full_error(ran), ran)
                     os.remove(os.path.join(root, "filler"))
                     next_build()
+                    wait_warm(side, ws)
+                    worker = int(re.search(r"worker: pid (\d+)", status())[1])
+                    log = os.readlink(f"/proc/{worker}/fd/2")
+                    with open(log, "w"):
+                        pass
+                    fill()
+                    edit()
+                    ran = finish(spawn())
+                    record("full worker log error names path", full_error(ran) and
+                           os.stat(log).st_size == 0 and
+                           ran.stderr.count("the disk is full:") == 1, ran)
+                    os.remove(os.path.join(root, "filler"))
+                    next_build("full worker log recovers")
+                    wait_warm(side, ws)
+                    worker = int(re.search(r"worker: pid (\d+)", status())[1])
+                    os.kill(worker, signal.SIGSTOP)
+                    stopped.append(worker)
+                    sock = glob.glob(os.path.join(home, "workers", "*", "sock"))[0]
+                    os.remove(sock)
+                    with socket.socket(socket.AF_UNIX) as listener:
+                        listener.bind(sock)
+                        os.chmod(sock, 0o600)
+                        listener.listen()
+                        listener.settimeout(15)
+                        fill()
+                        edit()
+                        process = spawn()
+                        stream, _ = listener.accept()
+                        stream.close()
+                        ran = finish(process)
+                    record("unanswered request on full disk names path", full_error(ran) and
+                           "did not answer" in ran.stderr and
+                           ran.stderr.count("the disk is full:") == 1, ran)
+                    os.remove(os.path.join(root, "filler"))
+                    next_build("unanswered request recovers")
                     wait_warm(side, ws)
                     fill()
                     side.cargo("stop", timeout=15)
