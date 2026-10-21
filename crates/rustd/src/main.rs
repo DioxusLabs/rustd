@@ -975,14 +975,21 @@ impl SymbolResolver for Resolver<'_> {
         let db = self.db;
         let it = hir::Impl::from(id);
         let source = it.source(db)?;
-        // FIXME: where rustc puts the `impl`s a macro makes among the ones written out.
+        // FIXME: the order among impls expanded from macros.
         if source.file_id.is_macro() {
             return None;
         }
         let start = |it: &hir::InFile<ast::Impl>| it.value.syntax().text_range().start();
         let mut earlier = 0;
+        // rustc collects written definitions before expanding macros.
         for other in it.module(db).impl_defs(db) {
+            if hir_def::ImplId::try_from(other).is_err() {
+                continue;
+            }
             let other = other.source(db)?;
+            if other.file_id.is_macro() {
+                continue;
+            }
             if other.file_id != source.file_id {
                 return None;
             }

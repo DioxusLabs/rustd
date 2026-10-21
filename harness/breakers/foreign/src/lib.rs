@@ -38,6 +38,52 @@ pub use reexports::Issue;
 #[derive(Debug)]
 pub struct LocalTypes;
 
+pub mod local_method_ids {
+    use std::any::TypeId;
+
+    #[derive(Debug)]
+    pub struct Neighbour;
+
+    macro_rules! extra {
+        () => {
+            impl Neighbour {
+                pub fn extra() {}
+            }
+        };
+    }
+    extra!();
+
+    pub trait LocalId<T> {
+        fn id(value: T) -> TypeId;
+    }
+
+    impl<T> LocalId<T> for str {
+        #[inline]
+        fn id(_: T) -> TypeId {
+            struct LocalError;
+            TypeId::of::<LocalError>()
+        }
+    }
+
+    pub struct Holder;
+
+    impl Holder {
+        #[inline]
+        pub fn id<T>(_: T) -> TypeId {
+            struct LocalError;
+            TypeId::of::<LocalError>()
+        }
+    }
+
+    pub fn trait_reference() -> TypeId {
+        <str as LocalId<()>>::id(())
+    }
+
+    pub fn inherent_reference() -> TypeId {
+        Holder::id(())
+    }
+}
+
 macro_rules! padding {
     () => {
         const _: () = ();
