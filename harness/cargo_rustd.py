@@ -680,6 +680,9 @@ def flags(work):
     patched_rows, patched_wrong = first_edit_patches(work)
     rows.extend(patched_rows)
     wrong.extend(patched_wrong)
+    ahead_rows, ahead_wrong = unused_ahead(work)
+    rows.extend(ahead_rows)
+    wrong.extend(ahead_wrong)
 
     def round_of(label):
         for command, args, extra in FLAG_CASES:
@@ -766,6 +769,54 @@ def selected_member_tests(work):
         ours.cargo("stop")
         daemon.wait(timeout=30)
     return rows, wrong
+
+
+def unused_ahead(work):
+    """A unit-only build does not retain its unused non-unit preload."""
+    if not os.path.isdir("/proc/self"):
+        return [], []
+    ws = os.path.realpath(os.path.join(work, "unit-only"))
+    files = {
+        "Cargo.toml": '[package]\nname = "unit-only"\nversion = "0.1.0"\nedition = "2021"\n',
+        "src/lib.rs": '#[test]\nfn unit() { assert_eq!(2 + 2, 4); }\n',
+    }
+    for file, text in files.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
+        open(os.path.join(ws, file), "w").write(text)
+    home = os.path.join(work, "home-unit-only")
+    env = dict(base_env(home), RUSTD_SPARE="1")
+    ours, theirs = Side(ws, env, True), Side(ws, env, False)
+    daemon = subprocess.Popen([RUSTD, "daemon"], cwd=ws, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        log = os.path.join(home, "spares", "0", "log")
+        until = time.time() + WARMUP_SECS
+        while time.time() < until:
+            if os.path.exists(log) and re.search(r"^spare: \d+ crates", open(log, errors="replace").read(), re.M):
+                break
+            if daemon.poll() is not None:
+                raise RuntimeError("unit-only daemon ended before loading its spare")
+            time.sleep(0.1)
+        else:
+            raise RuntimeError("unit-only spare did not load")
+        children = open(f"/proc/{daemon.pid}/task/{daemon.pid}/children").read().split()
+        if len(children) != 1:
+            raise RuntimeError(f"expected one preloaded spare, got {children}")
+        spare = int(children[0])
+        _, mine = ours.cargo("test", "--lib")
+        _, other = theirs.cargo("test", "--lib")
+        differs = difference(test_results(mine), test_results(other))
+        how = how_built(mine.stderr)
+        if mine.returncode or other.returncode or by_cargo(how) or not test_results(mine)[1]:
+            differs = "; ".join(filter(None, [differs, "test failure, Cargo fallback or no tests"]))
+        if alive(spare):
+            differs = "; ".join(filter(None, [differs, "the unused non-unit preload is still alive"]))
+        shown = "cargo rustd test --lib (unused non-unit preload)"
+        row = ("cold", shown, how, mine.returncode, differs or "same; unused preload stopped")
+        print(f"  cold   {shown}  exit {mine.returncode}  {row[-1]}", flush=True)
+        return [row], [f"{shown}: {differs}\n{mine.stderr[-1000:]}"] if differs else []
+    finally:
+        ours.cargo("stop")
+        daemon.wait(timeout=30)
 
 
 def first_edit_patches(work):
