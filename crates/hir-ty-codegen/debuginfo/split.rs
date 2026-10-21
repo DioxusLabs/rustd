@@ -18,7 +18,7 @@ use cranelift_codegen::gimli::{
     },
 };
 use cranelift_object::object::{
-    self, BinaryFormat, SectionFlags, SectionKind, elf,
+    self, SectionFlags, SectionKind, elf,
     write::{Object, StandardSegment},
 };
 use rustc_hash::FxHashMap;
@@ -88,7 +88,6 @@ pub(super) struct Split {
     directory: Vec<u8>,
     /// What the name of each file the entries are read from starts with.
     name: String,
-    object: (BinaryFormat, object::Architecture),
     info: SectionWriter,
     abbrev: SectionWriter,
     line: DebugLine<SectionWriter>,
@@ -96,21 +95,15 @@ pub(super) struct Split {
     addr: SectionWriter,
     /// The location lists of the unit being added.
     loc_apart: SectionWriter,
-    files: Vec<Sidecar>,
+    files: Vec<(String, [(SectionId, SectionWriter); 3])>,
 }
 
 impl Split {
-    pub(super) fn new(
-        encoding: Encoding,
-        directory: Vec<u8>,
-        name: String,
-        like: &Object<'_>,
-    ) -> Self {
+    pub(super) fn new(encoding: Encoding, directory: Vec<u8>, name: String) -> Self {
         Split {
             encoding,
             directory,
             name,
-            object: (like.format(), like.architecture()),
             info: SectionWriter::default(),
             abbrev: SectionWriter::default(),
             line: DebugLine(SectionWriter::default()),
@@ -183,20 +176,23 @@ impl Split {
         }
         let name = file(&self.name, self.files.len());
         let lists = std::mem::take(&mut self.loc_apart);
-        let bytes = self.file([
-            (SectionId::DebugInfo, &info),
-            (SectionId::DebugAbbrev, &by_index(&written.debug_abbrev.0)?),
-            (SectionId::DebugLoc, &lists),
-        ])?;
+        let sections = [
+            (SectionId::DebugInfo, info),
+            (SectionId::DebugAbbrev, by_index(&written.debug_abbrev.0)?),
+            (SectionId::DebugLoc, lists),
+        ];
         self.skeleton(name.as_bytes(), lines.0, id, of_unit, ranges_base, addr_base)
             .map_err(|e| e.to_string())?;
-        self.files.push(Sidecar { name, bytes });
+        self.files.push((name, sections));
         Ok(())
     }
 
     /// The file of one unit's entries: an object of nothing but these sections.
-    fn file(&self, sections: [(SectionId, &SectionWriter); 3]) -> Result<Vec<u8>, String> {
-        let (format, architecture) = self.object;
+    fn file(
+        like: &Object<'_>,
+        sections: [(SectionId, SectionWriter); 3],
+    ) -> Result<Vec<u8>, String> {
+        let (format, architecture) = (like.format(), like.architecture());
         // The sections are written with the low byte first, as every target of ours has it.
         let mut object = Object::new(format, architecture, object::Endianness::Little);
         for (id, written) in sections {
@@ -332,7 +328,12 @@ impl Split {
     }
 
     /// The sections to link, and the files of what is kept apart.
-    pub(super) fn finish(self) -> (Vec<Section>, Vec<Sidecar>) {
+    pub(super) fn finish(self, like: &Object<'_>) -> Result<(Vec<Section>, Vec<Sidecar>), String> {
+        let files = self
+            .files
+            .into_iter()
+            .map(|(name, sections)| Self::file(like, sections).map(|bytes| Sidecar { name, bytes }))
+            .collect::<Result<Vec<_>, _>>()?;
         let linked = [
             (SectionId::DebugInfo, self.info),
             (SectionId::DebugAbbrev, self.abbrev),
@@ -341,6 +342,6 @@ impl Split {
             (SectionId::DebugAddr, self.addr),
         ];
         let linked = linked.into_iter().map(|(id, written)| Section { id, written });
-        (linked.collect(), self.files)
+        Ok((linked.collect(), files))
     }
 }
