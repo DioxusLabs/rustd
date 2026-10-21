@@ -296,6 +296,11 @@ pub trait SymbolResolver {
         _ = adt;
         None
     }
+    /// The closure numbers from the owning function to this closure, outermost first.
+    fn closure_numbers(&self, closure: InternedClosureId<'_>) -> Option<Vec<u32>> {
+        _ = closure;
+        None
+    }
     /// How many `impl`s of its module rustc numbers before this one.
     fn impl_place(&self, id: hir_def::ImplId) -> Option<u32> {
         _ = id;

@@ -253,4 +253,63 @@ pub mod typeids {
             error(step)
         }
     }
+
+    pub mod closures {
+        use std::any::Any;
+
+        pub fn generic<T: Any>() -> impl Any {
+            let closure = || std::mem::size_of::<T>();
+            closure
+        }
+
+        pub fn second<T: Any>() -> impl Any {
+            let first = || 0usize;
+            let second = || std::mem::size_of::<T>();
+            let _ = first();
+            second
+        }
+
+        pub fn nested<T: Any>() -> impl Any {
+            let outer = || {
+                let inner = || std::mem::size_of::<T>();
+                inner
+            };
+            outer()
+        }
+
+        pub fn once<T: Any>() -> impl Any {
+            let closure = |()| std::mem::size_of::<T>();
+            let _ = Some(()).map(closure);
+            closure
+        }
+
+        pub fn mutable<T: Any>() -> impl Any {
+            let closure = |()| {
+                let _ = std::mem::size_of::<T>();
+            };
+            std::iter::once(()).for_each(closure);
+            closure
+        }
+
+        pub struct Factory<T>(std::marker::PhantomData<T>);
+
+        impl<T: Any> Factory<T> {
+            pub fn inherent() -> impl Any {
+                let closure = || std::mem::size_of::<T>();
+                closure
+            }
+        }
+
+        pub async fn asynchronous<T: Any>() -> impl Any {
+            let closure = || std::mem::size_of::<T>();
+            closure
+        }
+
+        pub fn capturing<T: Any>(value: T) -> impl Any {
+            move || {
+                let _ = &value;
+                std::mem::size_of::<T>()
+            }
+        }
+    }
 }

@@ -50,6 +50,7 @@ use hir_def::{
     AssocItemId, DefWithBodyId, FunctionId, ItemContainerId, Lookup, ModuleDefId, StaticId,
     expr_store::Body, item_scope::ItemScope,
 };
+use hir_ty::db::InternedClosureId;
 use hir_ty::mir::codegen::{
     Backend, CodegenError, CodegenUnit, ContentId, ParallelWork, Rejections, Roots, SymbolResolver,
     exported_symbol,
@@ -987,6 +988,43 @@ impl SymbolResolver for Resolver<'_> {
         let func: FunctionId =
             self.function_at(&sema, adt.module(self.db), &func)?.try_into().ok()?;
         Some((func.into(), 0))
+    }
+
+    fn closure_numbers(&self, closure: InternedClosureId<'_>) -> Option<Vec<u32>> {
+        let closure = closure.loc(self.db);
+        let func = closure.owner.as_function()?;
+        let owner = DefWithBodyId::FunctionId(func);
+        let (_, source_map) = Body::with_source_map(self.db, owner);
+        let source = source_map.expr_syntax(closure.expr).ok()?;
+        let sema = hir::Semantics::new(self.db);
+        let root = sema.parse_or_expand(source.file_id);
+        let source = source.value.to_node(&root).left()?;
+        let module = ModuleDef::from(ModuleDefId::FunctionId(func)).module(self.db)?;
+        let mut numbers = Vec::new();
+        let mut reaches_owner = false;
+        for node in sema.ancestors_with_macros(source.syntax().clone()) {
+            if is_closure(&node) {
+                numbers.push(closure_number(&sema, &node)?);
+                continue;
+            }
+            if let Some(function) = ast::Fn::cast(node.clone()) {
+                if function.async_token().is_some() {
+                    numbers.push(0);
+                }
+                let function = self.function_at(&sema, module, &function)?;
+                let function: FunctionId = function.try_into().ok()?;
+                if function != func {
+                    return None;
+                }
+                reaches_owner = true;
+                break;
+            }
+        }
+        if !reaches_owner {
+            return None;
+        }
+        numbers.reverse();
+        Some(numbers)
     }
 
     fn impl_place(&self, id: hir_def::ImplId) -> Option<u32> {
