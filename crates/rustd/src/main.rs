@@ -50,6 +50,7 @@ use hir_def::{
     AssocItemId, DefWithBodyId, FunctionId, ItemContainerId, Lookup, ModuleDefId, StaticId,
     expr_store::Body, item_scope::ItemScope,
 };
+use hir_ty::db::InternedClosureId;
 use hir_ty::mir::codegen::{
     Backend, CodegenError, CodegenUnit, ContentId, ParallelWork, Rejections, Roots, SymbolResolver,
     exported_symbol,
@@ -681,8 +682,27 @@ impl Resolver<'_> {
             return None;
         }
         // Lifetimes are erased, and rustc leaves erased ones out of the name.
-        let args: Option<Vec<_>> = ty.type_arguments().map(|arg| self.type_path(&arg)).collect();
-        Some(format!("{path}<{}>", args?.join(", ")))
+        let mut args: Vec<String> =
+            ty.type_arguments().map(|arg| self.type_path(&arg)).collect::<Option<_>>()?;
+        // rustc leaves out the trailing arguments that are their parameter's default, so
+        // `TlsConnector<S, ConnectorKindAuto>` is `TlsConnector<_>`. A default that names
+        // another parameter is kept: telling it apart needs the argument of that one.
+        while let Some(param) = args.len().checked_sub(1).and_then(|it| params.get(it)) {
+            let Some(default) = param.as_type_param(self.db).and_then(|it| it.default(self.db))
+            else {
+                break;
+            };
+            if !default.generic_params(self.db).is_empty()
+                || self.type_path(&default).as_ref() != args.last()
+            {
+                break;
+            }
+            args.pop();
+        }
+        if args.is_empty() {
+            return Some(path);
+        }
+        Some(format!("{path}<{}>", args.join(", ")))
     }
 }
 
@@ -970,6 +990,43 @@ impl SymbolResolver for Resolver<'_> {
         Some((func.into(), 0))
     }
 
+    fn closure_numbers(&self, closure: InternedClosureId<'_>) -> Option<Vec<u32>> {
+        let closure = closure.loc(self.db);
+        let func = closure.owner.as_function()?;
+        let owner = DefWithBodyId::FunctionId(func);
+        let (_, source_map) = Body::with_source_map(self.db, owner);
+        let source = source_map.expr_syntax(closure.expr).ok()?;
+        let sema = hir::Semantics::new(self.db);
+        let root = sema.parse_or_expand(source.file_id);
+        let source = source.value.to_node(&root).left()?;
+        let module = ModuleDef::from(ModuleDefId::FunctionId(func)).module(self.db)?;
+        let mut numbers = Vec::new();
+        let mut reaches_owner = false;
+        for node in sema.ancestors_with_macros(source.syntax().clone()) {
+            if is_closure(&node) {
+                numbers.push(closure_number(&sema, &node)?);
+                continue;
+            }
+            if let Some(function) = ast::Fn::cast(node.clone()) {
+                if function.async_token().is_some() {
+                    numbers.push(0);
+                }
+                let function = self.function_at(&sema, module, &function)?;
+                let function: FunctionId = function.try_into().ok()?;
+                if function != func {
+                    return None;
+                }
+                reaches_owner = true;
+                break;
+            }
+        }
+        if !reaches_owner {
+            return None;
+        }
+        numbers.reverse();
+        Some(numbers)
+    }
+
     fn impl_place(&self, id: hir_def::ImplId) -> Option<u32> {
         use hir::HasSource;
         let db = self.db;
@@ -1059,7 +1116,19 @@ impl Resolver<'_> {
                 }
                 let func = self.function_at(&sema, module, &func)?;
                 let func: FunctionId = func.try_into().ok()?;
-                owner = Some((self.path(func)?, func));
+                let function = match ModuleDef::from(ModuleDefId::FunctionId(func)) {
+                    ModuleDef::Function(function) => function,
+                    _ => return None,
+                };
+                let path = match function.as_assoc_item(self.db).map(|it| it.container(self.db)) {
+                    Some(AssocItemContainer::Trait(trait_)) => {
+                        let trait_path =
+                            self.item_path(trait_.module(self.db), trait_.name(self.db).as_str())?;
+                        format!("{trait_path}::{}", function.name(self.db).as_str())
+                    }
+                    _ => self.path(func)?,
+                };
+                owner = Some((path, func));
                 break;
             }
             let name = match_ast! {
@@ -2926,12 +2995,23 @@ fn build(
         .partition(|&(func, exported)| exported || main.is_none() || main == Some(func));
     let unzip = |it: Vec<(FunctionId, bool)>| it.into_iter().map(|it| it.0).collect::<Vec<_>>();
     let (entries, on_demand) = (unzip(entries), unzip(on_demand));
+    let harness = cargo::plan::Harness::of(&args.out)?;
+    let doctest = programs_own.first().is_some_and(|&krate| doctest::is_examples(db, krate.into()));
+    let reports: Vec<_> = if harness.is_some() && !doctest {
+        harness_tests(db, &resolver, &programs_own)
+            .into_iter()
+            .filter(|&id| !hir::Function::from(id).ret_type(db).is_unit())
+            .collect()
+    } else {
+        Vec::new()
+    };
     // The program's `main` is called by one rustc wrote, when rustc built the crate.
     let own = |main: &FunctionId| resolver.own_crate_id(hir_def::HasModule::krate(main, db));
     let roots = Roots {
         entries: &entries,
         on_demand: &on_demand,
         start: main.filter(|it| own(it).is_some()),
+        reports: &reports,
         kept: &kept,
     };
     let setup = start.elapsed();
@@ -3003,11 +3083,12 @@ fn build(
     if let (Some(path), Some(patch)) = (&args.patch, &unit.patch) {
         replace(path, patch)?;
     }
-    if let Some(harness) = cargo::plan::Harness::of(&args.out)? {
+    let mut harness_unfit = None;
+    if let Some(harness) = harness {
         // What each test can run, for the client to run only the ones an edit can change.
         Reached::of(db, listed, args).write(&args.out)?;
         let text = hir::attach_db(db, || match programs_own.first() {
-            Some(&krate) if doctest::is_examples(db, krate.into()) => {
+            Some(&krate) if doctest => {
                 let runners: Vec<(String, Option<String>)> = listed
                     .of(db, krate)
                     .functions
@@ -3021,13 +3102,17 @@ fn build(
                 doctest::harness(db, krate.into(), &runners)
             }
             _ => harness_of(db, &resolver, &programs_own),
-        })
-        .map_err(anyhow::Error::msg)?;
-        // A splice adds the edit to the executable and leaves the harness as it was linked.
-        if harness.write(&text)?
-            && let Some(binary) = &args.splice
-        {
-            lock(&LINKED).remove(binary);
+        });
+        match text {
+            Ok(text) => {
+                // A splice adds the edit to the executable and leaves the harness as it was linked.
+                if harness.write(&text)?
+                    && let Some(binary) = &args.splice
+                {
+                    lock(&LINKED).remove(binary);
+                }
+            }
+            Err(reason) => harness_unfit = Some(reason),
         }
     }
     // A function of a crate rustc built nothing of has no copy to stand in for it.
@@ -3038,6 +3123,10 @@ fn build(
         let error = with_failed_macro(db, *func, error.clone());
         format!("`{}` is not compiled by rustd: {error}", name(*func))
     });
+    let report_unfit = unit
+        .report_errors
+        .first()
+        .map(|(func, error)| format!("the report shim for test `{}` failed: {error}", name(*func)));
     let build = Build {
         compiled: unit.compiled.len(),
         skipped: unit
@@ -3050,7 +3139,7 @@ fn build(
         emit: start.elapsed(),
         steps: [setup, revalidate - setup, codegen - revalidate],
         looked,
-        unfit: missing.or_else(|| {
+        unfit: harness_unfit.or(report_unfit).or(missing).or_else(|| {
             unset_in(db, &local)
                 .map(|it| format!("`env!(\"{it}\")` names a variable that is not set"))
         }),
@@ -3064,7 +3153,13 @@ fn build(
         let mut index = String::new();
         for (i, &(func, _)) in unit.compiled.iter().enumerate() {
             let single = hir::attach_db(db, || {
-                let roots = Roots { entries: &[func], on_demand: &[], start: None, kept: &[] };
+                let roots = Roots {
+                    entries: &[func],
+                    on_demand: &[],
+                    start: None,
+                    reports: &[],
+                    kept: &[],
+                };
                 CodegenUnit::compile(hir_db, &resolver, roots, &Default::default(), known)
             })
             .map_err(anyhow::Error::msg)?;
@@ -4006,6 +4101,25 @@ struct Program {
     tests: Option<Tests>,
 }
 
+/// The tests rustc includes in the harness of the crates in `own`.
+fn harness_tests(db: &RootDatabase, resolver: &Resolver<'_>, own: &[Crate]) -> Vec<FunctionId> {
+    let mut tests = Vec::new();
+    for &krate in own {
+        for &id in &resolver.listed.of(db, krate).functions {
+            let function = hir::Function::from(id);
+            if !function.is_test(db) {
+                continue;
+            }
+            let module = function.module(db);
+            // rustc runs no test declared in a body.
+            if module.nearest_non_block_module(db) == module {
+                tests.push(id);
+            }
+        }
+    }
+    tests
+}
+
 /// The harness of a test executable whose own crates are `own`: a `#[test]` for each test
 /// the daemon compiled, which calls it, in modules as the test's are, so that it is named as
 /// rustc would name it. `Err` is why the daemon does not run the tests.
@@ -4029,29 +4143,20 @@ fn harness_of(db: &RootDatabase, resolver: &Resolver<'_>, own: &[Crate]) -> Resu
         }
     }
     let mut glue = Glue::default();
-    let sema = hir::Semantics::new(db);
     for &krate in own {
         let edition = krate.edition(db);
-        for &id in &resolver.listed.of(db, krate).functions {
+        for id in harness_tests(db, resolver, &[krate]) {
             let function = hir::Function::from(id);
-            if !function.is_test(db) {
-                continue;
-            }
             let module = function.module(db);
             let name = function.name(db).display_no_db(edition).to_string();
-            // rustc runs no test declared in a body.
-            if module.nearest_non_block_module(db) != module {
-                continue;
-            }
-            let returns = match function.ret_type(db).is_unit() {
-                true => String::new(),
-                false => named_from_anywhere(&sema, resolver, function)
-                    .map(|it| format!(" -> {it}"))
-                    .map_err(|why| format!("the test `{name}` returns a value: {why}"))?,
-            };
             let symbol = resolver
                 .function_named(id)
                 .ok_or_else(|| format!("the test `{name}` has no symbol of the daemon's"))?;
+            let (returns, symbol) = if function.ret_type(db).is_unit() {
+                (String::new(), symbol)
+            } else {
+                (" -> std::process::ExitCode".to_owned(), format!("{symbol}.rustd_report"))
+            };
             let mut at = &mut glue;
             for module in module.path_to_root(db).into_iter().rev() {
                 let Some(segment) = module.name(db) else { continue };
@@ -4079,64 +4184,6 @@ fn harness_of(db: &RootDatabase, resolver: &Resolver<'_>, own: &[Crate]) -> Resu
     }
     let mut text = String::from("#![allow(warnings)]\n");
     glue.write(&mut text);
-    Ok(text)
-}
-
-/// The return type of `function` as written, with each item it names by a path that names
-/// the same item from any crate with the same dependencies, such as the harness. `Err` is
-/// why it can't be named so: a workspace crate's type is the daemon's, which no rustc crate
-/// sees.
-fn named_from_anywhere(
-    sema: &hir::Semantics<'_, RootDatabase>,
-    resolver: &Resolver<'_>,
-    function: hir::Function,
-) -> Result<String, String> {
-    use hir::HasCrate as _;
-    use syntax::ast::HasGenericArgs as _;
-    let db = sema.db;
-    let written = sema.source(function).and_then(|it| it.value.ret_type()?.ty());
-    let written = written.ok_or("its return type is not written")?;
-    let module = function.module(db);
-    let edition = module.krate(db).edition(db);
-    let cfg = hir::FindPathConfig {
-        prefer_no_std: false,
-        prefer_prelude: true,
-        prefer_absolute: true,
-        allow_unstable: false,
-    };
-    let start = written.syntax().text_range().start();
-    let mut text = written.syntax().text().to_string();
-    let paths = written.syntax().descendants().filter_map(ast::Path::cast);
-    let paths: Vec<_> = paths.filter(|it| it.parent_path().is_none()).collect();
-    // From the last, so that the ranges of those before stay where they are.
-    for path in paths.iter().rev() {
-        let Some(hir::PathResolution::Def(def)) = sema.resolve_path(path) else {
-            return Err(format!("`{path}` is not an item"));
-        };
-        if matches!(def, hir::ModuleDef::BuiltinType(_)) {
-            continue;
-        }
-        if !resolver.rustc_built(def.krate(db).into()) {
-            return Err(format!("`{path}` is a type of the workspace's"));
-        }
-        let qualifier = path.qualifier();
-        if qualifier.is_some_and(|it| it.segments().any(|it| it.generic_arg_list().is_some())) {
-            return Err(format!("`{path}` has generic arguments before its last segment"));
-        }
-        let named = module
-            .find_use_path(db, def, hir::PrefixKind::ByCrate, cfg)
-            .ok_or_else(|| format!("`{path}` has no path from outside its crate"))?;
-        let end = path.segment().and_then(|it| it.name_ref());
-        let end = end.ok_or_else(|| format!("`{path}` does not end in a name"))?;
-        let range = syntax::TextRange::new(
-            path.syntax().text_range().start(),
-            end.syntax().text_range().end(),
-        );
-        text.replace_range(
-            std::ops::Range::<usize>::from(range - start),
-            &named.display(db, edition).to_string(),
-        );
-    }
     Ok(text)
 }
 

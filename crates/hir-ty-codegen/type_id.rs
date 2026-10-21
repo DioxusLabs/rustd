@@ -19,12 +19,12 @@ use hir_def::{
     src::HasSource,
     visibility::{Visibility, visibility_from_ast},
 };
-use rustc_abi::{ExternAbi, Integer, IntegerType, ReprFlags};
+use rustc_abi::{Integer, IntegerType, ReprFlags};
 use rustc_ast_ir::Mutability;
 use rustc_stable_hash::{FromStableHash, SipHasher128Hash, StableSipHasher128};
 use rustc_type_ir::{
     BoundVar, BoundVarIndexKind, ExistentialPredicate, FloatTy, GenericArgKind, IntTy, RegionKind,
-    UintTy,
+    TypeVisitableExt, UintTy,
     inherent::{GenericArgs as _, IntoKind, Safety as _, Term as _},
 };
 use syntax::ast::HasVisibility;
@@ -35,7 +35,7 @@ use super::SymbolResolver;
 use crate::{
     InferBodyId,
     consteval::try_const_usize,
-    db::{HirDatabase, InternedClosure},
+    db::{HirDatabase, InternedClosure, InternedClosureId},
     next_solver::{Const, ConstKind, GenericArgs, Region, TermId, Ty, TyKind, default_types},
 };
 
@@ -57,6 +57,7 @@ enum DefPathData<'a> {
     Impl,
     TypeNs(&'a str),
     ValueNs(&'a str),
+    Closure,
     Ctor,
     AnonConst,
 }
@@ -80,6 +81,7 @@ impl Fingerprint {
             DefPathData::Impl => (1, None),
             DefPathData::TypeNs(name) => (5, Some(name)),
             DefPathData::ValueNs(name) => (6, Some(name)),
+            DefPathData::Closure => (9, None),
             DefPathData::Ctor => (10, None),
             DefPathData::AnonConst => (11, None),
         };
@@ -279,14 +281,17 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
     /// A function that the items of its body are children of.
     fn body_path(&mut self, func: FunctionId) -> Option<Fingerprint> {
         let db = self.db;
+        let name = &FunctionSignature::of(db, func).name;
         let parent = match func.lookup(db).container {
             ItemContainerId::ImplId(id) if self.ours => self.own_impl(id)?,
             ItemContainerId::ImplId(id) => self.impl_path(id)?,
+            ItemContainerId::ModuleId(module) if module.is_block_module(db) && !self.ours => {
+                self.around_local(module.block(db)?, name)?
+            }
             ItemContainerId::ModuleId(module) => self.module(module)?,
             ItemContainerId::TraitId(trait_) => self.trait_path(trait_)?,
             ItemContainerId::ExternBlockId(_) => return None,
         };
-        let name = &FunctionSignature::of(db, func).name;
         // `#[test]` and `#[bench]` put a constant of the function's name ahead of it.
         let flags = AttrFlags::query(db, func.into());
         let earlier = u32::from(flags.intersects(AttrFlags::IS_TEST | AttrFlags::IS_BENCH));
@@ -401,6 +406,37 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
         Some(())
     }
 
+    fn rustc_closure(
+        &mut self,
+        hasher: &mut StableSipHasher128,
+        id: InternedClosureId<'_>,
+        closure: InternedClosure<'_>,
+        args: GenericArgs<'db>,
+    ) -> Option<()> {
+        if self.ours {
+            return None;
+        }
+        let InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) = closure.owner else {
+            return None;
+        };
+        if self.owned.contains(&func.krate(self.db))
+            || args.has_regions()
+            || !args.as_closure().sig().bound_vars().is_empty()
+            || !matches!(
+                args.as_closure().tupled_upvars_ty().kind(),
+                TyKind::Tuple(fields) if fields.is_empty()
+            )
+        {
+            return None;
+        }
+        let mut path = self.body_path(func)?;
+        for number in self.symbols.closure_numbers(id)? {
+            path = path.child_at(DefPathData::Closure, number);
+        }
+        path.hash(hasher);
+        Some(())
+    }
+
     fn ty(&mut self, hasher: &mut StableSipHasher128, ty: Ty<'db>) -> Option<()> {
         let hashed = self.kind(hasher, ty);
         if hashed.is_none() && self.stuck.is_none() {
@@ -487,12 +523,23 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
             }
             TyKind::FnDef(def, args) => {
                 hasher.write_isize(13);
-                let CallableDefId::FunctionId(func) = def.0 else { return None };
                 // A lifetime of a function is mostly late bound, and then no argument to rustc.
                 if args.iter().any(|arg| matches!(arg.kind(), GenericArgKind::Lifetime(_))) {
                     return None;
                 }
-                self.function_path(func)?.hash(hasher);
+                let path = match def.0 {
+                    CallableDefId::FunctionId(func) => self.function_path(func)?,
+                    CallableDefId::StructId(it) => {
+                        self.adt_path(it.into())?.child(DefPathData::Ctor)
+                    }
+                    CallableDefId::EnumVariantId(it) => {
+                        let variant = it.lookup(self.db);
+                        let name = variant.name.as_str();
+                        let enum_ = self.adt_path(variant.parent.into())?;
+                        enum_.child(DefPathData::TypeNs(name)).child(DefPathData::Ctor)
+                    }
+                };
+                path.hash(hasher);
                 // The arguments are under a binder, which binds nothing.
                 self.binder(hasher, |this, hasher| {
                     this.args(args)?.hash(hasher);
@@ -501,9 +548,19 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
             }
             TyKind::Closure(id, args) => {
                 hasher.write_isize(17);
-                self.closure(hasher, id.0.loc(self.db))?;
-                let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
-                self.args(parent)?.hash(hasher);
+                let closure = id.0.loc(self.db);
+                let InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) = closure.owner
+                else {
+                    return None;
+                };
+                if self.owned.contains(&func.krate(self.db)) {
+                    self.closure(hasher, closure)?;
+                    let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
+                    self.args(parent)?.hash(hasher);
+                } else {
+                    self.rustc_closure(hasher, id.0, closure, args)?;
+                    self.args(args)?.hash(hasher);
+                }
             }
             TyKind::CoroutineClosure(id, args) => {
                 hasher.write_isize(18);
@@ -531,12 +588,7 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
                 self.signatures -= 1;
                 hashed?;
                 // `FnSigKind`'s flags: the ABI's index, then safe, then variadic.
-                let abi = match header.abi() {
-                    ExternAbi::C { unwind: false } => 0,
-                    ExternAbi::C { unwind: true } => 1,
-                    ExternAbi::Rust => 2,
-                    _ => return None,
-                };
+                let abi = header.abi().as_packed();
                 let safe = u8::from(header.safety().is_safe()) << 6;
                 let variadic = u8::from(header.c_variadic()) << 7;
                 hasher.write_u8(abi | safe | variadic);

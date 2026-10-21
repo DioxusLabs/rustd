@@ -1052,6 +1052,9 @@ impl Base {
         cg.phases.compile = verify;
         // What nothing reached any more can be reached again by the code compiled now.
         cg.replaced = unchanged;
+        for &test in roots.reports {
+            cg.define_report(test)?;
+        }
         // rustc's copies are the ones the base was built against: what they call is in it.
         for instance in &changed_instances {
             let was = &self.instances[instance];

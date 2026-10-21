@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ConstBlob, DataIdentity,
-    debuginfo::{FunctionDebug, LineRow, SlotPlaces, TypeSet},
+    debuginfo::{DebugType, FunctionDebug, LineRow, SlotPlaces, TypeList, TypeSet},
     fragment::Code,
     store::{KEY, Store},
     unwind::FunctionUnwind,
@@ -501,6 +501,12 @@ struct Known {
     types: FxHashMap<[u8; KEY], Option<TypeSet>>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct StoredTypeSet {
+    types: Vec<DebugType>,
+    links: Vec<[u8; KEY]>,
+}
+
 /// The sets of types that were given to the store, each when the first entry with a
 /// variable of the type was.
 #[derive(Default)]
@@ -512,13 +518,15 @@ pub(super) struct KeptTypes {
 impl KeptTypes {
     /// The key the set is in the store under, which is of nothing but what the set tells.
     pub(super) fn keep(&mut self, store: &Store, types: &TypeSet) -> [u8; KEY] {
-        let at = types.as_ptr() as usize;
+        let at = Arc::as_ptr(types) as usize;
         if let Some((_, key)) = self.keys.get(&at) {
             return *key;
         }
-        let bytes = postcard::to_allocvec(&**types).unwrap_or_default();
+        let links = types.links.iter().map(|it| self.keep(store, it)).collect();
+        let bytes = postcard::to_allocvec(&StoredTypeSet { types: types.types.clone(), links })
+            .unwrap_or_default();
         let mut hasher = Sha256::new();
-        hasher.update(b"rustd types 1");
+        hasher.update(b"rustd types 2");
         hasher.update(&bytes);
         let key = hasher.finalize().into();
         store.insert(&key, &bytes);
@@ -711,13 +719,39 @@ impl Entries {
     /// The set of types kept under `key`, which every entry with a variable of the type
     /// shares.
     fn types(&self, key: &[u8; KEY]) -> Option<TypeSet> {
+        self.types_at(key, 0, &mut FxHashSet::default())
+    }
+
+    fn types_at(
+        &self,
+        key: &[u8; KEY],
+        depth: u32,
+        visiting: &mut FxHashSet<[u8; KEY]>,
+    ) -> Option<TypeSet> {
+        if depth >= DebugType::DEEPEST {
+            return None;
+        }
         if let Some(known) = self.known().types.get(key) {
             return known.clone();
         }
-        let types = self.store.get(key).and_then(|it| postcard::from_bytes::<Vec<_>>(&it).ok());
-        let types = types.map(TypeSet::from);
-        self.known().types.insert(*key, types.clone());
-        types
+        if !visiting.insert(*key) {
+            return None;
+        }
+        let types = self
+            .store
+            .get(key)
+            .and_then(|it| postcard::from_bytes::<StoredTypeSet>(&it).ok())
+            .and_then(|stored| {
+                let links = stored
+                    .links
+                    .iter()
+                    .map(|key| self.types_at(key, depth + 1, visiting))
+                    .collect::<Option<_>>()?;
+                Some(TypeSet::new(TypeList { types: stored.types, links }))
+            });
+        visiting.remove(key);
+        let Some(types) = types else { return None };
+        self.known().types.entry(*key).or_insert_with(|| Some(types.clone())).clone()
     }
 
     fn settle(&self, name: Arc<str>, usable: bool) {
@@ -804,7 +838,7 @@ mod tests {
         super::{
             Resolved, Target,
             debuginfo::{
-                Aggregate, DebugContext, DebugType, Field, Place, Scope, VariableDebug,
+                Aggregate, DebugContext, DebugType, Field, Place, Scope, TypeList, VariableDebug,
                 VariablePlace,
             },
             fuzz,
@@ -867,7 +901,7 @@ mod tests {
         debug.files.push("src/lib.rs".to_owned());
         debug.declared = Some(Place { file: 0, line: 3, column: 1 });
         debug.rows.push((4, Place { file: 0, line: 4, column: 5 }));
-        debug.types = vec![types.into()];
+        debug.types = vec![TypeSet::new(TypeList { types, links: Vec::new() })];
         debug.scopes.push(Scope { parent: None, ranges: vec![(0, 8)] });
         debug.frame_base = vec![cranelift_codegen::gimli::DW_OP_reg6.0];
         debug.variables.push(VariableDebug {
@@ -1018,21 +1052,70 @@ mod tests {
     }
 
     /// The entry as it comes back from a store, which keeps its sets of types apart.
-    fn read_back(written: &Entry) -> Entry {
+    fn read_back(written: &Entry) -> Option<Entry> {
         let mut read = Entry::decode(&written.encode().unwrap()).unwrap();
         if let (Some(read), Some(written)) = (&mut read.debug, &written.debug) {
-            let stored = |it: &TypeSet| postcard::to_allocvec(&**it).unwrap();
-            let sets = written.types.iter().map(stored);
-            read.types =
-                sets.map(|it| postcard::from_bytes::<Vec<_>>(&it).unwrap().into()).collect();
+            fn keep(
+                types: &TypeSet,
+                stored: &mut FxHashMap<[u8; KEY], Vec<u8>>,
+                keys: &mut FxHashMap<usize, [u8; KEY]>,
+            ) -> [u8; KEY] {
+                let at = Arc::as_ptr(types) as usize;
+                if let Some(key) = keys.get(&at) {
+                    return *key;
+                }
+                let links = types.links.iter().map(|it| keep(it, stored, keys)).collect();
+                let bytes =
+                    postcard::to_allocvec(&StoredTypeSet { types: types.types.clone(), links })
+                        .unwrap();
+                let mut hasher = Sha256::new();
+                hasher.update(b"rustd types 2");
+                hasher.update(&bytes);
+                let key = hasher.finalize().into();
+                stored.insert(key, bytes);
+                keys.insert(at, key);
+                key
+            }
+
+            fn read_types(
+                key: &[u8; KEY],
+                stored: &FxHashMap<[u8; KEY], Vec<u8>>,
+                known: &mut FxHashMap<[u8; KEY], TypeSet>,
+                depth: u32,
+            ) -> Option<TypeSet> {
+                if depth >= DebugType::DEEPEST {
+                    return None;
+                }
+                if let Some(types) = known.get(key) {
+                    return Some(types.clone());
+                }
+                let StoredTypeSet { types, links } = postcard::from_bytes(stored.get(key)?).ok()?;
+                let links = links
+                    .iter()
+                    .map(|key| read_types(key, stored, known, depth + 1))
+                    .collect::<Option<_>>()?;
+                let types = TypeSet::new(TypeList { types, links });
+                known.insert(*key, types.clone());
+                Some(types)
+            }
+
+            let mut stored = FxHashMap::default();
+            let mut keys = FxHashMap::default();
+            let roots = written.types.iter().map(|it| keep(it, &mut stored, &mut keys));
+            let roots = roots.collect::<Vec<_>>();
+            let mut known = FxHashMap::default();
+            read.types = roots
+                .iter()
+                .map(|key| read_types(key, &stored, &mut known, 0))
+                .collect::<Option<_>>()?;
         }
-        read
+        Some(read)
     }
 
     #[test]
     fn an_entry_is_read_back_as_it_was_written() {
         let written = entry();
-        let read = read_back(&written);
+        let read = read_back(&written).unwrap();
         assert_eq!(read, written);
         follow(&read);
     }
@@ -1078,7 +1161,7 @@ mod tests {
     #[test]
     fn types_and_scopes_inside_too_many_others_are_read_and_end() {
         let deep = Entry { debug: Some(debug(nested(40_000))), ..entry() };
-        assert_eq!(read_back(&deep), deep);
+        assert_eq!(read_back(&deep).as_ref(), Some(&deep));
         let mut ring = debug(vec![DebugType::Array { of: 0, len: 2 }]);
         ring.scopes[0].parent = Some(0);
         let mut chain = debug(nested(6));
@@ -1086,12 +1169,41 @@ mod tests {
             .map(|at| Scope { parent: at.checked_sub(1), ranges: vec![(0, 8)] })
             .collect();
         chain.variables[0].scope = Some(39_999);
+        let mut linked = TypeSet::new(TypeList {
+            types: vec![DebugType::Base { name: "T".to_owned(), size: 4, encoding: 7 }],
+            links: Vec::new(),
+        });
+        for _ in 0..200 {
+            linked =
+                TypeSet::new(TypeList { types: vec![DebugType::Link(0)], links: vec![linked] });
+        }
+        let linked_entry = Entry { debug: Some(debug(vec![DebugType::Link(0)])), ..entry() };
+        let mut linked_entry = linked_entry;
+        linked_entry.debug.as_mut().unwrap().types[0] =
+            TypeSet::new(TypeList { types: vec![DebugType::Link(0)], links: vec![linked] });
+        assert!(read_back(&linked_entry).is_none());
         let isa = Target::selected().and_then(|it| it.isa("backtracking", false)).unwrap();
         // Only ELF and Mach-O have the tables.
         let Some(mut context) = DebugContext::new(&*isa, "/", true, None) else { return };
-        for (at, debug) in [deep.debug.unwrap(), ring, chain].iter().enumerate() {
+        for (at, debug) in
+            [deep.debug.unwrap(), ring, chain, linked_entry.debug.unwrap()].iter().enumerate()
+        {
             context.add_function(FuncId::from_u32(at as u32), 8, debug);
         }
+    }
+
+    #[test]
+    fn linked_types_round_trip_and_share_a_die() {
+        let shared = TypeSet::new(TypeList {
+            types: vec![DebugType::Base { name: "Shared".to_owned(), size: 4, encoding: 7 }],
+            links: Vec::new(),
+        });
+        let linked = || {
+            TypeSet::new(TypeList { types: vec![DebugType::Link(0)], links: vec![shared.clone()] })
+        };
+        let mut written = entry();
+        written.debug.as_mut().unwrap().types = vec![linked()];
+        assert_eq!(read_back(&written).unwrap(), written);
     }
 
     #[test]

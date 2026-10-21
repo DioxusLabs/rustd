@@ -156,3 +156,160 @@ mod reexports {
         }
     }
 }
+
+pub mod served {
+    use std::future::Future;
+
+    pub trait Serve {
+        fn serve(&self, step: u32) -> impl Future<Output = u32> + Send;
+    }
+
+    pub struct Auto;
+    pub struct Other;
+
+    pub struct Logged<T, K = Auto>(pub T, pub K);
+
+    impl<T: Sync> Serve for Logged<T, Auto> {
+        async fn serve(&self, step: u32) -> u32 {
+            crate::callsites::site!(step)
+        }
+    }
+
+    impl<T: Sync> Serve for Logged<T, Other> {
+        async fn serve(&self, step: u32) -> u32 {
+            crate::callsites::site!(step * 100)
+        }
+    }
+
+    /// rustc's own instance of the method, whose static rustd's shares.
+    pub fn served_by_rustc(step: u32) -> u32 {
+        crate::ready(Box::pin(Logged(0u8, Auto).serve(step)))
+    }
+}
+
+pub mod default_callsites {
+    pub trait DefaultCallsites {
+        fn visit(&self, first: bool, step: u32) -> u32 {
+            if first { crate::callsites::site!(step) } else { crate::callsites::site!(step * 100) }
+        }
+
+        async fn visit_async(&self, first: bool, step: u32) -> u32 {
+            if first { crate::callsites::site!(step) } else { crate::callsites::site!(step * 100) }
+        }
+    }
+
+    pub struct Rustc;
+
+    impl DefaultCallsites for Rustc {}
+
+    pub fn served_callsite(first: bool, step: u32) -> u32 {
+        Rustc.visit(first, step)
+    }
+
+    pub async fn served_async_callsite(first: bool, step: u32) -> u32 {
+        Rustc.visit_async(first, step).await
+    }
+}
+
+/// The output of a future that is ready the first time it is polled.
+pub fn ready(mut future: std::pin::Pin<Box<dyn Future<Output = u32> + Send + '_>>) -> u32 {
+    use std::task::{Context, Poll, Waker};
+    match future.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(it) => it,
+        Poll::Pending => unreachable!(),
+    }
+}
+
+/// Types rustc hashes for `TypeId`s asked for by code rustd compiles.
+pub mod typeids {
+    use std::any::{Any, TypeId};
+    use std::fmt::Debug;
+
+    pub enum Status {
+        Bad(u32),
+    }
+
+    fn id<A: Any>(_: &A) -> TypeId {
+        TypeId::of::<A>()
+    }
+
+    pub fn ok_id() -> TypeId {
+        id(&Ok::<u8, u16>)
+    }
+
+    pub fn bad_id() -> TypeId {
+        id(&Status::Bad)
+    }
+
+    pub trait Unpack {
+        /// A struct of a function declared in this body, whose `TypeId` only the caller asks for.
+        fn hidden(step: u32) -> impl Any + Debug {
+            fn error(step: u32) -> impl Any + Debug {
+                #[derive(Debug)]
+                struct Named(u32);
+
+                Named(step)
+            }
+            error(step)
+        }
+    }
+
+    pub mod closures {
+        use std::any::Any;
+
+        pub fn generic<T: Any>() -> impl Any {
+            let closure = || std::mem::size_of::<T>();
+            closure
+        }
+
+        pub fn second<T: Any>() -> impl Any {
+            let first = || 0usize;
+            let second = || std::mem::size_of::<T>();
+            let _ = first();
+            second
+        }
+
+        pub fn nested<T: Any>() -> impl Any {
+            let outer = || {
+                let inner = || std::mem::size_of::<T>();
+                inner
+            };
+            outer()
+        }
+
+        pub fn once<T: Any>() -> impl Any {
+            let closure = |()| std::mem::size_of::<T>();
+            let _ = Some(()).map(closure);
+            closure
+        }
+
+        pub fn mutable<T: Any>() -> impl Any {
+            let closure = |()| {
+                let _ = std::mem::size_of::<T>();
+            };
+            std::iter::once(()).for_each(closure);
+            closure
+        }
+
+        pub struct Factory<T>(std::marker::PhantomData<T>);
+
+        impl<T: Any> Factory<T> {
+            pub fn inherent() -> impl Any {
+                let closure = || std::mem::size_of::<T>();
+                closure
+            }
+        }
+
+        pub async fn asynchronous<T: Any>() -> impl Any {
+            let closure = || std::mem::size_of::<T>();
+            closure
+        }
+
+        pub fn capturing<T: Any>(value: T) -> impl Any {
+            move || {
+                let _ = &value;
+                std::mem::size_of::<T>()
+            }
+        }
+    }
+}
