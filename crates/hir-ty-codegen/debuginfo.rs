@@ -16,7 +16,7 @@ mod split;
 mod types;
 
 use codeview::CodeView;
-pub(super) use types::Types;
+pub(super) use types::{Descriptions, Types};
 
 use cranelift_codegen::{
     binemit::CodeOffset,
@@ -107,7 +107,7 @@ pub(super) type TypeSet = std::sync::Arc<TypeList>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct TypeList {
-    pub(super) types: Vec<DebugType>,
+    pub(super) types: std::sync::Arc<[DebugType]>,
     pub(super) links: Vec<TypeSet>,
 }
 
@@ -1553,11 +1553,14 @@ mod tests {
         let isa =
             super::super::Target::selected().and_then(|it| it.isa("backtracking", false)).unwrap();
         let shared = TypeSet::new(TypeList {
-            types: vec![DebugType::Base { name: "Shared".to_owned(), size: 4, encoding: 7 }],
+            types: vec![DebugType::Base { name: "Shared".to_owned(), size: 4, encoding: 7 }].into(),
             links: Vec::new(),
         });
         let linked = || {
-            TypeSet::new(TypeList { types: vec![DebugType::Link(0)], links: vec![shared.clone()] })
+            TypeSet::new(TypeList {
+                types: vec![DebugType::Link(0)].into(),
+                links: vec![shared.clone()],
+            })
         };
         let mut dwarf = Dwarf::new(&*isa, "/", true, None);
 

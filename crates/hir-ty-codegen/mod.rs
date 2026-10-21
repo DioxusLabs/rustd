@@ -2302,6 +2302,7 @@ struct ToldTypes(
     std::sync::Arc<
         std::sync::Mutex<FxHashMap<(StoredParamEnvAndCrate, StoredTy), Option<debuginfo::TypeSet>>>,
     >,
+    std::sync::Arc<debuginfo::Descriptions>,
 );
 
 /// The types a thread tells of itself, by the environment they are in.
@@ -2319,8 +2320,9 @@ impl ToldTypes {
         if let Some(told) = self.0.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
             return told.clone();
         }
-        let types =
-            own.entry(env.clone()).or_insert_with(|| debuginfo::Types::new(db, env.as_ref(db)));
+        let types = own
+            .entry(env.clone())
+            .or_insert_with(|| debuginfo::Types::new(db, env.as_ref(db), self.1.clone()));
         let told = types.describe(ty.as_ref());
         // Another thread may have told of it meanwhile, and the functions share one set.
         self.0.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_insert(told).clone()

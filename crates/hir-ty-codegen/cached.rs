@@ -523,7 +523,7 @@ impl KeptTypes {
             return *key;
         }
         let links = types.links.iter().map(|it| self.keep(store, it)).collect();
-        let bytes = postcard::to_allocvec(&StoredTypeSet { types: types.types.clone(), links })
+        let bytes = postcard::to_allocvec(&StoredTypeSet { types: types.types.to_vec(), links })
             .unwrap_or_default();
         let mut hasher = Sha256::new();
         hasher.update(b"rustd types 2");
@@ -751,7 +751,7 @@ impl Entries {
                     .iter()
                     .map(|key| self.types_at(key, depth + 1, visiting))
                     .collect::<Option<_>>()?;
-                Some(TypeSet::new(TypeList { types: stored.types, links }))
+                Some(TypeSet::new(TypeList { types: stored.types.into(), links }))
             });
         visiting.remove(key);
         let Some(types) = types else { return None };
@@ -976,7 +976,7 @@ mod tests {
         debug.files.push("src/lib.rs".to_owned());
         debug.declared = Some(Place { file: 0, line: 3, column: 1 });
         debug.rows.push((4, Place { file: 0, line: 4, column: 5 }));
-        debug.types = vec![TypeSet::new(TypeList { types, links: Vec::new() })];
+        debug.types = vec![TypeSet::new(TypeList { types: types.into(), links: Vec::new() })];
         debug.scopes.push(Scope { parent: None, ranges: vec![(0, 8)] });
         debug.frame_base = vec![cranelift_codegen::gimli::DW_OP_reg6.0];
         debug.variables.push(VariableDebug {
@@ -1141,7 +1141,7 @@ mod tests {
                 }
                 let links = types.links.iter().map(|it| keep(it, stored, keys)).collect();
                 let bytes =
-                    postcard::to_allocvec(&StoredTypeSet { types: types.types.clone(), links })
+                    postcard::to_allocvec(&StoredTypeSet { types: types.types.to_vec(), links })
                         .unwrap();
                 let mut hasher = Sha256::new();
                 hasher.update(b"rustd types 2");
@@ -1169,7 +1169,7 @@ mod tests {
                     .iter()
                     .map(|key| read_types(key, stored, known, depth + 1))
                     .collect::<Option<_>>()?;
-                let types = TypeSet::new(TypeList { types, links });
+                let types = TypeSet::new(TypeList { types: types.into(), links });
                 known.insert(*key, types.clone());
                 Some(types)
             }
@@ -1245,17 +1245,19 @@ mod tests {
             .collect();
         chain.variables[0].scope = Some(39_999);
         let mut linked = TypeSet::new(TypeList {
-            types: vec![DebugType::Base { name: "T".to_owned(), size: 4, encoding: 7 }],
+            types: vec![DebugType::Base { name: "T".to_owned(), size: 4, encoding: 7 }].into(),
             links: Vec::new(),
         });
         for _ in 0..200 {
-            linked =
-                TypeSet::new(TypeList { types: vec![DebugType::Link(0)], links: vec![linked] });
+            linked = TypeSet::new(TypeList {
+                types: vec![DebugType::Link(0)].into(),
+                links: vec![linked],
+            });
         }
         let linked_entry = Entry { debug: Some(debug(vec![DebugType::Link(0)])), ..entry() };
         let mut linked_entry = linked_entry;
         linked_entry.debug.as_mut().unwrap().types[0] =
-            TypeSet::new(TypeList { types: vec![DebugType::Link(0)], links: vec![linked] });
+            TypeSet::new(TypeList { types: vec![DebugType::Link(0)].into(), links: vec![linked] });
         assert!(read_back(&linked_entry).is_none());
         let isa = Target::selected().and_then(|it| it.isa("backtracking", false)).unwrap();
         // Only ELF and Mach-O have the tables.
@@ -1270,11 +1272,14 @@ mod tests {
     #[test]
     fn linked_types_round_trip_and_share_a_die() {
         let shared = TypeSet::new(TypeList {
-            types: vec![DebugType::Base { name: "Shared".to_owned(), size: 4, encoding: 7 }],
+            types: vec![DebugType::Base { name: "Shared".to_owned(), size: 4, encoding: 7 }].into(),
             links: Vec::new(),
         });
         let linked = || {
-            TypeSet::new(TypeList { types: vec![DebugType::Link(0)], links: vec![shared.clone()] })
+            TypeSet::new(TypeList {
+                types: vec![DebugType::Link(0)].into(),
+                links: vec![shared.clone()],
+            })
         };
         let mut written = entry();
         written.debug.as_mut().unwrap().types = vec![linked()];
