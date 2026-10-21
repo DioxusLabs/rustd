@@ -739,6 +739,32 @@ impl State {
         let picked = asked.flags.selects_targets || !asked.positional.is_empty();
         let tested_libraries =
             if picked && !asked.flags.doc { Vec::new() } else { tested_libraries };
+        if asked.subcommand == Subcommand::Test && (!picked || asked.flags.doc) {
+            let named = |names: &[String], package: &Package| {
+                names.iter().any(|it| it.split('@').next() == Some(package.name.as_str()))
+            };
+            for package in metadata.workspace_packages() {
+                let selected = if asked.flags.workspace {
+                    true
+                } else if !asked.flags.packages.is_empty() {
+                    named(&asked.flags.packages, package)
+                } else if project == root {
+                    metadata.workspace_default_members.contains(&package.id)
+                } else {
+                    package_dir(package) == project
+                };
+                let disabled =
+                    package.targets.iter().any(|it| it.is_lib() && it.doctest && !it.test);
+                let planned = tested_libraries.iter().any(|(it, ..)| it.id == package.id);
+                if selected && !named(&asked.flags.excludes, package) && disabled && !planned {
+                    state.unrun_doc_tests.push(format!(
+                        "the doc tests of `{}` are not run: its library has `test = false`; \
+                         run them separately with `cargo rustd test -p {} --doc`",
+                        package.name, package.name
+                    ));
+                }
+            }
+        }
         for (package, unit, executable, artifact) in tested_libraries {
             if !artifact.target.doctest {
                 continue;

@@ -698,6 +698,18 @@ def flags(work):
     rewrite(os.path.join(ws, "app/src/main.rs"), ".len(), 7)", ".len(), 8)")
     rewrite(os.path.join(ws, "app/tests/it.rs"), '"hello it"', '"hello it!"')
     round_of("edit")
+    manifest = os.path.join(ws, "util/Cargo.toml")
+    rewrite(manifest, "[features]", "[lib]\ntest = false\n\n[features]")
+    _, refused = ours.cargo("test", "-p", "util")
+    if refused.returncode == 0 or "its library has `test = false`" not in refused.stderr:
+        wrong.append("flags: omitted doc tests of a library with test = false were not refused")
+    for args in (["-p", "util", "--doc"], ["-p", "util", "--tests"], ["--workspace", "--exclude", "util"]):
+        (_, mine), (_, other) = ours.cargo("test", *args), theirs.cargo("test", *args)
+        differs = difference(test_results(mine), test_results(other))
+        rows.append(("docs", "cargo rustd test " + " ".join(args), how_built(mine.stderr), mine.returncode, differs or "same"))
+        if differs:
+            wrong.append(f"flags: library with test = false: {args}: {differs}")
+    rewrite(manifest, "[lib]\ntest = false\n\n[features]", "[features]")
     tested = []
     for path in pathlib.Path(ws, "target").rglob("record.json"):
         record = json.load(open(path))
