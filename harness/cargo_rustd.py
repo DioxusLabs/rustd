@@ -677,6 +677,9 @@ def flags(work):
     env = base_env(os.path.join(work, "home-flags"))
     ours, theirs = Side(ws, env, True), Side(ws, env, False)
     rows, wrong = selected_member_tests(work)
+    patched_rows, patched_wrong = first_edit_patches(work)
+    rows.extend(patched_rows)
+    wrong.extend(patched_wrong)
 
     def round_of(label):
         for command, args, extra in FLAG_CASES:
@@ -762,6 +765,58 @@ def selected_member_tests(work):
     finally:
         ours.cargo("stop")
         daemon.wait(timeout=30)
+    return rows, wrong
+
+
+def first_edit_patches(work):
+    """Every test program keeps a patchable baseline, including code shared through the store."""
+    ws = os.path.realpath(os.path.join(work, "first-patch"))
+    files = {
+        "Cargo.toml": '[package]\nname = "first-patch"\nversion = "0.1.0"\nedition = "2021"\n\n[profile.dev]\noverflow-checks = false\n\n[profile.test]\noverflow-checks = false\n',
+        "src/lib.rs": 'pub struct Number(i32);\n/// ```\n/// assert_eq!(first_patch::value(), 7);\n/// ```\npub fn value() -> i32 { vec![Number(7)].into_iter().map(|n| n.0).sum() }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn unit() { assert_eq!(super::value(), 7); }\n}\n',
+        "tests/one.rs": '#[test]\nfn one() { assert_eq!(first_patch::value(), 7); }\n',
+        "tests/two.rs": '#[test]\nfn two() { assert_eq!(first_patch::value(), 7); }\n',
+    }
+    for file, text in files.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
+        open(os.path.join(ws, file), "w").write(text)
+    home = os.path.join(work, "home-first-patch")
+    env = base_env(home)
+    # Seal even this small fixture so later programs can hydrate its checkout code.
+    env["RUSTD_CACHE_SEAL_AT"] = "1"
+    ours, theirs = Side(ws, env, True), Side(ws, env, False)
+    rows, wrong = [], []
+    try:
+        for label in ("cold", "edit"):
+            if label == "edit":
+                _, status = ours.cargo("status")
+                logs = re.findall(r"^  worker: .*?, log (.+)$", status.stdout, re.M)
+                offsets = {path: os.path.getsize(path) for path in logs}
+                rewrite(os.path.join(ws, "src/lib.rs"), "{ vec![Number(7)]", "{ let _ = 0; vec![Number(7)]")
+            _, mine = ours.cargo("test")
+            _, other = theirs.cargo("test")
+            differs = difference(test_results(mine), test_results(other))
+            how = how_built(mine.stderr)
+            if mine.returncode or other.returncode or by_cargo(how) or not test_results(mine)[1]:
+                differs = "; ".join(filter(None, [differs, "test failure, Cargo fallback or no tests"]))
+            if label == "edit":
+                if len(logs) != 2:
+                    differs = "; ".join(filter(None, [differs, f"expected two workers, got {len(logs)}"]))
+                for path in logs:
+                    with open(path, errors="replace") as log:
+                        log.seek(offsets[path])
+                        added = log.read()
+                    counts = [len(re.findall(pattern, added, re.M)) for pattern in (r"^edit \(", r"^patch: ", r"^link: .*\(spliced:")]
+                    if counts != [2, 2, 2] or "not spliced:" in added:
+                        differs = "; ".join(filter(None, [differs, f"{path}: builds/patches/splices {counts}\n{added}"]))
+            shown = "cargo rustd test (two integration tests, lib unit tests and doctests)"
+            same = "same; every first edit patched and spliced" if label == "edit" else "same"
+            rows.append((label, shown, how, mine.returncode, differs or same))
+            print(f"  {label:6} {shown}  exit {mine.returncode}  {differs or rows[-1][-1]}", flush=True)
+            if differs:
+                wrong.append(f"{label}: {shown}: {differs}\n{mine.stderr[-1000:]}")
+    finally:
+        ours.cargo("stop")
     return rows, wrong
 
 
