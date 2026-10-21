@@ -115,7 +115,9 @@ def main():
                    or any(t["name"].replace("-", "_") == crate for t in p["targets"]))
     # The test targets as cargo sees them: one may be named otherwise than its file, or be a
     # directory.
-    tests = sorted((t["name"], t["src_path"]) for t in package["targets"] if "test" in t["kind"])
+    # A published package may list a test whose file it left out; cargo cannot build that one.
+    tests = sorted((t["name"], t["src_path"]) for t in package["targets"]
+                   if "test" in t["kind"] and os.path.exists(t["src_path"]))
     lib_target = next((t for t in package["targets"] if "lib" in t["kind"]), None)
     lib = lib_target and lib_target["src_path"]
     if lib_target and not a.crate:

@@ -47,6 +47,7 @@ cases![
     simd_sums,
     variant_alias,
     two_bitflags,
+    ctor_namesakes,
     extern_static,
     raw_through_deref,
     dyn_lifetime,

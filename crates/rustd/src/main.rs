@@ -403,10 +403,10 @@ impl Resolver<'_> {
         // not known to be this one when a body has two of the path. One of a crate rustc
         // built nothing of is named by where it is written as well.
         let krate = hir_def::HasModule::krate(&func, self.db);
-        if self.rustc_built(krate) && self.shares_path(func) {
-            return None;
-        }
         let path = self.path(func)?;
+        if self.rustc_built(krate) && self.shares_path(func) {
+            return self.namesake_symbol(func, &path);
+        }
         // A test is the second of its name where it is written: rustc puts the constant
         // that describes it to the harness before it, under the same name.
         let function = hir::Function::from(func);
@@ -432,6 +432,37 @@ impl Resolver<'_> {
         }
         let place = hir_ty::mir::codegen::block_place(self.db, self, func)?;
         Some(format!("rustd.{id:x}.{path}.{:x}", short_hash(&place)))
+    }
+
+    /// The symbol of a function written in a body that another there has the path of. rustc
+    /// tells them apart by the function's place among those of its name in what it is
+    /// written in, and by the places of the constants and statics around it.
+    fn namesake_symbol(&self, func: FunctionId, path: &str) -> Option<String> {
+        let function = hir::Function::from(func);
+        if function.as_assoc_item(self.db).is_some() {
+            return None;
+        }
+        let sema = hir::Semantics::new(self.db);
+        let source = sema.source(function)?;
+        let name = function.name(self.db);
+        let named = |node: &SyntaxNode| {
+            ast::Fn::cast(node.clone())
+                .and_then(|it| it.name())
+                .is_some_and(|it| it.text() == name.as_str())
+        };
+        let place = place_in_definition(&sema, source.value.syntax(), &named)?;
+        let mut around = Vec::new();
+        for node in sema.ancestors_with_macros(source.value.syntax().clone()).skip(1) {
+            if ast::Fn::can_cast(node.kind()) || ast::Module::can_cast(node.kind()) {
+                break;
+            }
+            if let Some(name) = value_item_name(&node) {
+                let named = |other: &SyntaxNode| value_item_name(other).as_ref() == Some(&name);
+                around.push(place_in_definition(&sema, &node, &named)?.into());
+            }
+        }
+        around.reverse();
+        self.table.get_at(path, place.into(), &around).map(str::to_owned)
     }
 
     /// Whether the function, or the `impl` it is in, takes types or constants.
@@ -1024,33 +1055,20 @@ impl Resolver<'_> {
                 owner = Some((self.path(func)?, func));
                 break;
             }
-            let name = match_ast! {
-                match node {
-                    ast::Const(it) => it.name(),
-                    ast::Static(it) => it.name(),
-                    _ => None,
-                }
-            };
-            if let Some(name) = name {
-                let named = |other: &SyntaxNode| {
-                    let other = match_ast! {
-                        match other {
-                            ast::Const(it) => it.name(),
-                            ast::Static(it) => it.name(),
-                            _ => None,
-                        }
-                    };
-                    other.is_some_and(|it| it.text() == name.text())
-                };
+            if let Some(name) = value_item_name(&node) {
+                let named = |other: &SyntaxNode| value_item_name(other).as_ref() == Some(&name);
                 around.push(place_in_definition(&sema, &node, &named)?.into());
-                names.push(name.text().to_string());
+                names.push(name);
             }
         }
         let (path_of_owner, owner) = match owner {
             Some((path, func)) => (path, Some(func)),
             None => {
-                around.pop();
                 let outer = names.pop()?;
+                // The names of a module are its own, but for those of unnamed constants.
+                if outer != "_" {
+                    around.pop();
+                }
                 (self.item_path(module.nearest_non_block_module(self.db), &outer)?, None)
             }
         };
@@ -1107,6 +1125,21 @@ fn is_cfg_enabled(node: &SyntaxNode, cfg: &cfg::CfgOptions) -> bool {
         },
     );
     off.is_none()
+}
+
+/// The name of a constant or static, `_` for an unnamed constant: what rustc numbers the
+/// items of one name in a definition by.
+fn value_item_name(node: &SyntaxNode) -> Option<String> {
+    match_ast! {
+        match node {
+            ast::Const(it) => match it.name() {
+                Some(name) => Some(name.text().to_owned()),
+                None => it.underscore_token().map(|_| "_".to_owned()),
+            },
+            ast::Static(it) => it.name().map(|it| it.text().to_owned()),
+            _ => None,
+        }
+    }
 }
 
 fn is_definition(node: &SyntaxNode) -> bool {
@@ -1235,6 +1268,16 @@ fn module_is_expanded(sema: &hir::Semantics<'_, RootDatabase>, node: &SyntaxNode
     false
 }
 
+/// A macro used in a definition.
+enum Call {
+    /// `name!(..)`, which its expansion replaces.
+    Bang(ast::MacroCall),
+    /// An attribute that the item it is on is replaced by the expansion of.
+    Attr(ast::Item),
+    /// A `#[derive(..)]`, whose expansions go beside the item.
+    Derive(ast::Meta),
+}
+
 /// When rustc expands a macro used in a definition.
 enum Turn {
     /// As it comes to it.
@@ -1265,10 +1308,23 @@ impl Count<'_, '_> {
         let mut calls = Vec::new();
         self.written_in(node, &mut calls);
         for call in calls {
-            match self.turn(&call) {
-                Some(Turn::Now) => self.expansion_of(&call)?,
-                Some(Turn::Later) => self.waiting.push(call),
-                None => self.nothing_in(&call)?,
+            match call {
+                Call::Bang(call) => match self.turn(&call) {
+                    Some(Turn::Now) => self.expansion_of(&call)?,
+                    Some(Turn::Later) => self.waiting.push(call),
+                    None => self.nothing_in(&call)?,
+                },
+                Call::Attr(item) => {
+                    if let Some(expansion) = self.sema.expand_attr_macro(&item) {
+                        self.all_in(&expansion.value.value)?;
+                    }
+                }
+                Call::Derive(meta) => {
+                    let expansions = self.sema.expand_derive_macro(&meta).unwrap_or_default();
+                    for expansion in expansions.into_iter().flatten() {
+                        self.all_in(&expansion.value)?;
+                    }
+                }
             }
         }
         Some(())
@@ -1290,16 +1346,29 @@ impl Count<'_, '_> {
     }
 
     /// As `all_in`, of what is not in a macro: `calls` gets the macros come across.
-    fn written_in(&mut self, node: &SyntaxNode, calls: &mut Vec<ast::MacroCall>) {
+    fn written_in(&mut self, node: &SyntaxNode, calls: &mut Vec<Call>) {
         for child in node.children() {
             if self.cfg.is_some_and(|cfg| !is_cfg_enabled(&child, cfg)) {
                 continue;
             }
             if let Some(call) = ast::MacroCall::cast(child.clone()) {
-                calls.push(call);
+                calls.push(Call::Bang(call));
                 continue;
             }
             let target = child == *self.target;
+            if let Some(item) = ast::Item::cast(child.clone())
+                && !target
+                && self.sema.expand_attr_macro(&item).is_some()
+            {
+                calls.push(Call::Attr(item));
+                continue;
+            }
+            if let Some(adt) = ast::Adt::cast(child.clone()) {
+                let derives = ast::HasAttrs::attrs(&adt)
+                    .filter(|it| it.simple_name().is_some_and(|it| it == "derive"))
+                    .filter_map(|it| it.meta());
+                calls.extend(derives.map(Call::Derive));
+            }
             if target {
                 self.earlier = Some(self.seen);
             }
