@@ -48,6 +48,7 @@ cases![
     variant_alias,
     two_bitflags,
     ctor_namesakes,
+    tail_frames,
     extern_static,
     raw_through_deref,
     dyn_lifetime,
