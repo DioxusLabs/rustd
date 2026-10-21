@@ -28,6 +28,34 @@ The second round added four things, each with its own section: two more LLVM con
 in every run ("The long runs"), scenes in the generator ("Scenes"), generated edits
 ("Generated edits") and AArch64 ("AArch64 under qemu").
 
+## Where this stands
+
+Most of this report is the record of the two rounds that built the fuzzer. Since then it has
+been in CI:
+
+- On every pull request, `harness/ci.sh` runs `fuzz.py smoke` and `edits.py smoke` (two
+  generated programs, 477 functions, and one program of generated edits), then `fuzz.py check`
+  and `edits.py check`, which build every kept reduction in `harness/fuzz/found/` again and fail
+  if one differs from rustc's. A fixed finding that comes back fails the check.
+- Every night at 03:00 UTC, `.github/workflows/fuzz.yaml` runs 400 new programs under Cranelift
+  and LLVM (the seed is the run number) and then 40 programs of generated edits.
+  - The night of 2026-10-20 failed under LLVM. The cause was a miscompile: an `Option<i128>`
+    argument that finds one register left was placed one way by LLVM and another by Cranelift.
+    It was fixed in #8; the breaker case is `wide_int_last_register`.
+  - The night of 2026-10-21, on main after #8: 400 programs, 147,009 functions compiled by
+    rustd under each backend, no difference, no crash, nothing left to rustc. The edits: 40
+    programs, 400 edits, no finding. The run took 1h31m.
+
+On the head of #10, under both backends: the smoke runs found nothing, `fuzz.py check` gave
+80 of 80 rows the same (40 reductions, two backends), `edits.py check` 18 of 18, and
+`breakers.py` 162 of 162 right with 9 open, before `frame_of_temporaries` was added (it passes
+under both).
+
+Still open from the findings below: finding 3, the text of a failed `assert!` whose condition
+rustc breaks over lines (`assert_message`, `assert_long_expression`). It changes what a failing
+assertion prints, not what a program computes, and matching it needs rustc's pretty printer.
+The section "Open, and not done" at the end is as it stood after the second round.
+
 ## Result
 
 The fuzzer found twenty-one distinct problems in whole builds. Eighteen are fixed in rustd, two
