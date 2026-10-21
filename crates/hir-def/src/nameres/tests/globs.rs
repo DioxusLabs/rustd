@@ -1,6 +1,37 @@
 use super::*;
 
 #[test]
+fn explicit_reexport_upgrades_glob_visibility() {
+    check(
+        r#"
+//- /main/lib.rs crate:main deps:dep
+use dep::{Issue, Hidden};
+
+//- /dep/lib.rs crate:dep
+pub use reexports::Issue;
+pub(crate) use reexports::Hidden;
+
+mod reexports {
+    pub use items::Issue;
+    pub(crate) use items::*;
+    mod items {
+        pub use super::defs::*;
+    }
+    mod defs {
+        pub struct Issue { pub value: u32 }
+        pub struct Hidden;
+    }
+}
+"#,
+        expect![[r#"
+            crate
+            - Hidden : _
+            - Issue : type (import)
+        "#]],
+    );
+}
+
+#[test]
 fn glob_1() {
     check(
         r#"
