@@ -179,4 +179,5 @@ cases![
     moved_bits_unread,
     const_location,
     let_into_binding,
+    forwarded_async_trait,
 ];

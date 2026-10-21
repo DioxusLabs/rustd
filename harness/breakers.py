@@ -12,7 +12,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from difftest import Fixture, RUNNER
 
-CRATES = ["devdep", "blanket", "edition2015", "fragment", "procmacro"]
+CRATES = ["devdep", "blanket", "edition2015", "fragment", "procmacro", "async_solver_depth"]
 # What is reduced and not fixed: these are expected to differ, and are told apart when they do.
 OPEN = {"assert_message", "raw_write_then_match", "future_unwind_flags", "fragment_edition_through_macro", "assert_long_expression"}
 # What is reduced and not fixed either, where rustd says so: a function of these is left to rustc.
