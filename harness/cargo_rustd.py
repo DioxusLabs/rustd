@@ -834,7 +834,7 @@ INCREMENTAL_LIB = """use std::sync::atomic::{AtomicUsize, Ordering};
 static HITS: AtomicUsize = AtomicUsize::new(0);
 pub fn a() -> u32 { A }
 pub fn b() -> u32 { 2 }
-pub fn hit() -> usize { HITS.fetch_add(1, Ordering::SeqCst) + 1 }
+pub fn hit() -> usize { HITS.fetch_add(1, Ordering::SeqCst).wrapping_add(1) }
 const A: u32 = 1;
 #[cfg(test)]
 mod tests {
@@ -882,7 +882,7 @@ def incremental(work):
     edited = INCREMENTAL_LIB.replace("{ A }", "{ A.min(5) }")
     open(lib, "w").write(edited)
     check("an edit runs the test that reaches it", [it for it in every if it != "ta"])
-    open(lib, "w").write(edited.replace("+ 1 }", "+ 2 }"))
+    open(lib, "w").write(edited.replace("wrapping_add(1)", "wrapping_add(2)"))
     check("an edit of what writes a static runs the tests that reach it", ["abort", "sleep", "ta", "tb", "tp"])
     check("--rerun-all runs every test", [], "--rerun-all")
     check("RUSTD_TEST_CACHE=0 runs every test", [], env={"RUSTD_TEST_CACHE": "0"})
@@ -901,6 +901,267 @@ def incremental(work):
     checks.append(("incremental: a test that aborts is listed among the failures", held, ""))
     side.cargo("stop")
     return checks
+
+
+def workspace_workers(work, check):
+    """Package roots of one workspace share a worker without unifying their crate graphs."""
+    ws = os.path.realpath(os.path.join(work, "worker-per-workspace"))
+    files = {
+        "Cargo.toml": '[workspace]\nmembers = ["a", "b", "shared", "threaded"]\nresolver = "2"\n',
+        "shared/Cargo.toml": '[package]\nname = "shared"\nversion = "0.1.0"\nedition = "2021"\n\n[features]\ndefault = ["defaulted"]\ndefaulted = []\nextra = []\n\n[dependencies]\nitoa = "1"\n',
+        "shared/src/lib.rs": 'pub fn defaulted() -> bool { cfg!(feature = "defaulted") }\npub fn extra() -> bool { cfg!(feature = "extra") }\npub fn format(value: u32) -> String { let mut buffer = itoa::Buffer::new(); buffer.format(value).to_owned() }\n',
+        "a/Cargo.toml": '[package]\nname = "a"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\ndoctest = false\n\n[[bin]]\nname = "a"\npath = "src/main.rs"\ntest = false\n\n[dependencies]\nshared = { path = "../shared" }\n',
+        "a/src/lib.rs": 'mod edit;\n\npub fn edited_value() -> u32 { edit::value() }\n\n#[test]\nfn selected_features() {\n    assert!(shared::defaulted());\n    assert!(!shared::extra());\n    assert_eq!(shared::format(12), "12");\n    assert_eq!(edited_value(), 0);\n}\n',
+        "a/src/edit.rs": "pub fn value() -> u32 { 0 }\n",
+        "a/src/main.rs": "fn main() { let _ = a::edited_value(); }\n",
+        "b/Cargo.toml": '[package]\nname = "b"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\ndoctest = false\n\n[dependencies]\nshared = { path = "../shared", default-features = false, features = ["extra"] }\n',
+        "b/src/lib.rs": '#[test]\nfn selected_features() {\n    assert!(!shared::defaulted());\n    assert!(shared::extra());\n    assert_eq!(shared::format(12), "12");\n}\n',
+        "threaded/Cargo.toml": '[package]\nname = "threaded"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\ncrossbeam-channel = { version = "0.5.15", default-features = false, features = ["std"] }\n\n[dev-dependencies]\ncrossbeam-channel = { version = "0.5.15", default-features = false, features = ["std"] }\ncrossbeam-utils = { version = "0.8", default-features = false, features = ["nightly"] }\n',
+        "threaded/src/lib.rs": '#[cfg(test)]\n#[inline]\npub fn render() -> bool {\n    let (_sender, receiver) = crossbeam_channel::unbounded::<u8>();\n    matches!(\n        receiver.recv_timeout(std::time::Duration::from_millis(1)),\n        Err(crossbeam_channel::RecvTimeoutError::Timeout),\n    )\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn thread_local_from_registry_inline_generic() {\n        assert!(super::render());\n    }\n}\n',
+    }
+    for file, text in files.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
+        open(os.path.join(ws, file), "w").write(text)
+    env = base_env(os.path.join(work, "home-worker-per-workspace"))
+    env["RUSTD_STATS"] = "1"
+    ours, theirs = Side(ws, env, True), Side(ws, env, False)
+    commands = [
+        ("test -p a", "test", ["-p", "a", "--no-fail-fast"]),
+        ("test -p b", "test", ["-p", "b", "--no-fail-fast"]),
+        ("build", "build", []),
+        ("test -p a again", "test", ["-p", "a", "--no-fail-fast"]),
+    ]
+    served = []
+    for label, command, args in commands:
+        _, mine = ours.cargo(command, *args)
+        _, other = theirs.cargo(command, *args)
+        same = test_results(mine) == test_results(other) if command == "test" else mine.returncode == other.returncode
+        how = how_built(mine.stderr)
+        served.append(how == "daemon")
+        check(f"{label} matches cargo and is daemon-served", same and how == "daemon", f"{how}; exit {mine.returncode}")
+
+    _, warm_build = ours.cargo("build", "-p", "a")
+    _, warm_reference = theirs.cargo("build", "-p", "a")
+    warm_how = how_built(warm_build.stderr)
+    served.append(warm_how == "daemon")
+    check("build -p a matches cargo and is daemon-served", warm_build.returncode == warm_reference.returncode and warm_how == "daemon", f"{warm_how}; exit {warm_build.returncode}")
+
+    before_status = ours.cargo("status")[1].stdout
+    before_workers = re.findall(r"^  worker: pid (\d+), .*?, log (.*)$", before_status, re.M)
+    before_log_size = os.path.getsize(before_workers[0][1]) if before_workers else 0
+    source = os.path.join(ws, "a/src/edit.rs")
+    original = rewrite(source, "pub fn value() -> u32 { 0 }", "pub fn value() -> u32 { 1 }")
+    _, mine = ours.cargo("build", "-p", "a")
+    _, other = theirs.cargo("build", "-p", "a")
+    status = ours.cargo("status")[1].stdout
+    workers = re.findall(r"^  worker: pid (\d+), .*?, log (.*)$", status, re.M)
+    worker_log_bytes = open(workers[0][1], "rb").read() if workers else b""
+    worker_log = worker_log_bytes.decode(errors="replace")
+    joined = re.findall(r"^join: .*: crates \d+ -> \d+$", worker_log, re.M)
+    new_log = (worker_log_bytes[before_log_size:] if len(worker_log_bytes) >= before_log_size else worker_log_bytes).decode(errors="replace")
+    edits = [int(functions) for functions in re.findall(r"^patch: (\d+) functions$", new_log, re.M)]
+    with open(source, "w") as changed:
+        changed.write(original)
+
+    edit_functions = edits
+    snapshots = []
+    log_lines = worker_log.splitlines()
+    for index, line in enumerate(log_lines):
+        if not line.startswith("crate graph snapshot:"):
+            continue
+        rows = []
+        for row in log_lines[index + 1:]:
+            if not row.startswith("crate graph: "):
+                break
+            rows.append(json.loads(row.removeprefix("crate graph: ")))
+        snapshots.append(rows)
+    graph = next(
+        (
+            rows
+            for rows in snapshots
+            if len({row["id"] for row in rows}) == len(rows)
+            and any(row["name"] == "a" and row["root"].endswith("/a/src/lib.rs") and '"test"' in row["cfg"] for row in rows)
+            and any(row["name"] == "b" and row["root"].endswith("/b/src/lib.rs") and '"test"' in row["cfg"] for row in rows)
+            and any(row["name"] == "shared" and "feature=defaulted" in row["cfg"] for row in rows)
+            and any(row["name"] == "shared" and "feature=extra" in row["cfg"] for row in rows)
+        ),
+        [],
+    )
+    graph_by_id = {row["id"]: row for row in graph}
+
+    def reachable(root):
+        found, pending = set(), [root["id"]]
+        while pending:
+            crate = pending.pop()
+            if crate not in found:
+                found.add(crate)
+                pending.extend(graph_by_id[crate]["dependencies"])
+        return found
+
+    def test_root(name, feature):
+        return next(
+            (
+                row
+                for row in graph
+                if row["name"] == name
+                and row["root"].endswith(f"/{name}/src/lib.rs")
+                and '"test"' in row["cfg"]
+                and any(
+                    graph_by_id[crate]["name"] == "shared"
+                    and "feature=" + feature in graph_by_id[crate]["cfg"]
+                    for crate in reachable(row)
+                )
+            ),
+            None,
+        )
+
+    test_a = test_root("a", "defaulted")
+    test_b = test_root("b", "extra")
+    selected_crates = (
+        reachable(test_a) | reachable(test_b)
+        if test_a is not None and test_b is not None
+        else set()
+    )
+    shared = [
+        row
+        for row in graph
+        if row["id"] in selected_crates
+        and row["name"] == "shared"
+        and row["root"].endswith("/shared/src/lib.rs")
+    ]
+    shared_features = {feature for row in shared for feature in ("defaulted", "extra") if "feature=" + feature in row["cfg"]}
+    common = (
+        reachable(test_a) & reachable(test_b)
+        if test_a is not None and test_b is not None
+        else set()
+    )
+    common_crates = [
+        graph_by_id[crate]
+        for crate in common
+        if graph_by_id[crate]["origin"].startswith(("Library", "Lang"))
+    ]
+    registry_crates = [row for row in common_crates if row["origin"].startswith("Library")]
+    sysroot_crates = [row for row in common_crates if row["origin"].startswith("Lang")]
+    check(
+        "shared feature graphs stay distinct and common registry/sysroot crates deduplicate",
+        len(shared) == 2
+        and shared_features == {"defaulted", "extra"}
+        and len([row for row in common_crates if row["name"] == "itoa"]) == 1
+        and len([row for row in common_crates if row["name"] == "core"]) == 1,
+        f"shared {[(row['id'], row['cfg']) for row in shared]}, "
+        f"common registry/sysroot crates {len(common_crates)} (registry {len(registry_crates)}, sysroot {len(sysroot_crates)})",
+    )
+    check(
+        "an edit after switching roots recompiles one function",
+        mine.returncode == other.returncode
+        and how_built(mine.stderr) == "daemon"
+        and sum(edit_functions) == 1
+        and before_workers
+        and workers
+        and before_workers[0][1] == workers[0][1],
+        f"patched functions {edit_functions}; {how_built(mine.stderr)}; exit {mine.returncode}/{other.returncode}",
+    )
+    check(
+        "package roots share one worker and distinct feature graphs",
+        len(workers) == 1 and all(served) and cargos_builds(status) == 0 and len(joined) >= 1,
+        f"workers {len(workers)}, joins {joined}, Cargo builds {cargos_builds(status)}",
+    )
+
+    for order, sequence in (
+        ("test then build", (("test", ["-p", "threaded", "--no-fail-fast"]), ("build", ["-p", "threaded"]))),
+        ("build then test", (("build", ["-p", "threaded"]), ("test", ["-p", "threaded", "--no-fail-fast"]))),
+    ):
+        env = base_env(os.path.join(work, f"home-threaded-{order.replace(' ', '-')}"))
+        env["RUSTD_STATS"] = "1"
+        env["CARGO_TARGET_DIR"] = os.path.join(work, f"target-threaded-{order.replace(' ', '-')}")
+        side = Side(ws, env, True)
+        first_command, first_args = sequence[0]
+        second_command, second_args = sequence[1]
+        _, first = side.cargo(first_command, *first_args)
+        _, first_status = side.cargo("status")
+        first_workers = re.findall(r"^  worker: pid (\d+), .*?, log (.*)$", first_status.stdout, re.M)
+        _, first_reference = theirs.cargo(first_command, *first_args)
+        _, second = side.cargo(second_command, *second_args)
+        _, second_reference = theirs.cargo(second_command, *second_args)
+        _, second_status = side.cargo("status")
+        second_workers = re.findall(r"^  worker: pid (\d+), .*?, log (.*)$", second_status.stdout, re.M)
+        outputs_match = (
+            test_results(first) == test_results(first_reference)
+            if first_command == "test"
+            else first.returncode == first_reference.returncode
+        ) and (
+            test_results(second) == test_results(second_reference)
+            if second_command == "test"
+            else second.returncode == second_reference.returncode
+        )
+        worker_log = second_workers[0][1] if len(second_workers) == 1 else None
+        worker_log_text = open(worker_log, errors="replace").read() if worker_log else ""
+        snapshots = []
+        log_lines = worker_log_text.splitlines()
+        for index, line in enumerate(log_lines):
+            if not line.startswith("crate graph snapshot:"):
+                continue
+            rows = []
+            for row in log_lines[index + 1:]:
+                if not row.startswith("crate graph: "):
+                    break
+                rows.append(json.loads(row.removeprefix("crate graph: ")))
+            snapshots.append(rows)
+        graph = next(
+            (rows for rows in reversed(snapshots) if len({row["id"] for row in rows}) == len(rows)),
+            [],
+        )
+        crossbeam_crates = [
+            row for row in graph
+            if row["root"]
+            and "/crossbeam-channel-" in row["root"]
+            and row["root"].endswith("/src/lib.rs")
+        ]
+        crossbeam_features = {"feature=std" in row["cfg"] for row in crossbeam_crates}
+        distinct_registry_crates = (
+            len(crossbeam_crates) == 2
+            and crossbeam_features == {True}
+            and len({tuple(row["dependencies"]) for row in crossbeam_crates}) == 2
+        )
+        check(
+            f"{order} keeps distinct registry crate graphs around a shared thread-local",
+            distinct_registry_crates,
+            f"crossbeam-channel {[(row['id'], row['cfg'], row['dependencies']) for row in crossbeam_crates]}",
+        )
+        same_worker = (
+            bool(first_workers and second_workers and first_workers[0][0] == second_workers[0][0])
+            or bool(
+                not first_workers
+                and worker_log
+                and os.path.commonpath((worker_log, os.path.join(env["RUSTD_HOME"], "spares")))
+                == os.path.join(env["RUSTD_HOME"], "spares")
+                and re.search(r"^cold: compiled \d+ of \d+ fns", worker_log_text, re.M)
+            )
+        )
+        workers_match = bool(
+            second_workers
+            and len(second_workers) == 1
+            and cargos_builds(second_status.stdout) == 0
+            and same_worker
+        )
+        check(
+            f"{order} matches cargo in one daemon worker",
+            bool(
+                outputs_match
+                and distinct_registry_crates
+                and how_built(first.stderr) == "daemon"
+                and how_built(second.stderr) == "daemon"
+                and workers_match
+            ),
+            f"workers {len(second_workers)}, pids "
+            f"{[worker[0] for worker in first_workers]} -> {[worker[0] for worker in second_workers]}, "
+            f"same worker {same_worker}, log {worker_log}, "
+            f"{first_command} {how_built(first.stderr)} ({first.returncode}/{first_reference.returncode}), "
+            f"{second_command} {how_built(second.stderr)} ({second.returncode}/{second_reference.returncode}), "
+            f"outputs match {outputs_match}, Cargo builds {cargos_builds(second_status.stdout)}",
+        )
+        side.cargo("stop")
+    ours.cargo("stop")
 
 
 def daemon(work):
@@ -1041,6 +1302,7 @@ def daemon(work):
     here.cargo("stop")
     manners(work, ws, env, here, check, edit)
     abuse(work, ws, tree, env, check, status, alive)
+    workspace_workers(work, check)
     return checks
 
 

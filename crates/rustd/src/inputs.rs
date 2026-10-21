@@ -24,7 +24,10 @@ pub(crate) struct Inputs {
 
 /// What the workspace at `root` was loaded from.
 struct Checkout {
+    project: PathBuf,
     root: PathBuf,
+    cfg_test: bool,
+    selection: crate::plan::Selection,
     /// The manifests and the lock file, the build scripts cargo finds by their name, and
     /// the files cargo's configuration is read from: those that are not there too.
     files: Vec<Watched>,
@@ -90,7 +93,10 @@ impl Inputs {
     /// Has the workspace at `root`, loaded with `config`, be one whose inputs are watched.
     pub(crate) fn watch(
         &mut self,
+        project: &Path,
         root: &Path,
+        cfg_test: bool,
+        selection: &crate::plan::Selection,
         workspace: &ProjectWorkspace,
         config: &CargoConfig,
     ) {
@@ -119,15 +125,37 @@ impl Inputs {
         }
         let flags = FLAGS.iter().map(|&it| (it, run_with(config, it))).collect();
         let scripts = Scripts::of(workspace, config);
-        self.checkouts.retain(|it| it.root != root);
-        self.checkouts.push(Checkout { root: root.to_owned(), files, flags, scripts });
+        self.checkouts.retain(|it| {
+            it.project != project || it.cfg_test != cfg_test || it.selection != *selection
+        });
+        self.checkouts.push(Checkout {
+            project: project.to_owned(),
+            root: root.to_owned(),
+            cfg_test,
+            selection: selection.clone(),
+            files,
+            flags,
+            scripts,
+        });
     }
 
     /// Whether the checkout at `root` is no longer what it was loaded from. It is asked for
     /// a process with the variables `env`, or with `None` for whoever it was loaded for.
     /// An error is why its build scripts can't say.
-    pub(crate) fn stale(&mut self, root: &Path, env: Option<&Env>) -> anyhow::Result<bool> {
-        let Some(checkout) = self.checkouts.iter_mut().find(|it| it.root == root) else {
+    pub(crate) fn stale(
+        &mut self,
+        project: &Path,
+        root: &Path,
+        cfg_test: bool,
+        selection: &crate::plan::Selection,
+        env: Option<&Env>,
+    ) -> anyhow::Result<bool> {
+        let Some(checkout) = self.checkouts.iter_mut().find(|it| {
+            it.project == project
+                && it.root == root
+                && it.cfg_test == cfg_test
+                && it.selection == *selection
+        }) else {
             return Ok(false);
         };
         if checkout.files.iter().any(Watched::changed) {
@@ -146,8 +174,20 @@ impl Inputs {
 
     /// The variables cargo and the build scripts of the checkout at `root` read, as a
     /// process with `env` has them.
-    pub(crate) fn variables(&self, root: &Path, env: &Env) -> FxHashMap<String, Option<String>> {
-        let scripts = self.checkouts.iter().find(|it| it.root == root);
+    pub(crate) fn variables(
+        &self,
+        project: &Path,
+        root: &Path,
+        cfg_test: bool,
+        selection: &crate::plan::Selection,
+        env: &Env,
+    ) -> FxHashMap<String, Option<String>> {
+        let scripts = self.checkouts.iter().find(|it| {
+            it.project == project
+                && it.root == root
+                && it.cfg_test == cfg_test
+                && it.selection == *selection
+        });
         let scripts = scripts.and_then(|it| it.scripts.as_ref());
         let read = scripts.into_iter().flat_map(|it| it.variables.iter().map(|it| &*it.0));
         FLAGS.iter().copied().chain(read).map(|it| (it.to_owned(), env.get(it))).collect()

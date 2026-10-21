@@ -639,16 +639,21 @@ impl State {
                 BTreeMap::new()
             }
         };
+        let selection = asked.selection();
         let config = |unit_test: bool| WorkerConfig {
             repository: repository(&root),
             project: project.strip_prefix(&root).unwrap_or(Path::new("")).to_owned(),
             cfg_test: unit_test,
-            selection: asked.selection(),
+            selection: selection.clone(),
             env: worker_env(),
         };
         let sysroot_libraries = sysroot_libraries();
         let checkout = |unit_test: bool| Checkout {
-            key: format!("{key}{}", if unit_test { "-unit" } else { "" }),
+            key: format!(
+                "{key}\t{}\t{unit_test}\t{}",
+                project.display(),
+                serde_json::to_string(&selection).unwrap_or_default()
+            ),
             generation: 0,
             built_at: built.started,
             config: config(unit_test),
