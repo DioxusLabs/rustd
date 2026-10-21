@@ -31,7 +31,8 @@ use salsa::SalsaValue;
 use span::Edition;
 
 use crate::{
-    Adjust, Adjustment, AutoBorrow, CallableDefId, InferBodyId, ParamEnvAndCrate,
+    Adjust, Adjustment, AutoBorrow, BindingMode, ByRef, CallableDefId, InferBodyId,
+    ParamEnvAndCrate,
     consteval::{ConstEvalError, try_const_usize},
     db::{GeneralConstId, HirDatabase, InternedClosure, InternedClosureId, InternedCoroutineId},
     generics::generics,
@@ -118,6 +119,9 @@ struct MirLowerCtx<'a, 'db> {
     /// While the pattern of a match arm that has a guard is lowered: what it binds by value, and
     /// the place each came out of.
     guarded_moves: Option<Vec<(LocalId, Place<'db>)>>,
+    /// In the body of a closure, a binding of the enclosing body gets its local when the closure
+    /// first mentions it: it captures the binding, or names it where nothing is read.
+    outer_bindings_on_demand: bool,
     env: ParamEnv<'db>,
     infcx: InferCtxt<'db>,
 }
@@ -282,6 +286,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             arm_unreached: false,
             or_choices: FxHashMap::default(),
             guarded_moves: None,
+            outer_bindings_on_demand: false,
             env,
             infcx,
         }
@@ -2702,6 +2707,25 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         self.extend_temporaries(*expr_id, *pat);
                         let temporaries = self.push_drop_scope();
                         self.drop_scopes.last_mut().unwrap().temporaries = true;
+                        // `let x = e;` evaluates `e` straight into `x`, as rustc does: through
+                        // a temporary, the value would take its size in the frame twice.
+                        if let Pat::Bind { id, subpat: None } = self.store[*pat]
+                            && else_branch.is_none()
+                            && !*is_super
+                            && let BindingMode(ByRef::No, _) = self.infer.binding_modes[*pat]
+                        {
+                            let binding = self.binding_local(id)?;
+                            self.push_storage_live(id, current)?;
+                            let Some(c) =
+                                self.lower_expr_to_place(*expr_id, binding.into(), current)?
+                            else {
+                                temporaries.pop_assume_dropped(self);
+                                scope.pop_assume_dropped(self);
+                                return Ok(None);
+                            };
+                            current = temporaries.pop_and_drop(self, c, span);
+                            continue;
+                        }
                         let Some((init_place, c)) =
                             self.lower_expr_as_place(current, *expr_id, true)?
                         else {
@@ -2929,9 +2953,15 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         Ok(current)
     }
 
-    fn binding_local(&self, b: BindingId) -> Result<'db, LocalId> {
+    fn binding_local(&mut self, b: BindingId) -> Result<'db, LocalId> {
         match self.result.binding_locals.get(b) {
             Some(it) => Ok(*it),
+            None if self.outer_bindings_on_demand => {
+                let local =
+                    self.result.locals.alloc(Local { ty: self.infer.binding_ty(b).store() });
+                self.result.binding_locals.insert(b, local);
+                Ok(local)
+            }
             None => {
                 // FIXME: It should never happens, but currently it will happen in some cases, not sure when exactly.
                 // never!("Using inaccessible local for binding is always a bug");
@@ -3532,11 +3562,15 @@ fn lower_closure_body<'db>(
         ctx.result.coroutine = Some(CoroutineLocals { poll, context });
     }
     let resolver_guard = ctx.resolver.update_to_inner_scope(db, ctx.store_owner, expr);
+    // The closure's own bindings: one of the enclosing body, or of another closure, would be a
+    // local the closure never uses unless it mentions the binding.
+    let store = ctx.store;
     let current = ctx.lower_params_and_bindings(
         args.iter().zip(inputs.iter()).map(|(it, y)| (*it, *y)),
         None,
-        |_| true,
+        |binding| store.binding_owner(binding) == Some(expr),
     )?;
+    ctx.outer_bindings_on_demand = true;
 
     // Push local for every upvar in the closure. rustc doesn't do that, but we have to so we have locals
     // to associate with upvars for borrowck.
