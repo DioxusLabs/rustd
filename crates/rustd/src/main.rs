@@ -3343,6 +3343,12 @@ fn selected(args: &Args) -> Vec<String> {
     for package in &selection.excludes {
         selected.extend(["--exclude".to_owned(), package.clone()]);
     }
+    // Dev-dependencies are for tests: cargo runs the build scripts and the proc macros of
+    // those only for a build that has them. Not `--all-targets`, which fails on a bench or an
+    // example a published package lists and left out the file of, as `cargo test` does not.
+    if args.cfg_test || selection.dev_deps {
+        selected.push("--tests".to_owned());
+    }
     selected
 }
 
@@ -4494,9 +4500,6 @@ fn cargo_config(args: &Args) -> CargoConfig {
         sysroot: Some(sysroot),
         target: args.selection.target.clone(),
         set_test: args.cfg_test,
-        // Tests, benches and examples are what dev-dependencies are for: cargo runs the
-        // build scripts and the proc macros of those only for a build that has them.
-        all_targets: args.cfg_test || args.selection.dev_deps,
         features: match args.selection.all_features {
             true => CargoFeatures::All,
             false => CargoFeatures::Selected {
