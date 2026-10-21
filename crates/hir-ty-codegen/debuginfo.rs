@@ -541,8 +541,9 @@ impl Dwarf {
         let mut context = Dwarf {
             dwarf: DwarfUnit::new(encoding),
             full: Vec::new(),
-            apart: apart
-                .map(|name| split::Split::new(isa, encoding, directory.as_bytes().to_vec(), name)),
+            apart: apart.and_then(|name| {
+                split::Split::new(isa, encoding, directory.as_bytes().to_vec(), name)
+            }),
             split_error: None,
             id: FxHasher::default(),
             addresses: Vec::new(),
@@ -1419,10 +1420,16 @@ impl Writer for SectionWriter {
 mod tests {
     use super::*;
 
+    fn split_isa() -> cranelift_codegen::isa::OwnedTargetIsa {
+        cranelift_codegen::isa::lookup("x86_64-unknown-linux-gnu".parse().unwrap())
+            .unwrap()
+            .finish(cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()))
+            .unwrap()
+    }
+
     #[test]
     fn split_units_are_encoded_at_their_boundary() {
-        let isa =
-            super::super::Target::selected().and_then(|it| it.isa("backtracking", false)).unwrap();
+        let isa = split_isa();
         let mut dwarf = Dwarf::new(&*isa, "/", true, Some("test.o".to_owned()));
         dwarf.end_unit();
         assert_eq!(dwarf.apart.as_ref().unwrap().next_name(), split::file("test.o", 0));
@@ -1442,8 +1449,7 @@ mod tests {
 
     #[test]
     fn split_encoding_keeps_the_first_error() {
-        let isa =
-            super::super::Target::selected().and_then(|it| it.isa("backtracking", false)).unwrap();
+        let isa = split_isa();
         let mut dwarf = Dwarf::new(&*isa, "/", true, Some("test.o".to_owned()));
         dwarf
             .ranges
