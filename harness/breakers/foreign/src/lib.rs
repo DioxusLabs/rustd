@@ -35,6 +35,48 @@ pub fn visit_callsites() -> (u32, u32, u32) {
 
 pub use reexports::Issue;
 
+pub struct LocalTypes;
+
+macro_rules! padding {
+    () => {
+        const _: () = ();
+    };
+}
+padding!();
+
+#[cfg(any())]
+const _: () = ();
+
+const _: () = ();
+
+const _: () = {
+    struct LocalError;
+
+    impl LocalTypes {
+        pub fn first<T>(_: T) -> std::any::TypeId {
+            std::any::TypeId::of::<LocalError>()
+        }
+
+        pub fn first_reference() -> std::any::TypeId {
+            std::any::TypeId::of::<LocalError>()
+        }
+    }
+};
+
+const _: () = {
+    struct LocalError;
+
+    impl LocalTypes {
+        pub fn second<T>(_: T) -> std::any::TypeId {
+            std::any::TypeId::of::<LocalError>()
+        }
+
+        pub fn second_reference() -> std::any::TypeId {
+            std::any::TypeId::of::<LocalError>()
+        }
+    }
+};
+
 mod reexports {
     pub use items::Issue;
     pub(crate) use items::*;

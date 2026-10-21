@@ -913,30 +913,61 @@ impl SymbolResolver for Resolver<'_> {
         self.contents.names_place((&*self.root, self.base.as_deref()), bytes)
     }
 
-    fn declared_in(&self, adt: hir_def::AdtId) -> Option<FunctionId> {
+    fn declared_in(&self, adt: hir_def::AdtId) -> Option<(DefWithBodyId, u32)> {
         let adt = hir::Adt::from(adt);
         let sema = hir::Semantics::new(self.db);
         let source = sema.source(adt)?;
+        sema.parse_or_expand(source.file_id);
         let mut around = sema.ancestors_with_macros(source.value.syntax().clone()).skip(1);
-        let func = ast::Fn::cast(around.find(is_definition)?)?;
+        let owner = around.find(is_definition)?;
+        let name = adt.name(self.db);
+        let named_so = |node: &SyntaxNode| {
+            let named = match_ast! {
+                match node {
+                    ast::Adt(it) => it.name(),
+                    ast::Trait(it) => it.name(),
+                    ast::TypeAlias(it) => it.name(),
+                    ast::Module(it) => it.name(),
+                    _ => None,
+                }
+            };
+            named.is_some_and(|it| it.text() == name.as_str())
+        };
+        if place_in_definition(&sema, source.value.syntax(), &named_so)? != 0 {
+            return None;
+        }
+        if let Some(konst) = ast::Const::cast(owner.clone()) {
+            if source.file_id.is_macro() {
+                return None;
+            }
+            let mut scope = konst.syntax().parent()?;
+            while !is_definition(&scope) {
+                let Some(parent) = scope.parent() else { break };
+                scope = parent;
+            }
+            if scope
+                .descendants()
+                .filter_map(ast::Item::cast)
+                .any(|it| has_attribute_macro(&sema, &it))
+            {
+                return None;
+            }
+            let name = konst.name().map(|it| it.text().to_string());
+            let earlier = place_in_definition(&sema, konst.syntax(), &|node| {
+                ast::Const::cast(node.clone())
+                    .is_some_and(|it| it.name().map(|it| it.text().to_string()) == name)
+            })?;
+            let id: hir_def::ConstId = sema.to_def(&konst)?.into();
+            return Some((id.into(), earlier));
+        }
+        let func = ast::Fn::cast(owner)?;
         // The body of an `async fn` is a closure to rustc.
         if func.async_token().is_some() {
             return None;
         }
-        let name = adt.name(self.db);
-        let named_so = func.syntax().descendants().filter_map(ast::Name::cast).filter(|it| {
-            it.text() == name.as_str()
-                && it.syntax().parent().is_some_and(|it| {
-                    ast::Adt::can_cast(it.kind())
-                        || ast::Trait::can_cast(it.kind())
-                        || ast::TypeAlias::can_cast(it.kind())
-                        || ast::Module::can_cast(it.kind())
-                })
-        });
-        if named_so.count() != 1 {
-            return None;
-        }
-        self.function_at(&sema, adt.module(self.db), &func)?.try_into().ok()
+        let func: FunctionId =
+            self.function_at(&sema, adt.module(self.db), &func)?.try_into().ok()?;
+        Some((func.into(), 0))
     }
 
     fn impl_place(&self, id: hir_def::ImplId) -> Option<u32> {

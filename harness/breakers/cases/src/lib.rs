@@ -15,6 +15,7 @@ macro_rules! cases {
 }
 
 cases![
+    const_local_type_id,
     explicit_and_glob_reexport,
     chained_rpitit,
     imported_callsite,
