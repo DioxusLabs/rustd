@@ -585,7 +585,7 @@ FLAG_WORKSPACE = {
     "app/tests/common/mod.rs": "pub fn twice<T: Clone>(it: T) -> (T, T) {\n    (it.clone(), it)\n}\n",
     "app/tests/edge.rs": 'mod common;\n\n#[test]\nfn uses_common() {\n    assert_eq!(common::twice(3u8), (3, 3));\n}\n\n#[test]\n#[should_panic(expected = "boom")]\nfn panics() {\n    panic!("boom now");\n}\n\n#[test]\n#[ignore = "slow"]\nfn ignored() {\n    panic!("never run");\n}\n\n#[test]\n#[cfg_attr(miri, ignore = "under miri")]\nfn not_under_miri() {}\n\n#[cfg(test)]\nmod inner {\n    #[test]\n    fn under_cfg_test() {\n        assert_eq!(super::common::twice("a").0, "a");\n    }\n\n    mod deeper {\n        #[test]\n        fn deepest() {}\n    }\n}\n\n#[cfg(not(test))]\n#[test]\nfn never_built() {\n    panic!();\n}\n',
     "app/tests/plain.rs": 'fn main() {\n    println!("plain: {}", util::greeting("plain"));\n}\n',
-    "app/tests/it.rs": 'use std::error::Error;\nuse std::io;\n\n#[test]\nfn greets_it() {\n    assert_eq!(util::greeting("it").to_lowercase(), "hello it");\n}\n\n#[test]\nfn fails_when_asked() {\n    assert!(std::env::var("FLAGS_FAIL").is_err());\n}\n\n// A test may return what `main` may: libtest fails it on an `Err`, and prints it.\n#[test]\nfn errs_when_asked() -> Result<(), Box<dyn Error>> {\n    std::env::var("FLAGS_FAIL").map_or(Ok(()), |it| Err(format!("asked: {it}").into()))\n}\n\n#[test]\nfn reads_nothing() -> io::Result<()> {\n    Ok(())\n}\n\n// A cargo run by a test has the units of the build: the program stays the file it was.\n#[test]\nfn a_cargo_inside_leaves_the_program() {\n    use std::os::unix::fs::MetadataExt;\n    let program = env!("CARGO_BIN_EXE_app");\n    let before = std::fs::metadata(program).unwrap().ino();\n    let cargo = std::env::var("CARGO").unwrap_or("cargo".to_string());\n    let built = std::process::Command::new(cargo).args(["build", "-q", "-p", "app"]).status().unwrap();\n    assert!(built.success());\n    assert_eq!(before, std::fs::metadata(program).unwrap().ino());\n}\n\n// What cargo tells a test of the places of the build is what the daemon tells it.\n#[test]\nfn the_places_of_the_build_are_cargos() {\n    assert!(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).is_dir());\n    let ran = std::process::Command::new(env!("CARGO_BIN_EXE_other")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&ran.stdout).lines().count(), 1);\n}\n',
+    "app/tests/it.rs": 'use std::error::Error;\nuse std::io;\n\n#[derive(Debug)]\nstruct WorkspaceError(String);\ntype Result<T> = std::result::Result<T, WorkspaceError>;\n\n#[test]\nfn greets_it() {\n    assert_eq!(util::greeting("it").to_lowercase(), "hello it");\n}\n\n#[test]\nfn fails_when_asked() {\n    assert!(std::env::var("FLAGS_FAIL").is_err());\n}\n\n// A test may return what `main` may: libtest fails it on an `Err`, and prints it.\n#[test]\nfn errs_when_asked() -> std::result::Result<(), Box<dyn Error>> {\n    std::env::var("FLAGS_FAIL").map_or(Ok(()), |it| Err(format!("asked: {it}").into()))\n}\n\n#[test]\nfn workspace_result_ok() -> Result<()> {\n    Ok(())\n}\n\n#[test]\nfn workspace_result_err() -> Result<()> {\n    std::env::var("FLAGS_FAIL").map_or(Ok(()), |it| Err(WorkspaceError(format!("asked: {it}"))))\n}\n\n#[test]\nfn reads_nothing() -> io::Result<()> {\n    Ok(())\n}\n\n// A cargo run by a test has the units of the build: the program stays the file it was.\n#[test]\nfn a_cargo_inside_leaves_the_program() {\n    use std::os::unix::fs::MetadataExt;\n    let program = env!("CARGO_BIN_EXE_app");\n    let before = std::fs::metadata(program).unwrap().ino();\n    let cargo = std::env::var("CARGO").unwrap_or("cargo".to_string());\n    let built = std::process::Command::new(cargo).args(["build", "-q", "-p", "app"]).status().unwrap();\n    assert!(built.success());\n    assert_eq!(before, std::fs::metadata(program).unwrap().ino());\n}\n\n// What cargo tells a test of the places of the build is what the daemon tells it.\n#[test]\nfn the_places_of_the_build_are_cargos() {\n    assert!(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).is_dir());\n    let ran = std::process::Command::new(env!("CARGO_BIN_EXE_other")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&ran.stdout).lines().count(), 1);\n}\n',
 }
 
 def cross_cases():
@@ -1001,19 +1001,33 @@ def daemon(work):
     edit(ws, "six")
     _, again = here.cargo("run")
     check("the build after that starts a daemon again and succeeds", again.returncode == 0 and "hello world" in again.stdout and status()[0] not in (None, pid))
-    # What the daemon could not load once, it loads again when a source of the crate is
-    # written: rustc read none of them, so it is not cargo's dep-info that says which.
+    # A test may return a type the rustc-compiled harness cannot name.
     valued = os.path.join(ws, "app/tests/valued.rs")
     open(valued, "w").write("struct Valued;\n\nimpl std::process::Termination for Valued {\n    fn report(self) -> std::process::ExitCode {\n        std::process::ExitCode::SUCCESS\n    }\n}\n\n#[test]\nfn valued() -> Valued {\n    Valued\n}\n")
-    _, refused = here.cargo("test", "--test", "valued")
-    time.sleep(1)
+    _, returned = here.cargo("test", "--test", "valued")
+    check("a test with a non-unit Termination return runs", returned.returncode == 0 and "1 passed" in returned.stdout, f"{returned.returncode}: {returned.stdout.strip()[-100:]} {returned.stderr.strip()[-200:]}")
+    valued_source = open(valued).read()
+    patched_source = valued_source.replace("fn valued() -> Valued {\n    Valued\n}", "fn valued() -> Valued {\n    let _ = 1;\n    Valued\n}", 1)
+    open(valued, "w").write(patched_source)
+    _, patched = here.cargo("test", "--test", "valued")
+    check("a report shim survives an incremental test edit", patched_source != valued_source and patched.returncode == 0 and "1 passed" in patched.stdout and how_built(patched.stderr) == "daemon", f"{patched.returncode}: {patched.stdout.strip()[-100:]} {patched.stderr.strip()[-200:]}")
     open(valued, "w").write("#[test]\nfn valued() {}\n")
     _, mended = here.cargo("test", "--test", "valued")
     open(valued, "w").write('#[test]\n#[cfg_attr(not(miri), ignore = "not under miri")]\nfn valued() {}\n\n#[test]\n#[cfg_attr(miri, ignore)]\n#[cfg_attr(not(miri), should_panic(expected = "boom"))]\nfn gated() {\n    panic!("boom");\n}\n')
     _, gated = here.cargo("test", "--test", "valued")
     check("the `cfg_attr`s of a test that hold are read", gated.returncode == 0 and "test valued ... ignored, not under miri" in gated.stdout and "test gated - should panic ... ok" in gated.stdout, f"{gated.returncode}: {gated.stdout.strip()[-300:]} {gated.stderr.strip()[-200:]}")
     os.remove(valued)
-    check("a test the daemon refuses fails the build, and runs once its source is mended", refused.returncode != 0 and "returns a value" in refused.stderr and mended.returncode == 0 and "1 passed" in mended.stdout, f"{refused.returncode}: {refused.stderr.strip()[-200:]}; then {mended.returncode}: {mended.stdout.strip()[-100:]} {mended.stderr.strip()[-200:]}")
+    check("a test source change is loaded again", mended.returncode == 0 and "1 passed" in mended.stdout, f"{mended.returncode}: {mended.stdout.strip()[-100:]} {mended.stderr.strip()[-200:]}")
+    unnameable = os.path.join(ws, "app/tests/unnameable.rs")
+    open(unnameable, "w").write("struct Generic<T>(T);\nimpl<T> Generic<T> {\n    #[test]\n    fn generic_impl_test() {}\n}\n")
+    _, refused = here.cargo("test", "--test", "unnameable")
+    _, _, refusal_status = status()
+    ready = re.search(rf"(?m)^    {re.escape(ws)}: ready$", refusal_status)
+    open(unnameable, "w").write("#[test]\nfn recovered() {}\n")
+    _, recovered = here.cargo("test", "--test", "unnameable")
+    os.remove(unnameable)
+    check("a test in a generic impl with no rustc symbol is refused while its workspace worker stays ready", refused.returncode != 0 and "no symbol of the daemon's" in refused.stderr and ready is not None, f"{refused.returncode}: {refused.stderr.strip()[-200:]}; worker state {ready.group(0) if ready else 'not ready'}")
+    check("the build works once the test has a rustc symbol", recovered.returncode == 0 and "1 passed" in recovered.stdout, f"{recovered.returncode}: {recovered.stdout.strip()[-100:]} {recovered.stderr.strip()[-200:]}")
     _, before = here.cargo("test", "--test", "edge")
     added = os.path.join(ws, "app/tests/added.rs")
     open(added, "w").write("#[test]\nfn added() {}\n")

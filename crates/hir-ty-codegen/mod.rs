@@ -39,6 +39,7 @@ use hir_def::{
 use hir_expand::{
     FileRange, HirFileId, InFile, MacroDefKind,
     builtin::{BuiltinFnLikeExpander, EagerExpander},
+    name::Name,
 };
 use la_arena::ArenaMap;
 use rustc_abi::{ExternAbi, Integer, ReprFlags, Size};
@@ -449,6 +450,8 @@ pub struct CodegenUnit {
     pub compiled: Vec<(FunctionId, String)>,
     /// Roots that have to come from rustc.
     pub skipped: Vec<(FunctionId, CodegenError)>,
+    /// Test return shims that could not be compiled.
+    pub report_errors: Vec<(FunctionId, CodegenError)>,
     /// Callees without a rustc symbol (generic or inlined) that were compiled as local functions.
     pub instances: usize,
 }
@@ -464,6 +467,8 @@ pub struct Roots<'a> {
     /// The `main` of a program rustc built nothing of: the `main` the C runtime calls is
     /// then ours to write as well.
     pub start: Option<FunctionId>,
+    /// Tests with a non-unit return type, which the harness calls through a report shim.
+    pub reports: &'a [FunctionId],
     /// The statics a linker or a runtime finds though no code names them, in the crates
     /// rustc built nothing of: `#[used]` ones, and those put in a section by name.
     pub kept: &'a [StaticId],
@@ -527,6 +532,7 @@ impl CodegenUnit {
                     apart: Vec::new(),
                     compiled: base.compiled.clone(),
                     skipped: base.skipped.clone(),
+                    report_errors: Vec::new(),
                     instances: base.instances.len(),
                 };
                 known.base = Some(base);
@@ -581,12 +587,18 @@ impl CodegenUnit {
             cg.patching = patching;
             let mut compiled = Vec::new();
             let mut skipped = Vec::new();
+            let mut report_errors = Vec::new();
             let mut failed = Vec::new();
             let mut queue = roots.entries.to_vec();
             let mut queued: FxHashSet<FunctionId> = queue.iter().copied().collect();
             let mut next = 0;
             if let Some(main) = start {
                 cg.define_start(main)?;
+            }
+            for &test in roots.reports {
+                if let Err(error) = cg.define_report(test) {
+                    report_errors.push((test, error));
+                }
             }
             for &id in roots.kept {
                 cg.static_data(id)?;
@@ -770,6 +782,7 @@ impl CodegenUnit {
                     apart,
                     compiled,
                     skipped,
+                    report_errors,
                     instances,
                 });
             }
@@ -1549,6 +1562,15 @@ fn compiled_start<'db>(db: &'db dyn HirDatabase, main: FunctionId) -> Result<Com
     let env = ParamEnvAndCrate { param_env: crate::next_solver::ParamEnv::empty(), krate };
     let checked = crate_checks_overflow(db, krate).unwrap_or(false);
     compile(db, env, None, false, checked, |fx| fx.start_shim(main))
+}
+
+/// The report shim the test harness calls for a test with a non-unit return type.
+#[salsa::tracked(returns(ref))]
+fn compiled_report<'db>(db: &'db dyn HirDatabase, test: FunctionId) -> Result<CompiledFunction> {
+    let krate = test.krate(db);
+    let env = ParamEnvAndCrate { param_env: crate::next_solver::ParamEnv::empty(), krate };
+    let checked = crate_checks_overflow(db, krate).unwrap_or(false);
+    compile(db, env, None, false, checked, |fx| fx.report_shim(test))
 }
 
 /// The code of a function, closure, `async` block or shim with its generic arguments filled in.
@@ -3472,6 +3494,21 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     fn define_start(&mut self, main: FunctionId) -> Result<()> {
         let compiled = compiled_start(self.db, main).as_ref().map_err(Clone::clone)?;
         let id = self.module.declare_function("main", Linkage::Export, &compiled.code.signature)?;
+        self.stitch(id, compiled)?;
+        Ok(())
+    }
+
+    /// Puts the report shim for a test in the object.
+    fn define_report(&mut self, test: FunctionId) -> Result<()> {
+        let Some(test_symbol) = self.symbols.function(test) else {
+            return Err(CodegenError::NoSymbol);
+        };
+        let compiled = compiled_report(self.db, test).as_ref().map_err(Clone::clone)?;
+        let id = self.module.declare_function(
+            &format!("{test_symbol}.rustd_report"),
+            Linkage::Export,
+            &compiled.code.signature,
+        )?;
         self.stitch(id, compiled)?;
         Ok(())
     }
@@ -11414,6 +11451,46 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let code =
             if ptr() == types::I32 { code } else { self.builder.ins().ireduce(types::I32, code) };
         self.builder.ins().return_(&[code]);
+        Ok(())
+    }
+
+    /// Calls a test and reports its return value like `main`.
+    fn report_shim(&mut self, test: FunctionId) -> Result<()> {
+        let Some(termination) = self.interner.lang_items().Termination else {
+            unsupported!("no `Termination`");
+        };
+        let Some(report) = termination
+            .trait_items(self.cg.db)
+            .method_by_name(&Name::new_symbol_root(intern::Symbol::intern("report")))
+        else {
+            unsupported!("no `Termination::report`");
+        };
+        let fn_ty = |func: FunctionId, args| {
+            Ty::new_fn_def(self.interner, CallableDefId::FunctionId(func).into(), args)
+        };
+        let sig_of = |ty: Ty<'db>| {
+            self.interner.instantiate_bound_regions_with_erased(ty.fn_sig(self.interner))
+        };
+        let test_ty = fn_ty(test, GenericArgs::new_from_slice(&[]));
+        let returned = self.normalize(sig_of(test_ty).output());
+        let report_args = GenericArgs::new_from_slice(&[returned.into()]);
+        let report_sig = sig_of(fn_ty(report, report_args));
+        let exit_code = self.normalize(report_sig.output());
+        let abi = self.fn_abi(ExternAbi::Rust, exit_code, std::iter::empty::<Ty<'db>>())?;
+        self.builder.func.signature = self.signature(&abi.args, abi.ret);
+        let entry = self.builder.create_block();
+        self.builder.append_block_params_for_function_params(entry);
+        self.builder.switch_to_block(entry);
+
+        let returned_layout = self.layout(returned)?;
+        let value = self.stack_slot(&returned_layout);
+        self.call_direct(test, GenericArgs::new_from_slice(&[]), &[], value, returned)?;
+        let exit_code_layout = self.layout(exit_code)?;
+        let code = self.stack_slot(&exit_code_layout);
+        self.call_direct(report, report_args, &[(value, returned)], code, exit_code)?;
+        let mut values = Vec::new();
+        self.pass(abi.ret, code, &exit_code_layout, &mut values);
+        self.builder.ins().return_(&values);
         Ok(())
     }
 
