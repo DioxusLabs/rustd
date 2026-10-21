@@ -323,9 +323,10 @@ pub(super) struct Base {
     /// The symbols of the functions built from entries of the store, by their stable names.
     /// No edit reaches what those are compiled from.
     pub(super) found: FxHashMap<Arc<str>, String>,
-    /// Some of `found` is code of the checkout, which an edit does reach, and nothing here
-    /// tells what of it: the first edit takes a full build without any.
-    hydrated: bool,
+    /// The crates that some of `found` is code of, with what those depend on; `None` for any.
+    /// An edit reaches into that code and nothing here tells what of it: an edit of one of
+    /// them takes a full build without any.
+    hydrated: Option<FxHashSet<Crate>>,
     outdated: bool,
     /// The instances that did not compile when the base was built. What called them was left
     /// to rustc, and stays there for as long as the base does.
@@ -653,10 +654,7 @@ impl Base {
                     (name.clone(), decls.get_function_decl(*id).linkage_name(*id).into_owned())
                 })
                 .collect(),
-            hydrated: cg
-                .found
-                .iter()
-                .any(|(name, _)| super::stable::StableNames::of_checkout(name)),
+            hydrated: Self::hydrated(db, cg.symbols, cg.found.iter().map(|(name, _)| &**name)),
             outdated: false,
             bodies: cg.bodies,
         })
@@ -672,7 +670,7 @@ impl Base {
     pub(super) fn touch(&mut self, db: &dyn HirDatabase, crates: Option<&[Crate]>) {
         let Some(crates) = crates else {
             self.touched.any = true;
-            self.outdated |= self.hydrated;
+            self.outdated |= self.found_of(|_| true);
             return;
         };
         for &krate in crates {
@@ -680,16 +678,42 @@ impl Base {
                 self.touched.crates.extend(krate.transitive_rev_deps(db));
             }
         }
-        self.outdated |=
-            self.hydrated && self.crates.iter().any(|it| self.touched.crates.contains(it));
+        self.outdated |= self.found_of(|it| self.touched.crates.contains(it));
     }
 
     /// Notes that a file changed in the bodies of functions alone, none of which the rest of
     /// the program sees into.
     pub(super) fn touch_bodies(&mut self, db: &dyn HirDatabase, file: FileId) {
         self.touched.bodies.insert(file);
-        self.outdated |= self.hydrated
-            && base_db::relevant_crates(db, file).iter().any(|it| self.crates.contains(it));
+        let crates = base_db::relevant_crates(db, file);
+        self.outdated |= self.found_of(|it| crates.contains(it));
+    }
+
+    /// The crates of the checkout that code found under `names` is of or may have inlined code
+    /// of, `None` when a name is of one that is not among them.
+    fn hydrated<'a>(
+        db: &dyn HirDatabase,
+        symbols: &dyn super::SymbolResolver,
+        names: impl Iterator<Item = &'a str>,
+    ) -> Option<FxHashSet<Crate>> {
+        let mut ids: Option<FxHashMap<String, Crate>> = None;
+        let mut crates = FxHashSet::default();
+        for id in names.flat_map(super::stable::StableNames::checkout_ids) {
+            let ids = ids.get_or_insert_with(|| {
+                let all = base_db::all_crates(db);
+                let local = all.iter().filter(|it| it.data(db).origin.is_local());
+                local.filter_map(|&it| Some((symbols.content_id(it)?.to_string(), it))).collect()
+            });
+            let krate = *ids.get(id)?;
+            if crates.insert(krate) {
+                crates.extend(krate.transitive_deps(db));
+            }
+        }
+        Some(crates)
+    }
+
+    fn found_of(&self, reached: impl Fn(&Crate) -> bool) -> bool {
+        self.hydrated.as_ref().is_none_or(|crates| crates.iter().any(reached))
     }
 
     /// Takes what every part of [`Base::stale`] found as where the next edit starts from.

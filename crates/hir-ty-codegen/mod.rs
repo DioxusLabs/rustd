@@ -3903,6 +3903,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             self.kept.unnamed += 1;
             return;
         };
+        // Code of the checkout compiled here is not taken from the store again in this
+        // process: a base tells what an edit reaches of what it compiled, not of what it found.
+        if stable::StableNames::of_checkout(&name) {
+            cached::Entries::ban(&name);
+        }
         let key = cached::Entry::key(&name, debug.is_some(), program.flatten().as_ref());
         let Some(key) = key else { return };
         let check = std::env::var_os("RUSTD_CACHE_CHECK");

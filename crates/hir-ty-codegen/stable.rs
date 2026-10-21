@@ -166,6 +166,11 @@ impl<'a, 'db> StableNames<'a, 'db> {
         name.contains(OF_CHECKOUT)
     }
 
+    /// The content ids of the crates of the checkout a name mentions.
+    pub(super) fn checkout_ids(name: &str) -> impl Iterator<Item = &str> {
+        name.split(OF_CHECKOUT).skip(1).filter_map(|it| Some(it.split_once(':')?.0))
+    }
+
     /// `None` for an instance that names anything this has no stable name for.
     pub(super) fn instance(&self, instance: &Instance) -> Option<String> {
         let mut out = String::new();
