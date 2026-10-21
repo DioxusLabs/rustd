@@ -509,6 +509,22 @@ struct Known {
 
 const ENTRY_CACHE_LIMIT: usize = 4096;
 
+impl Known {
+    fn remember(&mut self, key: [u8; KEY], entry: Option<Arc<Entry>>) -> Option<Arc<Entry>> {
+        if let Some(known) = self.entries.get(&key) {
+            return known.clone();
+        }
+        if self.entries.len() == ENTRY_CACHE_LIMIT {
+            if let Some(old) = self.entry_order.pop_front() {
+                self.entries.remove(&old);
+            }
+        }
+        self.entries.insert(key, entry.clone());
+        self.entry_order.push_back(key);
+        entry
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct StoredTypeSet {
     types: Vec<DebugType>,
@@ -724,15 +740,7 @@ impl Entries {
             .then(|| tally.step(super::backend::Step::StoreRead, read))
             .flatten()
             .map(Arc::new);
-        let mut known = self.known();
-        if known.entries.len() >= ENTRY_CACHE_LIMIT {
-            if let Some(old) = known.entry_order.pop_front() {
-                known.entries.remove(&old);
-            }
-        }
-        known.entries.insert(key, entry.clone());
-        known.entry_order.push_back(key);
-        entry
+        self.known().remember(key, entry)
     }
 
     /// The set of types kept under `key`, which every entry with a variable of the type
@@ -914,6 +922,38 @@ mod tests {
             assert_eq!(known.usable.len(), 1);
             assert!(known.entries[&key].is_none());
             assert!(!known.usable[&key]);
+        });
+    }
+
+    #[test]
+    fn decoded_entries_are_bounded_and_repeated_reads_keep_one_slot() {
+        let mut known = Known::default();
+        for index in 0..=ENTRY_CACHE_LIMIT {
+            let mut key = [0; KEY];
+            key[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            known.remember(key, None);
+            known.remember(key, None);
+        }
+        assert_eq!(known.entries.len(), ENTRY_CACHE_LIMIT);
+        assert_eq!(known.entry_order.len(), ENTRY_CACHE_LIMIT);
+        assert!(!known.entries.contains_key(&[0; KEY]));
+    }
+
+    #[test]
+    fn evicted_entries_can_be_read_again() {
+        with_entries(|entries| {
+            keep_entry(entries, "a", Vec::new());
+            let first = entries.get("a").unwrap();
+            let old = Arc::downgrade(&first);
+            drop(first);
+            for index in 0..ENTRY_CACHE_LIMIT {
+                entries
+                    .known()
+                    .remember(Entry::key(&format!("missing{index}"), true, None).unwrap(), None);
+            }
+            assert!(old.upgrade().is_none());
+            assert!(entries.usable("a", &|_| true));
+            assert_eq!(entries.get("a").unwrap().label, "a");
         });
     }
 
