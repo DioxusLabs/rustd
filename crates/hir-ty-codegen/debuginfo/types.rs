@@ -68,9 +68,9 @@ pub(in super::super) struct Types<'db> {
     links: Vec<TypeSet>,
     /// Where each type that is told of, or is being told of, is among `told`.
     known: FxHashMap<Ty<'db>, TypeIndex>,
-    described: FxHashMap<Ty<'db>, Option<TypeSet>>,
-    roots: Vec<Ty<'db>>,
-    in_progress: FxHashSet<Ty<'db>>,
+    described: FxHashMap<(Ty<'db>, u32), Option<TypeSet>>,
+    roots: Vec<(Ty<'db>, u32)>,
+    in_progress: FxHashSet<(Ty<'db>, u32)>,
     names: FxHashMap<Ty<'db>, Option<String>>,
     normalized: FxHashMap<Ty<'db>, Ty<'db>>,
 }
@@ -98,10 +98,14 @@ impl<'db> Types<'db> {
     /// The type and every type it is made of, with the type itself first. `None` is a type
     /// that has no layout or no name rustc would spell.
     pub(in super::super) fn describe(&mut self, ty: Ty<'db>) -> Option<TypeSet> {
-        if let Some(described) = self.described.get(&ty) {
+        self.describe_at(ty, POINTERS)
+    }
+
+    fn describe_at(&mut self, ty: Ty<'db>, pointers: u32) -> Option<TypeSet> {
+        let root = (self.tellable(ty), pointers);
+        if let Some(described) = self.described.get(&root) {
             return described.clone();
         }
-        let root = self.tellable(ty);
         if !self.in_progress.insert(root) {
             return None;
         }
@@ -109,7 +113,7 @@ impl<'db> Types<'db> {
         let known = std::mem::take(&mut self.known);
         let links = std::mem::take(&mut self.links);
         self.roots.push(root);
-        let described = self.ty(ty, POINTERS).map(|_| {
+        let described = self.ty(root.0, pointers).map(|_| {
             TypeSet::new(TypeList {
                 types: std::mem::take(&mut self.told),
                 links: std::mem::take(&mut self.links),
@@ -120,7 +124,7 @@ impl<'db> Types<'db> {
         self.told = told;
         self.known = known;
         self.links = links;
-        self.described.insert(ty, described.clone());
+        self.described.insert(root, described.clone());
         described
     }
 
@@ -131,25 +135,38 @@ impl<'db> Types<'db> {
         if let Some(&index) = self.known.get(&ty) {
             return Some(index);
         }
-        if matches!(ty.kind(), TyKind::Coroutine(..))
-            && self.roots.last() != Some(&ty)
-            && pointers == POINTERS
-            && !self.in_progress.contains(&ty)
-        {
-            let described = self.describe(ty)?;
-            let link = self
-                .links
-                .iter()
-                .position(|it| std::sync::Arc::ptr_eq(it, &described))
-                .unwrap_or_else(|| {
-                    self.links.push(described);
-                    self.links.len() - 1
-                });
-            let index = self.told.len() as TypeIndex;
-            self.told.push(DebugType::Link(link as u32));
-            return Some(index);
+        let mut layout = None;
+        let link = match ty.kind() {
+            TyKind::Adt(..) => {
+                let found = self.db.layout_of_ty(ty.store(), self.env.store()).ok()?;
+                let link = !self.is_pointer(ty, found.size.bytes());
+                layout = Some(found);
+                link
+            }
+            TyKind::Closure(..) | TyKind::CoroutineClosure(..) | TyKind::Coroutine(..) => true,
+            _ => false,
+        };
+        let root = (ty, pointers);
+        if link && self.roots.last() != Some(&root) && !self.in_progress.contains(&root) {
+            if let Some(described) = self.describe_at(ty, pointers) {
+                let link = self
+                    .links
+                    .iter()
+                    .position(|it| std::sync::Arc::ptr_eq(it, &described))
+                    .unwrap_or_else(|| {
+                        self.links.push(described);
+                        self.links.len() - 1
+                    });
+                let index = self.told.len() as TypeIndex;
+                self.told.push(DebugType::Link(link as u32));
+                self.known.insert(ty, index);
+                return Some(index);
+            }
         }
-        let layout = self.db.layout_of_ty(ty.store(), self.env.store()).ok()?;
+        let layout = match layout {
+            Some(layout) => layout,
+            None => self.db.layout_of_ty(ty.store(), self.env.store()).ok()?,
+        };
         let name = self.name(ty)?;
         // A type that is made of itself finds its place here. What stands there until the
         // type is told is what a type nothing more is known of is told as.
