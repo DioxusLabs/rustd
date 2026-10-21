@@ -15,6 +15,7 @@ macro_rules! cases {
 }
 
 cases![
+    chained_rpitit,
     imported_callsite,
     niche_eq,
     simd_cast,
