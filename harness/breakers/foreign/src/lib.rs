@@ -35,6 +35,7 @@ pub fn visit_callsites() -> (u32, u32, u32) {
 
 pub use reexports::Issue;
 
+#[derive(Debug)]
 pub struct LocalTypes;
 
 macro_rules! padding {

@@ -1245,11 +1245,16 @@ impl LateImports {
 /// Whether an attribute of the item is a macro, which rustc expands the item with: `#[test]`
 /// is one, though it leaves the item as it is written.
 fn has_attribute_macro(sema: &hir::Semantics<'_, RootDatabase>, item: &ast::Item) -> bool {
-    sema.resolve_attr_macro_call(item).is_some()
+    let transforms = |found: hir::Macro| {
+        found.is_attr(sema.db)
+            && !(matches!(found.kind(sema.db), hir::MacroKind::AttrBuiltIn)
+                && matches!(found.name(sema.db).as_str(), "derive" | "derive_const"))
+    };
+    sema.resolve_attr_macro_call(item).is_some_and(transforms)
         || ast::HasAttrs::attrs(item).filter_map(|it| it.path()).any(|path| {
             matches!(
                 sema.resolve_path(&path),
-                Some(hir::PathResolution::Def(ModuleDef::Macro(found))) if found.is_attr(sema.db)
+                Some(hir::PathResolution::Def(ModuleDef::Macro(found))) if transforms(found)
             )
         })
 }
