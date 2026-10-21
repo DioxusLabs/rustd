@@ -170,6 +170,7 @@ type DefAnonConstsMap<'db> = FxHashMap<DefWithoutBodyWithAnonConsts, ExprToAnonC
 
 pub struct SemanticsImpl<'db> {
     pub db: &'db dyn HirDatabase,
+    preferred_crate: Option<Crate>,
     s2d_cache: RefCell<SourceToDefCache<'db>>,
     /// MacroCall to its expansion's MacroCallId cache
     macro_call_cache: RefCell<FxHashMap<InFile<ast::MacroCall>, MacroCallId>>,
@@ -206,7 +207,16 @@ pub enum LintAttr {
 impl Semantics<'_, dyn HirDatabase> {
     /// Creates an instance that's weakly coupled to its underlying database type.
     pub fn new_dyn(db: &'_ dyn HirDatabase) -> Semantics<'_, dyn HirDatabase> {
-        let impl_ = SemanticsImpl::new(db);
+        let impl_ = SemanticsImpl::new(db, None);
+        Semantics { db, imp: impl_ }
+    }
+
+    /// Creates an instance that prefers the given crate when mapping source files.
+    pub fn new_dyn_for(
+        db: &'_ dyn HirDatabase,
+        krate: Crate,
+    ) -> Semantics<'_, dyn HirDatabase> {
+        let impl_ = SemanticsImpl::new(db, Some(krate));
         Semantics { db, imp: impl_ }
     }
 }
@@ -214,7 +224,13 @@ impl Semantics<'_, dyn HirDatabase> {
 impl<DB: HirDatabase> Semantics<'_, DB> {
     /// Creates an instance that's strongly coupled to its underlying database type.
     pub fn new(db: &DB) -> Semantics<'_, DB> {
-        let impl_ = SemanticsImpl::new(db);
+        let impl_ = SemanticsImpl::new(db, None);
+        Semantics { db, imp: impl_ }
+    }
+
+    /// Creates an instance that prefers the given crate when mapping source files.
+    pub fn new_for(db: &DB, krate: Crate) -> Semantics<'_, DB> {
+        let impl_ = SemanticsImpl::new(db, Some(krate));
         Semantics { db, imp: impl_ }
     }
 }
@@ -459,9 +475,10 @@ impl<DB: HirDatabase + ?Sized> Semantics<'_, DB> {
 }
 
 impl<'db> SemanticsImpl<'db> {
-    fn new(db: &'db dyn HirDatabase) -> Self {
+    fn new(db: &'db dyn HirDatabase, preferred_crate: Option<Crate>) -> Self {
         SemanticsImpl {
             db,
+            preferred_crate,
             s2d_cache: Default::default(),
             macro_call_cache: Default::default(),
             signature_anon_consts_cache: Default::default(),
@@ -2114,7 +2131,11 @@ impl<'db> SemanticsImpl<'db> {
     }
 
     fn with_ctx<F: FnOnce(&mut SourceToDefCtx<'db, '_>) -> T, T>(&self, f: F) -> T {
-        let mut ctx = SourceToDefCtx { db: self.db, cache: &mut self.s2d_cache.borrow_mut() };
+        let mut ctx = SourceToDefCtx {
+            db: self.db,
+            preferred_crate: self.preferred_crate.map(|krate| krate.id),
+            cache: &mut self.s2d_cache.borrow_mut(),
+        };
         f(&mut ctx)
     }
 

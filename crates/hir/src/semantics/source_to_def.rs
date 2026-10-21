@@ -187,6 +187,7 @@ impl<'db> SourceToDefCache<'db> {
 
 pub(super) struct SourceToDefCtx<'db, 'cache> {
     pub(super) db: &'db dyn HirDatabase,
+    pub(super) preferred_crate: Option<base_db::Crate>,
     pub(super) cache: &'cache mut SourceToDefCache<'db>,
 }
 
@@ -196,7 +197,14 @@ impl<'db> SourceToDefCtx<'db, '_> {
         self.cache.file_to_def_cache.entry(file).or_insert_with(|| {
             let mut mods = SmallVec::new();
 
-            for &crate_id in relevant_crates(self.db, file) {
+            let mut crates = relevant_crates(self.db, file).to_vec();
+            if let Some(preferred_crate) = self.preferred_crate
+                && let Some(index) = crates.iter().position(|&krate| krate == preferred_crate)
+            {
+                crates.swap(0, index);
+            }
+
+            for crate_id in crates {
                 // Note: `mod` declarations in block modules cannot be supported here
                 let crate_def_map = crate_def_map(self.db, crate_id);
                 let n_mods = mods.len();
