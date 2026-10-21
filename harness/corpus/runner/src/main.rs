@@ -5,6 +5,9 @@ macro_rules! case {
 }
 
 fn main() {
+    if std::env::var_os("DEBUGINFO_PERF").is_some() {
+        std::hint::black_box(profiling::run());
+    }
     use aggregates::*;
     use enums::*;
     for (a, b) in [(1u32, 2u32), (1000, 7), (77, 0), (4_000, 123_456)] {
