@@ -1,0 +1,88 @@
+# The crates.io sweep (docs/reports/SWEEP1000.md): every crate of harness/sweep1000.txt has its
+# own tests built by cargo and by rustd under both backends, and their output compared. The list
+# is split over the shards' machines; `report` adds up what they found. A crate's row is in the
+# artifact: `cratetest.py harness/vendor/<name>` runs it again.
+name: sweep
+on:
+  # A push to a `sweep/...` branch sweeps that commit.
+  push:
+    branches: ["sweep/**"]
+  schedule:
+    - cron: "0 6 * * 0"
+  workflow_dispatch:
+    inputs:
+      crates:
+        description: only these crates (name-version, space-separated); the whole list if empty
+        required: false
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  sweep:
+    name: sweep (${{ matrix.shard }} of 16)
+    runs-on: warp-ubuntu-latest-x64-16x
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+      - uses: ./.github/actions/rustd
+      - name: Sweep
+        working-directory: harness
+        env:
+          CRATES: ${{ inputs.crates }}
+        run: |
+          sudo apt-get install -y libssl-dev pkg-config protobuf-compiler libudev-dev libdbus-1-dev
+          list=${CRATES:-$(cat sweep1000.txt)}
+          mine=$(printf '%s\n' $list | awk -v n=16 -v i=${{ matrix.shard }} 'NR % n == i')
+          # A crate that takes longer than this is reported as a timeout, not waited for.
+          RUSTD_BIN="$GITHUB_WORKSPACE/target/release/rustd" CLEAN=1 JOBS=4 TIMEOUT=1200 \
+            BACKENDS="cranelift llvm" ./cratesweep.sh "$RUNNER_TEMP/sweep" $mine
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sweep-${{ matrix.shard }}
+          path: ${{ runner.temp }}/sweep
+
+  report:
+    needs: sweep
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sweep-*
+          merge-multiple: true
+          path: sweep
+      - name: Report
+        run: |
+          for backend in cranelift llvm; do
+            [ -d "sweep/$backend" ] || continue
+            {
+              echo "## $backend"
+              echo '```'
+              cut -f3 sweep/$backend/*.status | sed -E 's/^(MATCH|MISMATCH|UNTESTED|UNSTABLE|TIMEOUT|FAILED).*/\1/' | sort | uniq -c
+              grep -hE $'\t(MISMATCH|TIMEOUT|FAILED)' sweep/$backend/*.status | cut -f1,3 | cut -c1-200
+              echo
+              python3 harness/sweepreport.py "sweep/$backend" | sed -n '/ tests, /,$p'
+              echo '```'
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+          # Fails when a crate's tests print something else under rustd.
+          ! grep -lE $'\tMISMATCH' sweep/*/*.status
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sweep
+          path: sweep

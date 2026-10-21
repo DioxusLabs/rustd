@@ -29,7 +29,6 @@ use crate::{
     consteval::try_const_usize,
     db::HirDatabase,
     db::InternedClosure,
-    drop::{DropGlue, has_drop_glue},
     generics::generics,
     layout::CoroutineFrame,
     layout::struct_tail_erasing_lifetimes,
@@ -514,10 +513,7 @@ impl<'db> Types<'db> {
             ),
         }
         .ok()?;
-        let held = body.locals_held_across_yields(|local| {
-            has_drop_glue(&self.infcx, body.locals[local].ty.as_ref(), self.env.param_env)
-                != DropGlue::None
-        });
+        let held = body.locals_held_across_yields(&self.infcx, self.env.param_env);
         let closure = id.0.loc(self.db);
         let store = ExpressionStore::of(self.db, closure.owner.expression_store_owner(self.db));
         let bindings = body.local_to_binding_map();

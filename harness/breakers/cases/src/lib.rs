@@ -178,4 +178,5 @@ cases![
     literal_operands,
     moved_bits_unread,
     const_location,
+    let_into_binding,
 ];

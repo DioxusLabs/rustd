@@ -40,7 +40,7 @@ Writes CARGO-RUSTD.md and cargo_rustd.json next to this file or in `RUSTD_REPORT
 CARGO-RUSTD-LLVM.md and cargo_rustd_llvm.json under `RUSTD_BACKEND=llvm`. A run of some projects replaces their rows
 and keeps the others. `--small` is the three projects of the CI job.
 """
-import collections, glob, json, os, pathlib, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
+import collections, contextlib, glob, json, os, pathlib, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -382,8 +382,26 @@ def fetched(url):
     return lambda timeout: urllib.request.urlopen(url, timeout=timeout).read().decode()
 
 
+@contextlib.contextmanager
+def port_held():
+    """The servers' port to this run alone: CI runs both backends' projects on one machine at once,
+    and a server the other run started answers for this one, or takes its port."""
+    if WINDOWS:
+        yield
+        return
+    import fcntl
+    with open(__file__) as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        yield
+
+
 def served(side, command, ask):
     """What the server `cargo run` starts on `side` answers when `ask` asks it."""
+    with port_held():
+        return serving(side, command, ask)
+
+
+def serving(side, command, ask):
     server = subprocess.Popen(side.argv("run", *command), cwd=side.ws, env=side.env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, **OWN_GROUP)
     try:
         for _ in range(3000):

@@ -4,7 +4,7 @@
 usage: fuzz.py smoke                                   a short run on fixed seeds, for CI
        fuzz.py run --seed S --rounds N [--jobs J]      the long mode: N programs from seed S
        fuzz.py repro SEED-ROUND [CASE ...]             one program again, or only some of its cases
-       fuzz.py check FILE.rs ...                       reductions under found/, each on its own
+       fuzz.py check [FILE.rs ...] [--jobs J]          reductions under found/, each on its own
        fuzz.py report DIR                              adds up the logs a run left in DIR
 
 A round is one program (`gen.py`) of `--cases` cases, built once by cargo and once by rustd under
@@ -15,7 +15,7 @@ found in the run is counted and not reduced a second time.
 
 RUSTD_BIN names the rustd under test. The exit status is 1 when there is a finding.
 """
-import argparse, collections, contextlib, json, os, re, shutil, subprocess, sys, tempfile, time
+import argparse, collections, contextlib, json, multiprocessing, os, re, shutil, subprocess, sys, tempfile, time
 
 try:
     import resource
@@ -412,22 +412,36 @@ def main():
 def check(args):
     """Each reduction given, or all of found/: whether rustd's build still differs from rustc's."""
     paths = args.targets or sorted(os.path.join(FOUND, name) for name in os.listdir(FOUND) if name.endswith(".rs"))
-    project = Project(os.path.join(args.work, "check"))
-    wrong = 0
-    for path in paths:
-        path = path if os.path.exists(path) else os.path.join(FOUND, path)
-        modules, edition = read_found(path)
-        rejected = project.reference(modules, edition)
-        if rejected is not None:
-            print(f"REJECTED  {os.path.basename(path)}: {rejected[-300:]}")
-            wrong += 1
-            continue
-        for backend in args.backends:
-            findings, _ = project.rustd(backend)
-            wrong += bool(findings)
-            said = "; ".join(f"{f.kind}: {f.key}" for f in findings)
-            print(f"{'DIFFERENT' if findings else 'same     '} {os.path.basename(path)} ({backend}) {said}", flush=True)
+    paths = [path if os.path.exists(path) else os.path.join(FOUND, path) for path in paths]
+    jobs = max(1, min(args.jobs, len(paths)))
+    with multiprocessing.get_context("fork" if hasattr(os, "fork") else "spawn").Pool(jobs, check_start, (args,)) as pool:
+        wrong = 0
+        for lines, bad in pool.imap(check_one, paths):
+            print("\n".join(lines), flush=True)
+            wrong += bad
     return 1 if wrong else 0
+
+
+def check_start(args):
+    global checking
+    checking = args, Project(os.path.join(args.work, f"check-{os.getpid()}"))
+
+
+def check_one(path):
+    """The lines `check` prints for one reduction, and how many of them differ."""
+    args, project = checking
+    name = os.path.basename(path)
+    modules, edition = read_found(path)
+    rejected = project.reference(modules, edition)
+    if rejected is not None:
+        return [f"REJECTED  {name}: {rejected[-300:]}"], 1
+    lines, wrong = [], 0
+    for backend in args.backends:
+        findings, _ = project.rustd(backend)
+        wrong += bool(findings)
+        said = "; ".join(f"{f.kind}: {f.key}" for f in findings)
+        lines.append(f"{'DIFFERENT' if findings else 'same     '} {name} ({backend}) {said}")
+    return lines, wrong
 
 
 if __name__ == "__main__":

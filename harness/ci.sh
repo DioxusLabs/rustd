@@ -102,9 +102,9 @@ want=$2
 # Parts take about the same time each, by the times CI measured for each harness.
 part() {
     case "$1" in
-    storekills.py | difftest.py | programs.py | storefull.py | fuzz/fuzz.py) echo store ;;
+    storekills.py | difftest.py | programs.py | storefull.py | fuzz/fuzz.py | fuzz/edits.py) echo store ;;
     keys.py | remote.py | stress.py) echo keys ;;
-    buildmodel.py | storecorrupts.py | storeshared.py | fuzz/edits.py | storeguards.py | worktrees.py | selects.py) echo model ;;
+    buildmodel.py | storecorrupts.py | storeshared.py | storeguards.py | worktrees.py | selects.py) echo model ;;
     *) echo codegen ;;
     esac
 }
@@ -134,10 +134,13 @@ if macos; then
     run worktrees.py --overlay
 fi
 run keys.py
-# Generated programs and edits on fixed seeds. Only x86-64 has been fuzzed so far.
+# Generated programs and edits on fixed seeds, and every reduction the fuzzers have found.
+# Only x86-64 has been fuzzed so far.
 if linux && [ "$arch" = x86_64 ]; then
     run fuzz/fuzz.py smoke --backends "$RUSTD_BACKEND"
+    run fuzz/fuzz.py check --jobs 4 --backends "$RUSTD_BACKEND"
     run fuzz/edits.py smoke --backends "$RUSTD_BACKEND"
+    run fuzz/edits.py check --backends "$RUSTD_BACKEND"
 fi
 # How much of the corpus LLVM compiled itself, and what it left to Cranelift and why.
 if [ "$RUSTD_BACKEND" = llvm ]; then run backends.py corpus runner cases --bin runner --levels 2f; fi
