@@ -199,6 +199,7 @@ pub fn ready(mut future: std::pin::Pin<Box<dyn Future<Output = u32> + Send + '_>
 /// Types rustc hashes for `TypeId`s asked for by code rustd compiles.
 pub mod typeids {
     use std::any::{Any, TypeId};
+    use std::fmt::Debug;
 
     pub enum Status {
         Bad(u32),
@@ -214,5 +215,18 @@ pub mod typeids {
 
     pub fn bad_id() -> TypeId {
         id(&Status::Bad)
+    }
+
+    pub trait Unpack {
+        /// A struct of a function declared in this body, whose `TypeId` only the caller asks for.
+        fn hidden(step: u32) -> impl Any + Debug {
+            fn error(step: u32) -> impl Any + Debug {
+                #[derive(Debug)]
+                struct Named(u32);
+
+                Named(step)
+            }
+            error(step)
+        }
     }
 }

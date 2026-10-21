@@ -279,14 +279,17 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
     /// A function that the items of its body are children of.
     fn body_path(&mut self, func: FunctionId) -> Option<Fingerprint> {
         let db = self.db;
+        let name = &FunctionSignature::of(db, func).name;
         let parent = match func.lookup(db).container {
             ItemContainerId::ImplId(id) if self.ours => self.own_impl(id)?,
             ItemContainerId::ImplId(id) => self.impl_path(id)?,
+            ItemContainerId::ModuleId(module) if module.is_block_module(db) && !self.ours => {
+                self.around_local(module.block(db)?, name)?
+            }
             ItemContainerId::ModuleId(module) => self.module(module)?,
             ItemContainerId::TraitId(trait_) => self.trait_path(trait_)?,
             ItemContainerId::ExternBlockId(_) => return None,
         };
-        let name = &FunctionSignature::of(db, func).name;
         // `#[test]` and `#[bench]` put a constant of the function's name ahead of it.
         let flags = AttrFlags::query(db, func.into());
         let earlier = u32::from(flags.intersects(AttrFlags::IS_TEST | AttrFlags::IS_BENCH));
