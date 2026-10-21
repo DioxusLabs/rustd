@@ -1167,6 +1167,9 @@ def incremental(work):
     check("an edit runs the test that reaches it", [it for it in every if it != "ta"])
     open(lib, "w").write(edited.replace("+ 1 }", "+ 2 }"))
     check("an edit of what writes a static runs the tests that reach it", ["abort", "sleep", "ta", "tb", "tp"])
+    isolated = edited.replace("+ 1 }", "+ 2 }").replace("super::hit() >= 1", "super::hit() > 0", 1)
+    open(lib, "w").write(isolated)
+    check("an edit of one test leaves another that shares its static cached", [it for it in every if it != "h1"])
     check("--rerun-all runs every test", [], "--rerun-all")
     check("RUSTD_TEST_CACHE=0 runs every test", [], env={"RUSTD_TEST_CACHE": "0"})
     check("a filter lists the cached test", ["tb"], "tb", listed=1)
@@ -1182,6 +1185,60 @@ def incremental(work):
     check("a test that runs too long is stopped", [], env={"INCREMENTAL_SLEEP": "1", "RUSTD_TEST_TIMEOUT": "2"}, failed=["sleep"])
     held = "---- tests::abort stdout ----" in aborted.stdout and "failures:\n    tests::abort" in aborted.stdout
     checks.append(("incremental: a test that aborts is listed among the failures", held, ""))
+    side.cargo("stop")
+    checks.extend(memory_cache(work))
+    return checks
+
+
+def memory_cache(work):
+    """Memory instrumentation is observable by tests, but need not change per step."""
+    ws = os.path.realpath(os.path.join(work, "memory-cache"))
+    os.makedirs(os.path.join(ws, "src"), exist_ok=True)
+    open(os.path.join(ws, "Cargo.toml"), "w").write('[package]\nname = "memory-cache"\nversion = "0.1.0"\nedition = "2021"\n')
+    open(os.path.join(ws, "src/lib.rs"), "w").write('''#[cfg(test)] mod tests {
+    #[test] fn memory_directory() {
+        assert!(std::env::var("RUSTD_MEMORY").is_ok_and(|it| it.ends_with("memory")));
+    }
+    #[test] fn ordinary() {}
+    #[test] #[ignore] fn ignored() {}
+}
+''')
+    env = base_env(os.path.join(work, "home-memory-cache"))
+    env.pop("RUSTD_MEMORY", None)
+    side, reference = Side(ws, env, True), Side(ws, env, False)
+    checks = []
+    every = ["ignored", "memory_directory", "ordinary"]
+    reports = os.path.join(env["RUSTD_HOME"], "memory")
+    samples = os.path.join(work, "memory-samples")
+    os.makedirs(samples, exist_ok=True)
+
+    def check(name, directory, cached, failed=()):
+        changed = {} if directory is None else {"RUSTD_MEMORY": directory}
+        _, cargo = reference.cargo("test", "--lib", env={"RUSTD_MEMORY": reports if directory is None else directory})
+        if sys.platform == "linux":
+            label = f"step-{len(checks)}"
+            command = [sys.executable, os.path.join(HERE, "memory_run.py"), label, "--", *side.argv("test", "--lib")]
+            _, sampled = timed(command, ws, dict(side.env, RUSTD_REPORTS=samples, **changed))
+            output = open(os.path.join(samples, label, "command.log")).read()
+            ran = subprocess.CompletedProcess(command, sampled.returncode, output, sampled.stderr)
+        else:
+            _, ran = side.cargo("test", "--lib", env={"RUSTD_MEMORY": reports if directory is None else directory})
+        results = dict(re.findall(r"^test tests::(\w+) \.\.\. (.+)$", ran.stdout, re.M))
+        found = sorted(name for name, result in results.items() if result.endswith("(cached)"))
+        failing = sorted(name for name, result in results.items() if result.startswith("FAILED"))
+        same = difference(test_results(cargo), test_results(ran)) is None
+        held = same and len(results) == len(every) and found == sorted(cached) and failing == sorted(failed)
+        checks.append((f"memory cache: {name}", held, f"cached {found}, failed {failing}"))
+        print(f"  {'ok ' if held else 'NOT'} memory cache: {name}  cached {found}, failed {failing}", flush=True)
+
+    changed = os.path.join(work, "changed-reports-directory")
+    check("cold instrumented tests run", None, [])
+    check("stable instrumentation caches ordinary, env-reading and ignored tests", None, every)
+    check("a changed report path is observable and invalidates results", changed, [], ["memory_directory"])
+    check("a failure is rerun with the same instrumentation", changed, ["ignored", "ordinary"], ["memory_directory"])
+    check("an empty report path is observable", "", [], ["memory_directory"])
+    check("restoring the report path reruns tests", None, [])
+    check("the restored instrumentation caches tests again", None, every)
     side.cargo("stop")
     return checks
 

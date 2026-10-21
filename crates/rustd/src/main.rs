@@ -6819,7 +6819,7 @@ impl Tests {
         let print = |it: Option<u128>| it.map_or("-".to_owned(), |it| format!("{it:032x}"));
         let mut lines = String::new();
         for ((_, name), reached) in std::iter::zip(&tests, &reached) {
-            let _ = writeln!(lines, "test {} {} {name}", print(reached.print), reached.group);
+            let _ = writeln!(lines, "test {} {} {name}", print(reached.alone), reached.group);
         }
         lines
     }

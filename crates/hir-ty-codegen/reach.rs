@@ -34,6 +34,8 @@ enum Node {
 pub struct Reached {
     /// `None` when something it reaches did not compile: what that calls is not known.
     pub print: Option<u128>,
+    /// The print when the test runs in a process of its own.
+    pub alone: Option<u128>,
     /// Equal for tests that reach a static the program can write, directly or through a
     /// chain of tests that do: one of them can leave there what another finds.
     pub group: usize,
@@ -339,7 +341,7 @@ pub fn reached(
     let reached = std::iter::zip(group, alone)
         .map(|(group, alone)| {
             let all = together[&group].as_ref();
-            Reached { print: alone.zip(all).map(|it| print_of(&it)), group }
+            Reached { print: alone.zip(all).map(|it| print_of(&it)), alone, group }
         })
         .collect();
     (reached, everywhere.as_ref().map(print_of), graph.unknown)
