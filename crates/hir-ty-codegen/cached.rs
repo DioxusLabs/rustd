@@ -495,9 +495,9 @@ pub(super) struct Entries {
 
 #[derive(Default)]
 struct Known {
-    entries: FxHashMap<Arc<str>, Option<Arc<Entry>>>,
+    entries: FxHashMap<[u8; KEY], Option<Arc<Entry>>>,
     /// Whether the program can be built from an entry and everything it calls.
-    usable: FxHashMap<Arc<str>, bool>,
+    usable: FxHashMap<[u8; KEY], bool>,
     types: FxHashMap<[u8; KEY], Option<TypeSet>>,
 }
 
@@ -657,7 +657,7 @@ impl Drop for Writer {
 
 /// An entry on the way down from the one asked about.
 struct Visit {
-    name: Arc<str>,
+    key: [u8; KEY],
     entry: Arc<Entry>,
     /// How many of the functions the entry refers to have been looked at.
     seen: usize,
@@ -694,12 +694,16 @@ impl Entries {
     }
 
     pub(super) fn get(&self, name: &str) -> Option<Arc<Entry>> {
-        if let Some(known) = self.known().entries.get(name) {
+        let key = Entry::key(name, self.debug, self.program.as_ref())?;
+        self.get_key(name, key)
+    }
+
+    fn get_key(&self, name: &str, key: [u8; KEY]) -> Option<Arc<Entry>> {
+        if let Some(known) = self.known().entries.get(&key) {
             return known.clone();
         }
         let banned = Self::banned().lock().unwrap_or_else(|e| e.into_inner()).contains(name);
         let read = || {
-            let key = Entry::key(name, self.debug, self.program.as_ref())?;
             let mut entry = Entry::decode(&self.store.get(&key)?)?;
             if let Some(debug) = &mut entry.debug {
                 let types = debug.stored_types.iter().map(|key| self.types(key));
@@ -712,7 +716,7 @@ impl Entries {
             .then(|| tally.step(super::backend::Step::StoreRead, read))
             .flatten()
             .map(Arc::new);
-        self.known().entries.insert(Arc::from(name), entry.clone());
+        self.known().entries.insert(key, entry.clone());
         entry
     }
 
@@ -754,28 +758,28 @@ impl Entries {
         self.known().types.entry(*key).or_insert_with(|| Some(types.clone())).clone()
     }
 
-    fn settle(&self, name: Arc<str>, usable: bool) {
-        self.known().usable.insert(name, usable);
+    fn settle(&self, key: [u8; KEY], usable: bool) {
+        self.known().usable.insert(key, usable);
     }
 
     /// Whether there is an entry for `name` and for everything it calls, and what they import
     /// is in the program, as `defines` tells.
     pub(super) fn usable(&self, name: &str, defines: &dyn Fn(&str) -> bool) -> bool {
-        let settled = |name: &str| self.known().usable.get(name).copied();
-        if let Some(usable) = settled(name) {
+        let Some(key) = Entry::key(name, self.debug, self.program.as_ref()) else { return false };
+        let settled = |key: &[u8; KEY]| self.known().usable.get(key).copied();
+        if let Some(usable) = settled(&key) {
             return usable;
         }
-        let name: Arc<str> = Arc::from(name);
-        let Some(entry) = self.get(&name).filter(|it| it.links(defines)) else {
-            self.settle(name, false);
+        let Some(entry) = self.get_key(name, key).filter(|it| it.links(defines)) else {
+            self.settle(key, false);
             return false;
         };
         // Entries call each other in circles, so one is only known to be usable along with
         // the ones it leans on.
-        let mut unsettled = vec![name.clone()];
-        let mut leaning = FxHashMap::<Arc<str>, usize>::default();
-        leaning.insert(name.clone(), 0);
-        let mut path = vec![Visit { name, entry, seen: 0, leans_on: 0, below: 0 }];
+        let mut unsettled = vec![key];
+        let mut leaning = FxHashMap::<[u8; KEY], usize>::default();
+        leaning.insert(key, 0);
+        let mut path = vec![Visit { key, entry, seen: 0, leans_on: 0, below: 0 }];
         while !path.is_empty() {
             let depth = path.len() - 1;
             let visit = &mut path[depth];
@@ -783,39 +787,44 @@ impl Entries {
             let Some(callee) = entry.named().nth(visit.seen) else {
                 let Some(done) = path.pop() else { break };
                 if done.leans_on >= depth {
-                    for name in unsettled.drain(done.below..) {
-                        leaning.remove(&name);
-                        self.settle(name, true);
+                    for key in unsettled.drain(done.below..) {
+                        leaning.remove(&key);
+                        self.settle(key, true);
                     }
                 } else {
-                    leaning.insert(done.name, done.leans_on);
+                    leaning.insert(done.key, done.leans_on);
                     let above = &mut path[depth - 1];
                     above.leans_on = above.leans_on.min(done.leans_on);
                 }
                 continue;
             };
             visit.seen += 1;
-            if let Some(&on) = leaning.get(callee) {
-                visit.leans_on = visit.leans_on.min(on);
-                continue;
-            }
-            let found = match settled(callee) {
-                Some(true) => continue,
-                Some(false) => None,
-                None => self.get(callee).filter(|it| it.links(defines)),
-            };
-            let callee: Arc<str> = Arc::from(callee);
-            let Some(entry) = found else {
-                self.settle(callee, false);
+            let Some(key) = Entry::key(callee, self.debug, self.program.as_ref()) else {
                 for visit in path {
-                    self.settle(visit.name, false);
+                    self.settle(visit.key, false);
                 }
                 return false;
             };
-            leaning.insert(callee.clone(), depth + 1);
-            unsettled.push(callee.clone());
+            if let Some(&on) = leaning.get(&key) {
+                visit.leans_on = visit.leans_on.min(on);
+                continue;
+            }
+            let found = match settled(&key) {
+                Some(true) => continue,
+                Some(false) => None,
+                None => self.get_key(callee, key).filter(|it| it.links(defines)),
+            };
+            let Some(entry) = found else {
+                self.settle(key, false);
+                for visit in path {
+                    self.settle(visit.key, false);
+                }
+                return false;
+            };
+            leaning.insert(key, depth + 1);
+            unsettled.push(key);
             path.push(Visit {
-                name: callee,
+                key,
                 entry,
                 seen: 0,
                 leans_on: depth + 1,
@@ -851,6 +860,72 @@ mod tests {
         signature.params.push(AbiParam::new(types::I64));
         signature.returns.push(AbiParam::new(types::I32));
         signature
+    }
+
+    fn with_entries(test: impl FnOnce(&Entries)) {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let at = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("rustd-entry-{}-{at}", std::process::id()));
+        let store = Box::leak(Box::new(Store::for_test(&dir)));
+        test(&Entries::new(store, true, None, None, None));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn keep_entry(entries: &Entries, name: &str, targets: Vec<CachedTarget>) {
+        let funcs =
+            targets.into_iter().map(|target| CachedFunc { target, sig: signature() }).collect();
+        let entry = Entry {
+            label: name.to_owned(),
+            funcs,
+            datas: Vec::new(),
+            code: code(Vec::new()),
+            debug: None,
+        };
+        let key = Entry::key(name, entries.debug, entries.program.as_ref()).unwrap();
+        entries.store.insert(&key, &entry.encode().unwrap());
+        entries.store.flush();
+    }
+
+    #[test]
+    fn missing_entries_keep_only_fixed_size_keys() {
+        with_entries(|entries| {
+            let name = "a long missing name::".repeat(4096);
+            assert!(entries.get(&name).is_none());
+            assert!(!entries.usable(&name, &|_| true));
+            assert!(!entries.usable(&name, &|_| true));
+            let key = Entry::key(&name, true, None).unwrap();
+            let known = entries.known();
+            assert_eq!(known.entries.len(), 1);
+            assert_eq!(known.usable.len(), 1);
+            assert!(known.entries[&key].is_none());
+            assert!(!known.usable[&key]);
+        });
+    }
+
+    #[test]
+    fn entry_cycles_are_usable_and_share_the_decoded_entry() {
+        with_entries(|entries| {
+            keep_entry(entries, "a", vec![CachedTarget::Named("b".to_owned())]);
+            keep_entry(entries, "b", vec![CachedTarget::Named("a".to_owned())]);
+            assert!(entries.usable("a", &|_| true));
+            assert!(entries.usable("b", &|_| true));
+            let first = entries.get("a").unwrap();
+            assert!(Arc::ptr_eq(&first, &entries.get("a").unwrap()));
+        });
+    }
+
+    #[test]
+    fn entries_with_missing_dependencies_or_imports_are_not_usable() {
+        with_entries(|entries| {
+            keep_entry(entries, "a", vec![CachedTarget::Named("missing".to_owned())]);
+            keep_entry(
+                entries,
+                "b",
+                vec![CachedTarget::Import { symbol: "missing".to_owned(), checked: true }],
+            );
+            assert!(!entries.usable("a", &|_| false));
+            assert!(!entries.usable("b", &|_| false));
+        });
     }
 
     fn reloc(offset: u32, namespace: u32, index: u32) -> CachedReloc {

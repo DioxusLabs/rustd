@@ -974,6 +974,11 @@ pub fn is_off(value: &std::ffi::OsStr) -> bool {
 }
 
 impl Store {
+    #[cfg(test)]
+    pub(super) fn for_test(dir: &Path) -> Store {
+        Self::open(dir, Identity::new(b"test", "test"), Tuning { seal_at: 1, limit: None }).unwrap()
+    }
+
     /// The store of this process: the directory `RUSTD_CACHE` names, when it names one. A
     /// directory that cannot be used is said once, and the process compiles without one.
     pub(super) fn global() -> Option<&'static Store> {

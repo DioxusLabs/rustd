@@ -323,6 +323,72 @@ pub trait SymbolResolver {
 /// What an instance is called in every run of the daemon, if anything.
 type StableName = std::sync::Arc<str>;
 
+#[derive(Default)]
+struct StableNameCache {
+    names: FxHashMap<Instance, Option<StableName>>,
+    bytes: usize,
+}
+
+impl StableNameCache {
+    const BYTES: usize = 4 * 1024 * 1024;
+    const NAMES: usize = 4096;
+
+    fn get(&self, instance: &Instance) -> Option<&Option<StableName>> {
+        self.names.get(instance)
+    }
+
+    fn insert(&mut self, instance: Instance, name: Option<StableName>) {
+        let bytes = name.as_ref().map_or(0, |it| it.len());
+        if bytes > Self::BYTES {
+            return;
+        }
+        if self.bytes + bytes > Self::BYTES || self.names.len() == Self::NAMES {
+            self.names.clear();
+            self.bytes = 0;
+        }
+        self.bytes += bytes;
+        self.names.insert(instance, name);
+    }
+}
+
+#[cfg(test)]
+mod stable_name_cache_tests {
+    use super::*;
+
+    fn instance(checked: bool) -> Instance {
+        Instance { def: InstanceDef::DropGlue, args: GenericArgs::empty().store(), checked }
+    }
+
+    #[test]
+    fn names_are_shared_and_missing_names_are_memoized() {
+        let mut cache = StableNameCache::default();
+        assert!(cache.get(&instance(true)).is_none());
+        cache.insert(instance(true), None);
+        assert_eq!(cache.get(&instance(true)), Some(&None));
+        let name = StableName::from("a name");
+        cache.insert(instance(false), Some(name.clone()));
+        assert!(std::sync::Arc::ptr_eq(
+            cache.get(&instance(false)).unwrap().as_ref().unwrap(),
+            &name
+        ));
+    }
+
+    #[test]
+    fn names_do_not_keep_more_than_the_byte_budget() {
+        let mut cache = StableNameCache::default();
+        let name = StableName::from("x".repeat(StableNameCache::BYTES / 2 + 1));
+        cache.insert(instance(true), Some(name.clone()));
+        cache.insert(instance(false), Some(name.clone()));
+        assert!(cache.get(&instance(true)).is_none());
+        assert!(cache.get(&instance(false)).is_some());
+        assert_eq!(cache.bytes, name.len());
+        let oversized = StableName::from("x".repeat(StableNameCache::BYTES + 1));
+        cache.insert(instance(true), Some(oversized));
+        assert!(cache.get(&instance(true)).is_none());
+        assert_eq!(cache.bytes, name.len());
+    }
+}
+
 pub type ParallelWork<'a> = dyn Fn(&dyn HirDatabase, &dyn SymbolResolver, usize) + Sync + 'a;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1148,7 +1214,7 @@ struct ObjectCodegen<'a, 'db> {
     names: stable::StableNames<'a, 'db>,
     /// Whether the code of the checkout's crates can come from the store.
     hydrate: bool,
-    stable_names: FxHashMap<Instance, Option<StableName>>,
+    stable_names: StableNameCache,
     kept: Kept,
     /// The entries of the store to build from in place of compiling, if any.
     entries: Option<std::sync::Arc<cached::Entries>>,
@@ -3344,7 +3410,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             location_counter: 0,
             names: stable::StableNames::new(db, symbols, own_statics.crates.clone(), hydrate),
             hydrate,
-            stable_names: FxHashMap::default(),
+            stable_names: StableNameCache::default(),
             kept: Kept::default(),
             // A patch gets these from its base, and a check compiles them to compare.
             entries: store
@@ -3880,7 +3946,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if let Some(known) = self.stable_names.get(instance) {
             return known.clone();
         }
-        let name = self.names.instance(instance).map(StableName::from);
+        let name = self.names.instance(instance).map(|name| {
+            if let Some((known, _)) = self.named.get_key_value(name.as_str()) {
+                known.clone()
+            } else {
+                StableName::from(name)
+            }
+        });
         self.stable_names.insert(instance.clone(), name.clone());
         name
     }
@@ -4193,7 +4265,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// The function of an entry and everything it calls, declared here and to be defined from
     /// the store. `None` when the store does not have all of it, or `body` is given and is
     /// not the signature the entry was compiled with.
-    fn found_callee(&mut self, name: &str, body: Option<&Signature>) -> Result<Option<FuncId>> {
+    fn found_callee(
+        &mut self,
+        name: &str,
+        body: Option<&Signature>,
+        shared: Option<&StableName>,
+    ) -> Result<Option<FuncId>> {
         if let Some(&id) = self.named.get(name) {
             return Ok(Some(id));
         }
@@ -4219,7 +4296,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             .module
             .declare_function(&symbol, linkage, entry.code.signature())
             .map_err(|e| CodegenError::Backend(e.to_string()))?;
-        let name = StableName::from(name);
+        let name = shared.cloned().unwrap_or_else(|| StableName::from(name));
         self.named.insert(name.clone(), id);
         self.found.push((name.clone(), id));
         self.found_pending.push((name, id));
@@ -4249,7 +4326,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     self.import(&symbol, &func.sig)?
                 }
                 CachedTarget::Named(callee) => {
-                    let Some(id) = self.found_callee(callee, None)? else {
+                    let Some(id) = self.found_callee(callee, None, None)? else {
                         unsupported!("an entry calls `{callee}`, which the store lacks");
                     };
                     id
@@ -4855,7 +4932,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 return self.import(symbol, sig);
             }
             let body = signature.is_some().then_some(sig);
-            if let Some(id) = self.found_callee(name, body)? {
+            if let Some(id) = self.found_callee(name, body, Some(name))? {
                 self.instances.insert(instance.clone(), id);
                 return Ok(id);
             }
