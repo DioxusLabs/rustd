@@ -32,3 +32,26 @@ impl<T> Callsite<T> {
 pub fn visit_callsites() -> (u32, u32, u32) {
     Callsite(0u8).visit()
 }
+
+pub use reexports::Issue;
+
+mod reexports {
+    pub use items::Issue;
+    pub(crate) use items::*;
+
+    mod items {
+        pub use super::defs::*;
+    }
+
+    mod defs {
+        pub struct Issue {
+            pub value: u32,
+        }
+
+        impl Issue {
+            pub fn value(self) -> u32 {
+                self.value
+            }
+        }
+    }
+}

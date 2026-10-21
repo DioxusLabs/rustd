@@ -15,6 +15,7 @@ macro_rules! cases {
 }
 
 cases![
+    explicit_and_glob_reexport,
     chained_rpitit,
     imported_callsite,
     niche_eq,
