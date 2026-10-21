@@ -1,5 +1,17 @@
 //! Declarations and generic code supplied by a crate left to rustc.
 
+pub mod keys {
+    pub trait Key {
+        fn key(&self) -> u32;
+    }
+
+    impl Key for u8 {
+        fn key(&self) -> u32 {
+            *self as u32 + 3
+        }
+    }
+}
+
 unsafe extern "C" {
     pub fn abs(value: i32) -> i32;
     #[link_name = "labs"]
