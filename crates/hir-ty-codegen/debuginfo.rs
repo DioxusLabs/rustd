@@ -544,8 +544,13 @@ impl Dwarf {
             dwarf: DwarfUnit::new(encoding),
             full: Sections::new(SectionWriter::default()),
             apart: apart.map(|name| {
-                let split =
-                    split::Split::new(encoding, directory.as_bytes().to_vec(), name.clone());
+                let split = split::Split::new(
+                    encoding,
+                    directory.as_bytes().to_vec(),
+                    name.clone(),
+                    isa.triple().binary_format,
+                    isa.triple().architecture,
+                );
                 (name, split)
             }),
             units: 0,
@@ -1150,7 +1155,7 @@ impl Dwarf {
             place(product, self.sections()?)?;
             return Ok(Vec::new());
         };
-        let (sections, files) = split.finish(&product.object)?;
+        let (sections, files) = split.finish()?;
         place(product, sections)?;
         Ok(files)
     }
@@ -1166,7 +1171,18 @@ struct Section {
 pub struct Sidecar {
     /// Where the unit left in the object says the file is.
     pub name: String,
+    /// A temporary file containing the unit, written while it was encoded.
+    /// It is renamed to `name` only after the object is ready.
+    pub staged: Option<std::path::PathBuf>,
     pub bytes: Vec<u8>,
+}
+
+impl Drop for Sidecar {
+    fn drop(&mut self) {
+        if let Some(path) = self.staged.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// Writes the sections into the object, each with what the linker is to fill in. A Mach-O
@@ -1423,6 +1439,70 @@ impl Writer for SectionWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn staging_directory() -> std::path::PathBuf {
+        let nonce =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("rustd-dwo-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn split_units_are_staged_and_cleaned_up() {
+        let directory = staging_directory();
+        let object = directory.join("unit.o");
+        let isa =
+            super::super::Target::selected().and_then(|it| it.isa("backtracking", false)).unwrap();
+        let mut dwarf = Dwarf::new(&*isa, "/", true, Some(object.to_str().unwrap().to_owned()));
+        let debug = FunctionDebug::new("f".to_owned(), "f".to_owned());
+        dwarf.add_function(FuncId::from_u32(0), 8, &debug);
+        dwarf.end_unit();
+        assert!(dwarf.error.is_none());
+        let (_, split) = dwarf.apart.take().unwrap();
+        let (_, files) = split.finish().unwrap();
+        assert_eq!(files.len(), 1);
+        let staged = files[0].staged.as_ref().unwrap().clone();
+        assert!(!std::fs::read(&staged).unwrap().is_empty());
+        assert!(!std::path::Path::new(&files[0].name).exists());
+        assert!(files[0].bytes.is_empty());
+        drop(files);
+        assert!(!staged.exists());
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn unfinished_split_build_removes_staged_units() {
+        let directory = staging_directory();
+        let object = directory.join("unit.o");
+        let isa =
+            super::super::Target::selected().and_then(|it| it.isa("backtracking", false)).unwrap();
+        let mut dwarf = Dwarf::new(&*isa, "/", true, Some(object.to_str().unwrap().to_owned()));
+        let debug = FunctionDebug::new("f".to_owned(), "f".to_owned());
+        dwarf.add_function(FuncId::from_u32(0), 8, &debug);
+        dwarf.end_unit();
+        assert!(dwarf.error.is_none());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        drop(dwarf);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn split_write_errors_reach_emit() {
+        let directory = staging_directory();
+        let object = directory.join("missing/unit.o");
+        let isa =
+            super::super::Target::selected().and_then(|it| it.isa("backtracking", false)).unwrap();
+        let mut dwarf = Dwarf::new(&*isa, "/", true, Some(object.to_str().unwrap().to_owned()));
+        let debug = FunctionDebug::new("f".to_owned(), "f".to_owned());
+        dwarf.add_function(FuncId::from_u32(0), 8, &debug);
+        dwarf.end_unit();
+        let expected = dwarf.error.clone().unwrap();
+        assert!(matches!(dwarf.sections(), Err(error) if error == expected));
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        std::fs::remove_dir(directory).unwrap();
+    }
 
     #[test]
     fn finished_units_are_encoded() {

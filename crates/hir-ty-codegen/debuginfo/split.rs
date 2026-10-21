@@ -17,11 +17,9 @@ use cranelift_codegen::gimli::{
         Address, DebugLine, LineProgram, LineStringTable, Range, Sections, StringTable, Writer,
     },
 };
-use cranelift_object::object::{
-    self, SectionFlags, SectionKind, elf,
-    write::{Object, StandardSegment},
-};
+use cranelift_object::object::{self, SectionFlags, SectionKind, elf, write::StandardSegment};
 use rustc_hash::FxHashMap;
+use std::path::PathBuf;
 
 use super::{Reloc, Section, SectionWriter, Sidecar, Target};
 
@@ -85,6 +83,8 @@ pub(super) struct Apart {
 /// The sections of an object whose units are kept apart, as they are added to.
 pub(super) struct Split {
     encoding: Encoding,
+    format: object::BinaryFormat,
+    architecture: object::Architecture,
     directory: Vec<u8>,
     /// What the name of each file the entries are read from starts with.
     name: String,
@@ -95,13 +95,36 @@ pub(super) struct Split {
     addr: SectionWriter,
     /// The location lists of the unit being added.
     loc_apart: SectionWriter,
-    files: Vec<(String, [(SectionId, SectionWriter); 3])>,
+    files: Vec<Sidecar>,
 }
 
 impl Split {
-    pub(super) fn new(encoding: Encoding, directory: Vec<u8>, name: String) -> Self {
+    pub(super) fn new(
+        encoding: Encoding,
+        directory: Vec<u8>,
+        name: String,
+        format: target_lexicon::BinaryFormat,
+        architecture: target_lexicon::Architecture,
+    ) -> Self {
+        let format = match format {
+            target_lexicon::BinaryFormat::Elf => object::BinaryFormat::Elf,
+            target_lexicon::BinaryFormat::Macho => object::BinaryFormat::MachO,
+            target_lexicon::BinaryFormat::Coff => object::BinaryFormat::Coff,
+            other => unreachable!("split DWARF on unsupported object format {other:?}"),
+        };
+        let architecture = match architecture {
+            target_lexicon::Architecture::X86_32(_) => object::Architecture::I386,
+            target_lexicon::Architecture::X86_64 => object::Architecture::X86_64,
+            target_lexicon::Architecture::Arm(_) => object::Architecture::Arm,
+            target_lexicon::Architecture::Aarch64(_) => object::Architecture::Aarch64,
+            target_lexicon::Architecture::Riscv64(_) => object::Architecture::Riscv64,
+            target_lexicon::Architecture::S390x => object::Architecture::S390x,
+            other => unreachable!("split DWARF on unsupported architecture {other:?}"),
+        };
         Split {
             encoding,
+            format,
+            architecture,
             directory,
             name,
             info: SectionWriter::default(),
@@ -183,18 +206,24 @@ impl Split {
         ];
         self.skeleton(name.as_bytes(), lines.0, id, of_unit, ranges_base, addr_base)
             .map_err(|e| e.to_string())?;
-        self.files.push((name, sections));
+        let bytes = Self::file(self.format, self.architecture, sections)?;
+        let mut temporary = PathBuf::from(&name);
+        temporary.as_mut_os_string().push(format!(".{}.tmp", std::process::id()));
+        let file = Sidecar { name, staged: Some(temporary.clone()), bytes: Vec::new() };
+        std::fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
+        self.files.push(file);
         Ok(())
     }
 
     /// The file of one unit's entries: an object of nothing but these sections.
     fn file(
-        like: &Object<'_>,
+        format: object::BinaryFormat,
+        architecture: object::Architecture,
         sections: [(SectionId, SectionWriter); 3],
     ) -> Result<Vec<u8>, String> {
-        let (format, architecture) = (like.format(), like.architecture());
         // The sections are written with the low byte first, as every target of ours has it.
-        let mut object = Object::new(format, architecture, object::Endianness::Little);
+        let mut object =
+            object::write::Object::new(format, architecture, object::Endianness::Little);
         for (id, written) in sections {
             let bytes = written.bytes.slice();
             let Some(name) = id.dwo_name().filter(|_| !bytes.is_empty()) else { continue };
@@ -328,12 +357,8 @@ impl Split {
     }
 
     /// The sections to link, and the files of what is kept apart.
-    pub(super) fn finish(self, like: &Object<'_>) -> Result<(Vec<Section>, Vec<Sidecar>), String> {
-        let files = self
-            .files
-            .into_iter()
-            .map(|(name, sections)| Self::file(like, sections).map(|bytes| Sidecar { name, bytes }))
-            .collect::<Result<Vec<_>, _>>()?;
+    pub(super) fn finish(self) -> Result<(Vec<Section>, Vec<Sidecar>), String> {
+        let files = self.files;
         let linked = [
             (SectionId::DebugInfo, self.info),
             (SectionId::DebugAbbrev, self.abbrev),

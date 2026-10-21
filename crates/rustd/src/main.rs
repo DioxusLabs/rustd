@@ -3076,7 +3076,11 @@ fn build(
         weaken::definitions(object);
         // The files a debugger is sent to are there before the object that sends it.
         for file in &unit.apart {
-            replace(Path::new(&file.name), &file.bytes)?;
+            if let Some(staged) = &file.staged {
+                std::fs::rename(staged, &file.name)?;
+            } else {
+                replace(Path::new(&file.name), &file.bytes)?;
+            }
         }
         replace(&args.out, object)?;
     }
