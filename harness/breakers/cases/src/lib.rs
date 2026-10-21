@@ -15,6 +15,7 @@ macro_rules! cases {
 }
 
 cases![
+    imported_callsite,
     niche_eq,
     simd_cast,
     big_frame,

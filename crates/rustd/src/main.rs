@@ -1342,7 +1342,7 @@ impl Count<'_, '_> {
 
     /// Whether a path finds the macro with no import: any but a `macro_rules!` one of this
     /// crate that is not exported, which is in no module but by an import of it, and
-    /// whether that import is a late one is not known.
+    /// whether that import is a late one is not always known.
     fn reached_by_path(&self, call: &ast::MacroCall) -> bool {
         let sema = self.sema;
         let Some(found) = sema.resolve_macro_call(call) else { return true };
@@ -1351,10 +1351,161 @@ impl Count<'_, '_> {
             return true;
         }
         match sema.source(found).and_then(|it| it.value.left()) {
-            Some(ast::Macro::MacroRules(rules)) => ast::HasAttrs::attrs(&rules)
-                .any(|it| it.simple_name().is_some_and(|name| name == "macro_export")),
+            Some(ast::Macro::MacroRules(rules)) => {
+                ast::HasAttrs::attrs(&rules)
+                    .any(|it| it.simple_name().is_some_and(|name| name == "macro_export"))
+                    || self.written_reexport(call, found).unwrap_or(false)
+            }
             _ => true,
         }
+    }
+
+    /// A path through written modules and imports to a written reexport of a local macro
+    /// is resolved in the first import pass, unlike an import expanded from a macro.
+    fn written_reexport(&self, call: &ast::MacroCall, found: hir::Macro) -> Option<bool> {
+        let sema = self.sema;
+        let definition = sema.source(found)?;
+        if definition.file_id.is_macro() {
+            return None;
+        }
+        let path = call.path()?;
+        let name = path.segment()?.syntax().text().to_string();
+        let qualifier = path.qualifier()?;
+        let hir::PathResolution::Def(ModuleDef::Module(module)) = sema.resolve_path(&qualifier)?
+        else {
+            return None;
+        };
+        if module != found.module(sema.db) {
+            return None;
+        }
+        let mut ancestor = module;
+        let mut canonical = Vec::new();
+        while let Some(parent) = ancestor.parent(sema.db) {
+            canonical.push(ancestor.name(sema.db)?.as_str().to_owned());
+            let source = ancestor.declaration_source(sema.db)?;
+            sema.parse_or_expand(source.file_id);
+            if source.file_id.is_macro()
+                || has_attribute_macro(sema, &ast::Item::Module(source.value))
+            {
+                return None;
+            }
+            ancestor = parent;
+        }
+        canonical.push("crate".to_owned());
+        canonical.reverse();
+        let used: Vec<_> = qualifier.segments().map(|it| it.syntax().text().to_string()).collect();
+        if used != canonical
+            && (used.len() != 1
+                || !self.written_module_import(call, module, &used[0], &canonical)?)
+        {
+            return None;
+        }
+        let source = module.definition_source(sema.db);
+        sema.parse_or_expand(source.file_id);
+        if source.file_id.is_macro() {
+            return None;
+        }
+        let cfg = ide_db::base_db::Crate::from(module.krate(sema.db)).cfg_options(sema.db);
+        let imports = source.value.node().descendants().filter_map(ast::Use::cast);
+        for import in imports {
+            if !is_cfg_enabled(import.syntax(), cfg)
+                || has_attribute_macro(sema, &ast::Item::Use(import.clone()))
+                || sema.scope(import.syntax())?.module() != module
+            {
+                continue;
+            }
+            for tree in import.syntax().descendants().filter_map(ast::UseTree::cast) {
+                if tree.use_tree_list().is_some() || tree.star_token().is_some() {
+                    continue;
+                }
+                if tree
+                    .syntax()
+                    .ancestors()
+                    .skip(1)
+                    .filter_map(ast::UseTree::cast)
+                    .any(|it| it.path().is_some())
+                {
+                    continue;
+                }
+                let path = tree.path()?;
+                if path.qualifier().is_some()
+                    || path.segment()?.syntax().text().to_string() != found.name(sema.db).as_str()
+                    || sema.hir_file_for(import.syntax()) != definition.file_id
+                    || definition.value.syntax().text_range().end()
+                        > import.syntax().text_range().start()
+                {
+                    continue;
+                }
+                let imported = tree
+                    .rename()
+                    .and_then(|it| it.name())
+                    .map(|it| it.text().to_string())
+                    .or_else(|| path.segment().map(|it| it.syntax().text().to_string()));
+                if imported.as_deref() == Some(&name)
+                    && matches!(sema.resolve_path(&path), Some(hir::PathResolution::Def(ModuleDef::Macro(it))) if it == found)
+                {
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
+    }
+
+    fn written_module_import(
+        &self,
+        call: &ast::MacroCall,
+        module: hir::Module,
+        name: &str,
+        canonical: &[String],
+    ) -> Option<bool> {
+        let sema = self.sema;
+        let cfg = ide_db::base_db::Crate::from(module.krate(sema.db)).cfg_options(sema.db);
+        for scope in sema.ancestors_with_macros(call.syntax().clone()) {
+            for import in scope.children().filter_map(ast::Use::cast) {
+                if sema.hir_file_for(import.syntax()).is_macro()
+                    || !is_cfg_enabled(import.syntax(), cfg)
+                    || module_is_expanded(sema, import.syntax())
+                    || sema
+                        .ancestors_with_macros(import.syntax().clone())
+                        .filter_map(ast::Item::cast)
+                        .any(|it| has_attribute_macro(sema, &it))
+                {
+                    continue;
+                }
+                for tree in import.syntax().descendants().filter_map(ast::UseTree::cast) {
+                    if tree.use_tree_list().is_some() || tree.star_token().is_some() {
+                        continue;
+                    }
+                    let path = tree.path()?;
+                    let imported = tree
+                        .rename()
+                        .and_then(|it| it.name())
+                        .map(|it| it.text().to_string())
+                        .or_else(|| path.segment().map(|it| it.syntax().text().to_string()));
+                    if imported.as_deref() != Some(name)
+                        || !matches!(sema.resolve_path(&path), Some(hir::PathResolution::Def(ModuleDef::Module(it))) if it == module)
+                    {
+                        continue;
+                    }
+                    let mut paths: Vec<_> = tree
+                        .syntax()
+                        .ancestors()
+                        .filter_map(ast::UseTree::cast)
+                        .filter_map(|it| it.path())
+                        .collect();
+                    paths.reverse();
+                    let imported: Vec<_> = paths
+                        .iter()
+                        .flat_map(|it| it.segments())
+                        .map(|it| it.syntax().text().to_string())
+                        .collect();
+                    if imported == canonical {
+                        return Some(true);
+                    }
+                }
+            }
+        }
+        Some(false)
     }
 
     /// Whether the macro is a `macro_rules!` one found by where it is written, which is
