@@ -8924,10 +8924,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     _ => Some(pointee),
                 };
                 let empty = match pointee.kind() {
-                    TyKind::Slice(_) => blob.usize_at(offset + word()) == Some(0),
-                    _ => false,
+                    TyKind::Slice(_) | TyKind::Str => blob.usize_at(offset + word()) == Some(0),
+                    _ => {
+                        let layout = self.layout(pointee)?;
+                        !layout.is_unsized() && layout.size.bytes() == 0
+                    }
                 };
-                // An empty slice can be at the address of an allocation that is not its own.
+                // An empty str or slice, or a zero-sized pointee, may share another allocation's address.
                 if memory.is_empty() || empty {
                     // Nothing is behind the pointer, and rustc makes it the alignment.
                     let align = match elem {

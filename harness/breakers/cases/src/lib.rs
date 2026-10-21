@@ -116,6 +116,7 @@ cases![
     list_by_address,
     shared_constant_address,
     aligned_constant_field,
+    empty_str_beside_slice,
     negative_literal_operand,
     empty_array_by_impl,
     union_pattern,
