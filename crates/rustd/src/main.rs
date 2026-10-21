@@ -3568,11 +3568,12 @@ fn selected(args: &Args) -> Vec<String> {
 
 /// Has `bytes` be the file at `path`. A file that was there is left as it is for whoever has
 /// it open or under another name: the object of a program can be that of another one too.
-fn replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn replace(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let mut new = path.as_os_str().to_owned();
     new.push(format!(".{}.new", std::process::id()));
-    std::fs::write(&new, bytes)?;
-    std::fs::rename(&new, path)
+    std::fs::write(&new, bytes)
+        .with_context(|| format!("writing {}", Path::new(&new).display()))?;
+    std::fs::rename(&new, path).with_context(|| format!("replacing {}", path.display()))
 }
 
 /// What cargo said of every crate when the checkouts were last loaded.
@@ -4712,11 +4713,14 @@ impl Held {
     /// Loads an empty package in `dir` and resolves what it depends on, which is the library.
     fn load(dir: &Path) -> anyhow::Result<Held> {
         let start = Instant::now();
-        std::fs::create_dir_all(dir.join("src"))?;
+        std::fs::create_dir_all(dir.join("src"))
+            .with_context(|| format!("creating {}", dir.display()))?;
         let manifest =
             "[package]\nname = \"rustd-spare\"\nversion = \"0.0.0\"\nedition = \"2024\"\n";
-        std::fs::write(dir.join("Cargo.toml"), manifest)?;
-        std::fs::write(dir.join("src/lib.rs"), "")?;
+        std::fs::write(dir.join("Cargo.toml"), manifest)
+            .with_context(|| format!("writing {}", dir.join("Cargo.toml").display()))?;
+        std::fs::write(dir.join("src/lib.rs"), "")
+            .with_context(|| format!("writing {}", dir.join("src/lib.rs").display()))?;
         // The crate and the object are ones nothing asks for.
         let asked = ["--crate", "rustd_spare", "--out", "none"].map(str::to_owned);
         let asked = std::iter::once(dir.display().to_string()).chain(asked);

@@ -314,9 +314,16 @@ fn status() -> anyhow::Result<i32> {
                     worker.project.display(),
                     worker.log.display()
                 );
-                for (root, warmth) in worker.checkouts {
-                    let _ = writeln!(said, "    {}: {warmth}", root.display());
+                if let Some(state) = worker.state {
+                    let _ = writeln!(said, "    {state}");
+                } else {
+                    for (root, warmth) in worker.checkouts {
+                        let _ = writeln!(said, "    {}: {warmth}", root.display());
+                    }
                 }
+            }
+            for spare in daemon.spares {
+                let _ = writeln!(said, "  spare: {spare}");
             }
         }
         Some(Reply::Restart { version }) => {
