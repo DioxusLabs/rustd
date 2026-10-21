@@ -368,13 +368,7 @@ pub fn layout_of_ty_query(
                 )
             }
             .map_err(|_| LayoutError::Unknown)?;
-            let held = body.locals_held_across_yields(|local| {
-                crate::drop::has_drop_glue(
-                    &infer_ctxt,
-                    body.locals[local].ty.as_ref(),
-                    trait_env.param_env(db),
-                ) != crate::drop::DropGlue::None
-            });
+            let held = body.locals_held_across_yields(&infer_ctxt, trait_env.param_env(db));
             let upvars = rustc_type_ir::inherent::Ty::tuple_fields(args.tupled_upvars_ty())
                 .iter()
                 .map(|ty| db.layout_of_ty(ty.store(), trait_env.clone()))
@@ -391,27 +385,32 @@ pub fn layout_of_ty_query(
                     Ok(layout)
                 })
                 .collect::<Result<Vec<_>, LayoutError>>()?;
-            let flags: Vec<Layout> = held
+            // A drop flag is kept where its local is, as rustc keeps it.
+            let flags: Vec<(usize, LayoutData<RustcFieldIdx, RustcEnumVariantIdx>)> = held
                 .flagged()
                 .map(|at| {
                     let bits = Integer::from_size(Size::from_bytes(held.flag_bytes(at)))
                         .expect("a flag of one to eight bytes");
-                    Layout::scalar(dl, scalar_unit(dl, Primitive::Int(bits, false)))
+                    (at, LayoutData::scalar(dl, scalar_unit(dl, Primitive::Int(bits, false))))
                 })
                 .collect();
-            let mut prefix: Vec<&Layout> = upvars.iter().map(|it| &**it).collect();
-            prefix.extend(&flags);
+            let of_field = |field: usize| match field.checked_sub(held.locals.len()) {
+                Some(nth) => flags[nth].0,
+                None => field,
+            };
+            let prefix: Vec<&Layout> = upvars.iter().map(|it| &**it).collect();
             let prefix = prefix.iter().collect::<IndexVec<RustcFieldIdx, _>>();
-            let locals = locals.iter().collect::<Vec<_>>();
+            let locals = locals.iter().chain(flags.iter().map(|(_, it)| it)).collect::<Vec<_>>();
             let locals = locals.iter().collect::<IndexVec<usize, _>>();
             // The body has not started, has returned or has panicked, and holds nothing then.
             let mut kept: IndexVec<RustcEnumVariantIdx, IndexVec<RustcFieldIdx, usize>> =
                 IndexVec::from_elem_n(IndexVec::new(), CoroutineFrame::SUSPENDED);
-            kept.extend(held.yields.iter().map(|it| it.kept.iter().copied().collect()));
+            kept.extend(held.yields.iter().map(|it| CoroutineFrame::kept(&held, it).collect()));
             let mut conflicts = BitMatrix::new(locals.len(), locals.len());
             for a in 0..locals.len() {
                 for b in 0..locals.len() {
-                    if held.conflict(a, b) {
+                    let (of_a, of_b) = (of_field(a), of_field(b));
+                    if of_a == of_b || held.conflict(of_a, of_b) {
                         conflicts.insert(a, b);
                     }
                 }
@@ -652,13 +651,12 @@ fn scalar_unit(dl: &TargetDataLayout, value: Primitive) -> Scalar {
 }
 
 /// Where an `async` block keeps what has to survive from one `poll` to the next. The fields of
-/// its layout are the captures, the drop flags of each held local that needs them, and
-/// the state: where the body left off. The held locals are fields of its variants, one for
-/// each place the body yields at.
+/// its layout are the captures and the state: where the body left off. The held locals are
+/// fields of its variants, one for each place the body yields at, and so are the drop flags of
+/// the ones that need them.
 #[derive(Debug, Clone, Copy)]
 pub struct CoroutineFrame {
     pub upvars: usize,
-    pub flags: usize,
 }
 
 impl CoroutineFrame {
@@ -666,9 +664,19 @@ impl CoroutineFrame {
     /// started, returned and panicked.
     pub const SUSPENDED: usize = 3;
 
-    /// The flag of the `index`th of the locals that have one.
-    pub fn drop_flag(self, index: usize) -> usize {
-        self.upvars + index
+    /// The fields of the variant of a place the body yields at: the held locals kept there,
+    /// then the flags of the ones among them that have one, the `n`th flag numbered as if it
+    /// were held local `locals.len() + n`.
+    pub fn kept<'a>(
+        held: &'a crate::mir::HeldLocals,
+        point: &'a crate::mir::YieldPoint,
+    ) -> impl Iterator<Item = usize> + 'a {
+        let flags = held
+            .flagged()
+            .enumerate()
+            .filter(|(_, at)| point.kept.contains(at))
+            .map(|(nth, _)| held.locals.len() + nth);
+        point.kept.iter().copied().chain(flags)
     }
 
     /// Where the `index`th of the held locals is in the future: among what is kept at any of
@@ -678,10 +686,24 @@ impl CoroutineFrame {
         held: &crate::mir::HeldLocals,
         index: usize,
     ) -> Option<Size> {
+        Self::field_offset(layout, held, index)
+    }
+
+    /// Where the drop flag of the `index`th of the held locals is in the future.
+    pub fn flag_offset(
+        layout: &Layout,
+        held: &crate::mir::HeldLocals,
+        index: usize,
+    ) -> Option<Size> {
+        let nth = held.flagged().position(|it| it == index)?;
+        Self::field_offset(layout, held, held.locals.len() + nth)
+    }
+
+    fn field_offset(layout: &Layout, held: &crate::mir::HeldLocals, field: usize) -> Option<Size> {
         let Variants::Multiple { variants, .. } = &layout.variants else { return None };
         held.yields.iter().zip(variants.iter().skip(Self::SUSPENDED)).find_map(|(point, kept)| {
-            let field = point.kept.iter().position(|&it| it == index)?;
-            Some(kept.field_offsets[RustcFieldIdx::new(field)])
+            let at = Self::kept(held, point).position(|it| it == field)?;
+            Some(kept.field_offsets[RustcFieldIdx::new(at)])
         })
     }
 
@@ -702,6 +724,6 @@ impl CoroutineFrame {
     }
 
     pub fn state(self) -> usize {
-        self.upvars + self.flags
+        self.upvars
     }
 }

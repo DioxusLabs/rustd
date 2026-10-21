@@ -3126,6 +3126,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             span,
         );
 
+        // `Pending` holds nothing, and what is held over the yield is kept in the future.
+        self.push_statement(pending, StatementKind::StorageDead(polled.local).with_span(span));
         let poll = Place::from(poll);
         self.push_assignment(
             pending,

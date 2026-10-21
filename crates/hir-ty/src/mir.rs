@@ -1154,21 +1154,36 @@ enum Access {
     Part(StoredProjection),
 }
 
-impl MirBody<'_> {
+impl<'db> MirBody<'db> {
     /// The locals that may hold a value when the body yields: the ones an `async` block has to
-    /// keep from one `poll` to the next. `moved_by_use` says whether using a local as an operand
-    /// takes its value, which the operand does not say.
-    pub fn locals_held_across_yields(&self, moved_by_use: impl Fn(LocalId) -> bool) -> HeldLocals {
+    /// keep from one `poll` to the next. Using a value with drop glue as an operand takes it,
+    /// which the operand does not say.
+    pub fn locals_held_across_yields(
+        &self,
+        infcx: &InferCtxt<'db>,
+        env: ParamEnv<'db>,
+    ) -> HeldLocals {
         let index = |local: LocalId| local.into_raw().into_u32() as usize;
+        let moved_by_use =
+            |ty| crate::drop::has_drop_glue(infcx, ty, env) != crate::drop::DropGlue::None;
         let mut moved = vec![false; self.locals.len()];
-        for (local, _) in self.locals.iter() {
-            moved[index(local)] = moved_by_use(local);
+        for (local, data) in self.locals.iter() {
+            moved[index(local)] = moved_by_use(data.ty.as_ref());
         }
         let take = |held: &mut [bool], operand: &Operand| {
-            if let OperandKind::Copy(place) | OperandKind::Move(place) = &operand.kind
-                && place.projection.as_slice().is_empty()
-                && moved[index(place.local)]
-            {
+            let (OperandKind::Copy(place) | OperandKind::Move(place)) = &operand.kind else {
+                return;
+            };
+            let empties = match place.projection.as_slice() {
+                [] => true,
+                // Moving out the one field of the variant it is leaves nothing in it.
+                [ProjectionElem::Downcast(variant), ProjectionElem::Field(_)] => {
+                    variant.fields(infcx.interner.db).fields().len() == 1
+                        && moved_by_use(place.as_ref().ty(self, infcx, env).ty)
+                }
+                _ => false,
+            };
+            if empties && moved[index(place.local)] {
                 held[index(place.local)] = false;
             }
         };
