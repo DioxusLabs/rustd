@@ -7,6 +7,7 @@
 #![cfg_attr(feature = "nightly", feature(box_patterns, c_variadic_int128))]
 
 pub mod stabilized;
+pub mod profiling;
 
 pub mod scalars {
     pub fn wide_mul(a: u128, b: u128, c: i128) -> (u128, bool, Option<i128>, Option<u128>) {

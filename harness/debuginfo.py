@@ -805,7 +805,7 @@ def sampled(perf, binary, cwd):
     None where this machine does not let this user profile."""
     data = os.path.join(tempfile.mkdtemp(prefix="rustd-debuginfo-perf-"), "perf.data")
     record = subprocess.run([perf, "record", "-o", data, "-F", "5000", "--call-graph", "dwarf", binary],
-                            cwd=cwd, capture_output=True, text=True)
+                            cwd=cwd, capture_output=True, text=True, env={**os.environ, "DEBUGINFO_PERF": "1"})
     if record.returncode != 0 or not os.path.exists(data):
         return None
     return subprocess.run([perf, "script", "-i", data, "-F", "ip,sym,srcline"], capture_output=True, text=True).stdout
