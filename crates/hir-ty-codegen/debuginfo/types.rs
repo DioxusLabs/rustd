@@ -15,14 +15,14 @@ use hir_def::{
 };
 
 use rustc_abi::{TagEncoding, Variants};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     UintTy,
     inherent::{BoundExistentialPredicates as _, GenericArgs as _, IntoKind},
 };
 
 use super::super::vtable::{HEADER, VtableLayout};
-use super::{Aggregate, DebugType, Field, Tag, TypeIndex, TypeSet, Variant};
+use super::{Aggregate, DebugType, Field, Tag, TypeIndex, TypeList, TypeSet, Variant};
 use crate::{
     InferenceResult, ParamEnvAndCrate,
     closure_analysis::ProjectionKind,
@@ -65,9 +65,12 @@ pub(in super::super) struct Types<'db> {
     infcx: InferCtxt<'db>,
     /// What the type being described is made of so far, itself first.
     told: Vec<DebugType>,
+    links: Vec<TypeSet>,
     /// Where each type that is told of, or is being told of, is among `told`.
     known: FxHashMap<Ty<'db>, TypeIndex>,
     described: FxHashMap<Ty<'db>, Option<TypeSet>>,
+    roots: Vec<Ty<'db>>,
+    in_progress: FxHashSet<Ty<'db>>,
     names: FxHashMap<Ty<'db>, Option<String>>,
     normalized: FxHashMap<Ty<'db>, Ty<'db>>,
 }
@@ -82,8 +85,11 @@ impl<'db> Types<'db> {
             interner,
             infcx,
             told: Vec::new(),
+            links: Vec::new(),
             known: FxHashMap::default(),
             described: FxHashMap::default(),
+            roots: Vec::new(),
+            in_progress: FxHashSet::default(),
             names: FxHashMap::default(),
             normalized: FxHashMap::default(),
         }
@@ -95,9 +101,25 @@ impl<'db> Types<'db> {
         if let Some(described) = self.described.get(&ty) {
             return described.clone();
         }
-        self.told.clear();
-        self.known.clear();
-        let described = self.ty(ty, POINTERS).map(|_| TypeSet::from(self.told.as_slice()));
+        let root = self.tellable(ty);
+        if !self.in_progress.insert(root) {
+            return None;
+        }
+        let told = std::mem::take(&mut self.told);
+        let known = std::mem::take(&mut self.known);
+        let links = std::mem::take(&mut self.links);
+        self.roots.push(root);
+        let described = self.ty(ty, POINTERS).map(|_| {
+            TypeSet::new(TypeList {
+                types: std::mem::take(&mut self.told),
+                links: std::mem::take(&mut self.links),
+            })
+        });
+        self.roots.pop();
+        self.in_progress.remove(&root);
+        self.told = told;
+        self.known = known;
+        self.links = links;
         self.described.insert(ty, described.clone());
         described
     }
@@ -105,12 +127,26 @@ impl<'db> Types<'db> {
     fn ty(&mut self, ty: Ty<'db>, pointers: u32) -> Option<TypeIndex> {
         // A type narrowed to some of its values, as what a `NonNull` keeps is, is told as
         // the type itself.
-        let ty = self.normalize(ty);
-        let ty = match ty.kind() {
-            TyKind::Pat(of, _) => self.normalize(of),
-            _ => ty,
-        };
+        let ty = self.tellable(ty);
         if let Some(&index) = self.known.get(&ty) {
+            return Some(index);
+        }
+        if matches!(ty.kind(), TyKind::Coroutine(..))
+            && self.roots.last() != Some(&ty)
+            && pointers == POINTERS
+            && !self.in_progress.contains(&ty)
+        {
+            let described = self.describe(ty)?;
+            let link = self
+                .links
+                .iter()
+                .position(|it| std::sync::Arc::ptr_eq(it, &described))
+                .unwrap_or_else(|| {
+                    self.links.push(described);
+                    self.links.len() - 1
+                });
+            let index = self.told.len() as TypeIndex;
+            self.told.push(DebugType::Link(link as u32));
             return Some(index);
         }
         let layout = self.db.layout_of_ty(ty.store(), self.env.store()).ok()?;
@@ -120,11 +156,13 @@ impl<'db> Types<'db> {
         let index = self.told.len() as TypeIndex;
         self.told.push(DebugType::Struct(Aggregate::opaque(name.clone(), layout.size.bytes())));
         self.known.insert(ty, index);
+        let links = self.links.len();
         match self.told_as(ty, name, &layout, pointers) {
             Some(told) => self.told[index as usize] = told,
             // What was told since is of no use to anything.
             None => {
                 self.told.truncate(index as usize);
+                self.links.truncate(links);
                 self.known.retain(|_, known| *known < index);
             }
         }
@@ -568,6 +606,14 @@ impl<'db> Types<'db> {
             .unwrap_or(ty);
         self.normalized.insert(ty, normalized);
         normalized
+    }
+
+    fn tellable(&mut self, ty: Ty<'db>) -> Ty<'db> {
+        let ty = self.normalize(ty);
+        match ty.kind() {
+            TyKind::Pat(of, _) => self.normalize(of),
+            _ => ty,
+        }
     }
 }
 

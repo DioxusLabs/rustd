@@ -103,7 +103,13 @@ pub(super) type TypeIndex = u32;
 
 /// A type and every type it is made of, the type itself first. The functions with a
 /// variable of the type share the one set.
-pub(super) type TypeSet = std::sync::Arc<[DebugType]>;
+pub(super) type TypeSet = std::sync::Arc<TypeList>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TypeList {
+    pub(super) types: Vec<DebugType>,
+    pub(super) links: Vec<TypeSet>,
+}
 
 /// What a debugger is told of a type: its name, its size, and what it is made of as far as
 /// that is told. A type names the types it is made of by their place in the same list, so
@@ -129,6 +135,8 @@ pub(super) enum DebugType {
     /// some that are not told.
     Struct(Aggregate),
     Union(Aggregate),
+    /// The type at index 0 of one of the set's links.
+    Link(u32),
     /// An enum none of whose variants has a field: a number with a name for each value.
     Names {
         name: String,
@@ -516,6 +524,7 @@ enum SharedType {
 /// The entries of one function's types, as far as they have been asked for.
 struct FunctionTypes<'a> {
     types: &'a [DebugType],
+    links: &'a [TypeSet],
     entries: Vec<Option<UnitEntryId>>,
     /// How many types the one being told of is inside of.
     inside: u32,
@@ -628,13 +637,28 @@ impl Dwarf {
 
     /// The entry of the type a set is of, which is found once for the unit.
     fn set(&mut self, types: &TypeSet) -> Option<UnitEntryId> {
-        let at = types.as_ptr() as usize;
+        self.set_at(types, 0)
+    }
+
+    /// The entry of the type a set is of, at the depth its link was reached.
+    fn set_at(&mut self, types: &TypeSet, inside: u32) -> Option<UnitEntryId> {
+        if inside >= DebugType::DEEPEST {
+            return None;
+        }
+        let at = std::sync::Arc::as_ptr(types) as usize;
         if let Some((_, entry)) = self.sets.get(&at) {
             return *entry;
         }
-        let mut of = FunctionTypes { types, entries: vec![None; types.len()], inside: 0 };
+        let mut of = FunctionTypes {
+            types: &types.types,
+            links: &types.links,
+            entries: vec![None; types.types.len()],
+            inside,
+        };
         let entry = self.ty(&mut of, 0);
-        self.sets.insert(at, (types.clone(), entry));
+        if entry.is_some() {
+            self.sets.insert(at, (types.clone(), entry));
+        }
         entry
     }
 
@@ -658,6 +682,12 @@ impl Dwarf {
     /// The entry of the type at `index` of `of`, which has none yet.
     fn new_type(&mut self, of: &mut FunctionTypes<'_>, index: TypeIndex) -> Option<UnitEntryId> {
         let ty = of.types.get(index as usize)?;
+        if let DebugType::Link(link) = ty {
+            let linked = of.links.get(*link as usize)?.clone();
+            let entry = self.set_at(&linked, of.inside);
+            of.entries[index as usize] = entry;
+            return entry;
+        }
         let shared = match ty {
             DebugType::Base { name, size, .. } => {
                 SharedType::Named(DW_TAG_base_type, name.clone(), *size)
@@ -672,6 +702,7 @@ impl Dwarf {
                 SharedType::Named(DW_TAG_structure_type, it.name.clone(), it.size)
             }
             DebugType::Union(it) => SharedType::Named(DW_TAG_union_type, it.name.clone(), it.size),
+            DebugType::Link(_) => unreachable!(),
             DebugType::Names { name, size, .. } => {
                 SharedType::Named(DW_TAG_enumeration_type, name.clone(), *size)
             }
@@ -764,6 +795,7 @@ impl Dwarf {
                 size(&mut self.dwarf.unit, it.size);
                 self.variants(of, entry, it, *tag, variants);
             }
+            DebugType::Link(_) => unreachable!(),
         }
     }
 
@@ -1369,5 +1401,27 @@ impl Writer for SectionWriter {
             addend: val as i64,
         });
         self.write_udata_at(offset, 0, size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linked_types_share_one_die() {
+        let isa =
+            super::super::Target::selected().and_then(|it| it.isa("backtracking", false)).unwrap();
+        let shared = TypeSet::new(TypeList {
+            types: vec![DebugType::Base { name: "Shared".to_owned(), size: 4, encoding: 7 }],
+            links: Vec::new(),
+        });
+        let linked = || {
+            TypeSet::new(TypeList { types: vec![DebugType::Link(0)], links: vec![shared.clone()] })
+        };
+        let mut dwarf = Dwarf::new(&*isa, "/", true, None);
+
+        assert_eq!(dwarf.set(&linked()), dwarf.set(&linked()));
+        assert_eq!(dwarf.types.len(), 1);
     }
 }

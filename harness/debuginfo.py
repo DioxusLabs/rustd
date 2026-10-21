@@ -207,6 +207,10 @@ async fn steps(start: u32) -> u32 {
     kept[0] + second
 }
 
+async fn outer(start: u32) -> u32 {
+    steps(start).await + 1
+}
+
 fn show(seed: u32) -> u32 {
     let offset = seed + 1;
     let mut count = 0u64;
@@ -221,17 +225,20 @@ fn show(seed: u32) -> u32 {
     let wide = Wide::A(9, 1);
     let wide_b = Wide::B { text: "hi" };
     let wide_c = Wide::C;
-    let nested: Option<Option<bool>> = Some(None);
+    let nested_option: Option<Option<bool>> = Some(None);
     let ordering = std::cmp::Ordering::Less;
     let mut future = Box::pin(steps(seed));
     let fresh = steps(seed);
+    let mut nested = Box::pin(outer(seed));
     let mut cx = Context::from_waker(Waker::noop());
     let _ = future.as_mut().poll(&mut cx);
+    let _ = nested.as_mut().poll(&mut cx);
     let once = &*future;
+    let nested = &*nested;
     let _ = std::hint::black_box(&once);
     let sum = by_ref(1) + by_move(2) + by_mut() as u32 + object.name() + boxed.name();
     println!("{}", sum);
-    std::hint::black_box((&leaf, &node, &wide, &wide_b, &wide_c, &nested, &ordering, &fresh));
+    std::hint::black_box((&leaf, &node, &wide, &wide_b, &wide_c, &nested_option, &ordering, &fresh));
     let _ = future.as_mut().poll(&mut cx);
     let _ = future.as_mut().poll(&mut cx);
     sum
@@ -241,8 +248,8 @@ fn main() {
     println!("{}", show(std::hint::black_box(10)));
 }
 """
-RICH = ["by_ref", "by_move", "by_mut", "object", "boxed", "leaf", "node", "wide", "wide_b", "wide_c", "nested",
-        "ordering", "fresh", "*once", "future"]
+RICH = ["by_ref", "by_move", "by_mut", "object", "boxed", "leaf", "node", "wide", "wide_b", "wide_c",
+        "nested_option", "nested", "ordering", "fresh", "*once", "future", "*nested"]
 SCOPED = ["seed", "value", "inner", "total", "sum", "step"]
 TYPES = ["width", "name", "big", "point", "pair", "tuple", "shape", "circle", "dot", "level", "some", "none", "boxed",
          "missing", "ok", "list", "text", "slice", "bits", "*borrowed", "sum"]
