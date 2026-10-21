@@ -12,8 +12,8 @@ use std::{
 
 use anyhow::Context as _;
 use cargo_metadata::{
-    Artifact, BuildScript, CrateType, DependencyKind, Message, Metadata, MetadataCommand, Package,
-    Target, TargetKind,
+    Artifact, BuildScript, DependencyKind, Message, Metadata, MetadataCommand, Package, Target,
+    TargetKind,
 };
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
@@ -253,6 +253,7 @@ pub(crate) struct Built {
 pub(crate) struct Staged {
     /// The root file of each.
     roots: Vec<PathBuf>,
+    at_build: Vec<PathBuf>,
     /// What the daemon is told of the workspace before cargo starts, so that it loads it
     /// while cargo builds. `None` when the build is of no one project of it.
     pub(crate) ahead: Option<daemon::Ahead>,
@@ -287,8 +288,12 @@ impl Staged {
         let mut roots = Vec::new();
         let mut examples = Vec::new();
         let mut tests = Vec::new();
+        let mut at_build = Vec::new();
         for (at, member) in members.iter().enumerate() {
             if reached.contains(&at) {
+                at_build.extend(
+                    member.targets.iter().map(|it| it.src_path.clone().into_std_path_buf()),
+                );
                 continue;
             }
             let of_build = |it: &&Target| {
@@ -308,23 +313,6 @@ impl Staged {
                 if target.is_example() {
                     examples.push(source);
                     continue;
-                }
-                let alone = matches!(
-                    *target.crate_types,
-                    [CrateType::Lib | CrateType::RLib | CrateType::Bin]
-                );
-                if !alone {
-                    return Ok(Err(format!(
-                        "`{}` is built as {}, which the daemon does not link yet: it builds \
-                         a `lib`, an `rlib` or a `bin` alone",
-                        target.name,
-                        target
-                            .crate_types
-                            .iter()
-                            .map(|it| format!("`{it}`"))
-                            .collect::<Vec<_>>()
-                            .join(" and "),
-                    )));
                 }
                 roots.push(source);
             }
@@ -352,7 +340,7 @@ impl Staged {
         });
         roots.extend(examples);
         roots.extend(tests);
-        Ok(Ok(Staged { roots, ahead }))
+        Ok(Ok(Staged { roots, at_build, ahead }))
     }
 }
 
@@ -391,6 +379,7 @@ impl Built {
             Some(staged) => {
                 as_staged(&mut cargo)?;
                 cargo.env(wrapper::STAGED, std::env::join_paths(&staged.roots)?);
+                cargo.env(wrapper::AT_BUILD, std::env::join_paths(&staged.at_build)?);
             }
             None => as_built(&mut cargo)?,
         }

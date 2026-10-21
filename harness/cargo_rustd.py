@@ -698,6 +698,39 @@ def flags(work):
     return rows, wrong, counted.stdout
 
 
+def unselected_cdylib(work, check):
+    ws = os.path.realpath(os.path.join(work, "unselected-cdylib"))
+    files = {
+        "Cargo.toml": '[workspace]\nmembers = ["app", "shared"]\nresolver = "2"\n',
+        "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+        "app/src/main.rs": 'fn main() { println!("selected"); }\n',
+        "shared/Cargo.toml": '[package]\nname = "shared"\nversion = "0.1.0"\nedition = "2021"\n[lib]\ncrate-type = ["cdylib", "rlib"]\n',
+        "shared/src/lib.rs": 'pub fn value() -> u32 { 7 }\n',
+    }
+    for file, text in files.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
+        open(os.path.join(ws, file), "w").write(text)
+    here = Side(ws, base_env(os.path.join(work, "home-unselected-cdylib")), True)
+    wrapper = os.path.join(os.path.dirname(RUSTD), "rustd-rustc-first" + EXE)
+    output = os.path.join(ws, "unexpected")
+    os.makedirs(output)
+    _, unexpected = timed([wrapper, "rustc", "--crate-name", "shared", "--crate-type", "rlib", "--emit=link", "--out-dir", output, "shared/src/lib.rs"], ws, dict(here.env, RUSTD_CARGO_DRIVES="1", RUSTD_STAGED_CRATES="", RUSTD_AT_BUILD_CRATES=""))
+    check("an unstaged workspace member cannot reach real rustc", unexpected.returncode != 0 and "not staged for the daemon" in unexpected.stderr and not os.listdir(output), unexpected.stderr.strip())
+    _, built = here.cargo("run", "--bin", "app")
+    check("an unselected cdylib member does not refuse the build", built.returncode == 0 and built.stdout.strip() == "selected", built.stderr[-500:] if built.returncode else "")
+    reason = "`shared` is built as `cdylib` and `rlib`, which the daemon does not link yet"
+    for args in (("--workspace",), ("-p", "shared")):
+        _, refused = here.cargo("build", *args)
+        check("a selected cdylib member is refused: " + " ".join(args), refused.returncode == 101 and reason in refused.stderr, refused.stderr[-500:] if reason not in refused.stderr else "")
+    with open(os.path.join(ws, "app/Cargo.toml"), "a") as manifest:
+        manifest.write('\n[dependencies]\nshared = { path = "../shared" }\n')
+    _, cargo = timed(["cargo", "build", "--bin", "app", "-vv"], ws, dict(here.env, CARGO_TARGET_DIR=os.path.join(ws, "target-ref")))
+    check("cargo emits a dependency's cdylib as well as its rlib", cargo.returncode == 0 and "--crate-type cdylib --crate-type rlib" in cargo.stderr, cargo.stderr[-500:] if cargo.returncode else "")
+    _, refused = here.cargo("build", "--bin", "app")
+    check("a cdylib member used only as a dependency is refused", refused.returncode == 101 and reason in refused.stderr, refused.stderr[-500:] if reason not in refused.stderr else "")
+    here.cargo("stop")
+
+
 def scripted(work, check):
     """A member whose build script watches nothing, which runs again for any edit of its
     package: after the daemon's first build, an edit of the package is an edit, not a reload."""
@@ -988,6 +1021,7 @@ def daemon(work):
     os.remove(added)
     check("a test file added after the daemon loaded the tests is a target it builds", before.returncode == 0 and found.returncode == 0 and "1 passed" in found.stdout, found.stderr.strip()[-200:])
     scripted(work, check)
+    unselected_cdylib(work, check)
     registry_impls(work, check)
     body_statics(work, check)
     here.cargo("stop")
