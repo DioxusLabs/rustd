@@ -93,6 +93,19 @@ async fn nested(log: Log) -> usize {
     outer.0.len() + buffer.iter().map(|&it| it as usize).sum::<usize>()
 }
 
+/// The value moved out of the `Some` leaves nothing in the `Option` to keep or drop.
+async fn unwrapped(log: Log) -> usize {
+    let maybe = Some(Noisy("unwrapped", log.clone()));
+    let Some(noisy) = maybe else { return 0 };
+    pause().await;
+    let again = Some(Noisy("again", log.clone()));
+    if let Some(inner) = again {
+        pause().await;
+        return noisy.0.len() + inner.0.len();
+    }
+    0
+}
+
 async fn panics(log: Log) -> usize {
     let before = Noisy("before", log.clone());
     pause().await;
@@ -137,6 +150,7 @@ pub fn run() -> Vec<String> {
         out.push(drive("perhaps not", polls, |log| perhaps(log, false)));
         out.push(drive("in_loop", polls, in_loop));
         out.push(drive("nested", polls, nested));
+        out.push(drive("unwrapped", polls, unwrapped));
         out.push(drive("panics", polls, panics));
     }
     out
