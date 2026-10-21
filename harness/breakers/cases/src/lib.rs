@@ -23,6 +23,7 @@ cases![
     served_callsite,
     type_id_of_ctor,
     type_id_nested_fn,
+    closure_fn_ptr_in_promoted,
     type_id_of_foreign_closure,
     type_id_of_capturing_foreign_closure,
     default_method_callsite,
