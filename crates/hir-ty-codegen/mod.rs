@@ -2962,6 +2962,7 @@ fn build<'db>(
         inner_pad: None,
         drop_order: Vec::new(),
         operand_temps: Default::default(),
+        argument_temps: Default::default(),
         argument_slots: Vec::new(),
         free_argument_slots: Vec::new(),
         given_away: None,
@@ -5704,6 +5705,8 @@ struct FunctionCx<'cx, 'db> {
     drop_order: Vec<LocalId>,
     /// Temporaries that hold an operand: never borrowed, only moved whole.
     operand_temps: rustc_hash::FxHashSet<LocalId>,
+    /// Temporaries made for one argument of one call and read nowhere else.
+    argument_temps: rustc_hash::FxHashSet<LocalId>,
     /// The slots the arguments of the calls so far were copied to since the last were
     /// freed, each with its size and the power of two it is aligned to.
     argument_slots: Vec<(ir::StackSlot, (u32, u8))>,
@@ -7241,8 +7244,23 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             held.locals.binary_search(&local).ok()
         };
         let forwarded = forwarded_temps(body);
+        // A local in a register gets a slot only once something needs its address: Cranelift
+        // keeps every slot it is given in the frame, used or not.
+        if frame.is_none() {
+            for local in register_locals(body, &forwarded) {
+                if !self.locals.contains_idx(local)
+                    && let Some(ty) = self.register_ty(body.locals[local].ty.as_ref())
+                {
+                    let var = self.builder.declare_var(ty);
+                    self.registers.insert(local, Register { var, ty });
+                }
+            }
+        }
         for (local, data) in body.locals.iter() {
-            if self.locals.contains_idx(local) || forwarded.contains_key(&local) {
+            if self.locals.contains_idx(local)
+                || forwarded.contains_key(&local)
+                || self.registers.contains_key(&local)
+            {
                 continue;
             }
             let layout = self.layout(data.ty.as_ref())?;
@@ -7277,16 +7295,6 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 continue;
             }
             self.locals.insert(local, LocalSlot { addr, borrowed: false });
-        }
-        if frame.is_none() {
-            for local in register_locals(body, &forwarded) {
-                if !self.locals[local].borrowed
-                    && let Some(ty) = self.register_ty(body.locals[local].ty.as_ref())
-                {
-                    let var = self.builder.declare_var(ty);
-                    self.registers.insert(local, Register { var, ty });
-                }
-            }
         }
         for (temp, to) in forwarded {
             self.locals.insert(temp, self.locals[to]);
@@ -7385,6 +7393,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.flag_writes = body.coroutine.is_none().then(FxHashMap::default);
         self.drop_order = drop_order(body, &reachable);
         self.operand_temps = operand_temps(body);
+        self.argument_temps = argument_temps(body);
         self.index_spans = index_spans(body);
         for (id, block) in body.basic_blocks.iter() {
             if !reachable.contains(&id) {
@@ -8344,9 +8353,22 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
     }
 
+    /// The slot of a local, made the first time a local kept in a register needs one.
+    fn local_slot(&mut self, local: LocalId) -> LocalSlot {
+        if let Some(&slot) = self.locals.get(local) {
+            return slot;
+        }
+        let ty = self.body.expect("MIR body").locals[local].ty.as_ref();
+        let layout = self.layout(ty).expect("a local in a register has a layout");
+        let slot = LocalSlot { addr: self.stack_slot(&layout), borrowed: false };
+        self.locals.insert(local, slot);
+        slot
+    }
+
     /// Where a local is, with what its register holds written there first.
     fn local_addr(&mut self, local: LocalId) -> Value {
-        let addr = self.slot_addr(self.locals[local].addr);
+        let addr = self.local_slot(local).addr;
+        let addr = self.slot_addr(addr);
         if let Some(register) = self.registers.get(&local) {
             let value = self.builder.use_var(register.var);
             self.builder.ins().store(MEM, value, addr, 0);
@@ -8370,7 +8392,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn place_ref(&mut self, place: &StoredPlace) -> Result<PlaceRef<'db>> {
-        let LocalSlot { borrowed, .. } = self.locals[place.local];
+        let LocalSlot { borrowed, .. } = self.local_slot(place.local);
         // A pointer in a register is where it points with no load.
         let mut pointer = match place.projection.as_slice().first() {
             Some(ProjectionElem::Deref) => self.registers.get(&place.local).copied(),
@@ -8439,7 +8461,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     let index = match self.registers.get(local) {
                         Some(register) => self.builder.use_var(register.var),
                         None => {
-                            let index = self.slot_addr(self.locals[*local].addr);
+                            let index = self.local_slot(*local).addr;
+                            let index = self.slot_addr(index);
                             self.builder.ins().load(ptr(), MEM, index, 0)
                         }
                     };
@@ -8565,6 +8588,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let (addr, ty) = self.place(place)?;
                 if let Some(given) = &mut self.given_away {
                     given.read.push(addr);
+                    if place.projection.as_slice().is_empty()
+                        && self.argument_temps.contains(&place.local)
+                        && given.result != place.local
+                    {
+                        given.whole.insert(addr);
+                    }
                 }
                 // RA's lowering says `Copy` for moves too; a use of a value that needs dropping
                 // can only be a move.
@@ -9365,7 +9394,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let registered = Cell::new(false);
         self.assign_to_slot(place, rvalue, Some(register), &registered)?;
         if !registered.get() {
-            let addr = self.slot_addr(self.locals[place.local].addr);
+            let addr = self.local_slot(place.local).addr;
+            let addr = self.slot_addr(addr);
             let value = self.builder.ins().load(register.ty, MEM, addr, 0);
             self.builder.def_var(register.var, value);
         }
@@ -9381,7 +9411,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         register: Option<Register>,
         registered: &Cell<bool>,
     ) -> Result<()> {
-        if self.locals[place.local].borrowed && place.projection.as_slice().is_empty() {
+        if self.local_slot(place.local).borrowed && place.projection.as_slice().is_empty() {
             let Rvalue::Use(operand) = rvalue else {
                 unsupported!("unsized local assigned {rvalue:?}");
             };
@@ -9393,7 +9423,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             };
             // Marks the place as moved out of.
             self.operand(operand)?;
-            let slot = self.slot_addr(self.locals[place.local].addr);
+            let slot = self.local_slot(place.local).addr;
+            let slot = self.slot_addr(slot);
             self.builder.ins().store(MEM, addr, slot, 0);
             self.builder.ins().store(MEM, meta, slot, meta_at());
             return Ok(());
@@ -9402,7 +9433,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             // What the register holds is about to be replaced, and is not written back.
             Some(_) => {
                 let ty = self.body.expect("MIR body").locals[place.local].ty.as_ref();
-                let addr = self.slot_addr(self.locals[place.local].addr);
+                let addr = self.local_slot(place.local).addr;
+                let addr = self.slot_addr(addr);
                 (addr, PlaceTy::from_ty(self.normalize(ty)))
             }
             None => self.place(place)?,
@@ -13453,7 +13485,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let mut values = Vec::new();
         if !matches!(self.ret_mode, PassMode::Indirect) {
             let layout = self.layout(body.locals[local].ty.as_ref())?;
-            let addr = self.slot_addr(self.locals[local].addr);
+            let addr = self.local_slot(local).addr;
+            let addr = self.slot_addr(addr);
             self.pass(self.ret_mode, addr, &layout, &mut values);
         }
         self.builder.ins().return_(&values);
@@ -14405,6 +14438,54 @@ fn operand_temps(body: &MirBody<'_>) -> rustc_hash::FxHashSet<LocalId> {
         }
     }
     temps
+}
+
+/// The temporaries a call is handed whole as an argument, written whole and read nowhere
+/// else: `f(x)` with `x: Copy` copies `x` into one, and the callee can have it as it is,
+/// with no copy of the copy.
+fn argument_temps(body: &MirBody<'_>) -> rustc_hash::FxHashSet<LocalId> {
+    let whole = |place: &StoredPlace| place.projection.as_slice().is_empty().then_some(place.local);
+    // Every mention of a local, and the ones that are a whole write or a whole argument.
+    let mut mentions: FxHashMap<LocalId, (usize, usize, usize)> = FxHashMap::default();
+    body.clone().walk_places(|place| mentions.entry(place.local).or_default().0 += 1);
+    for (_, block) in body.basic_blocks.iter() {
+        for statement in &block.statements {
+            if let StatementKind::Assign(to, _) = &statement.kind
+                && let Some(local) = whole(to)
+            {
+                mentions.entry(local).or_default().1 += 1;
+            }
+        }
+        if let Some(TerminatorKind::Call { args, destination, .. }) =
+            block.terminator.as_ref().map(|it| &it.kind)
+        {
+            if let Some(local) = whole(destination) {
+                mentions.entry(local).or_default().1 += 1;
+            }
+            for arg in args.iter() {
+                if let OperandKind::Copy(place) | OperandKind::Move(place) = &arg.kind
+                    && let Some(local) = whole(place)
+                {
+                    mentions.entry(local).or_default().2 += 1;
+                }
+            }
+        }
+    }
+    let bound: rustc_hash::FxHashSet<LocalId> = body
+        .binding_locals
+        .values()
+        .chain(&body.param_locals)
+        .copied()
+        .chain(body.promoted_locals.iter().map(|it| it.0))
+        .chain([returned_local(body)])
+        .collect();
+    mentions
+        .into_iter()
+        .filter(|&(local, (all, written, passed))| {
+            !bound.contains(&local) && passed == 1 && written >= 1 && all == written + passed
+        })
+        .map(|(local, _)| local)
+        .collect()
 }
 
 /// The locals that can be kept in a register as far as the body goes: temporaries written
