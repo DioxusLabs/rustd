@@ -676,7 +676,7 @@ def flags(work):
         open(os.path.join(ws, file), "w").write(text)
     env = base_env(os.path.join(work, "home-flags"))
     ours, theirs = Side(ws, env, True), Side(ws, env, False)
-    rows, wrong = [], []
+    rows, wrong = selected_member_tests(work)
 
     def round_of(label):
         for command, args, extra in FLAG_CASES:
@@ -711,6 +711,58 @@ def flags(work):
         wrong.append(f"flags: status counts {cargos_builds(counted.stdout)} builds by cargo")
     ours.cargo("stop")
     return rows, wrong, counted.stdout
+
+
+def selected_member_tests(work):
+    """A spare loaded with a shared target before a selected member gets its doc tests."""
+    ws = os.path.realpath(os.path.join(work, "selected-member"))
+    files = {
+        "Cargo.toml": '[workspace]\nmembers = ["member"]\nresolver = "2"\n',
+        "member/Cargo.toml": '[package]\nname = "member"\nversion = "0.1.0"\nedition = "2021"\n',
+        "member/src/lib.rs": 'pub fn value() -> i32 { 7 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn unit() { assert_eq!(super::value(), 7); }\n}\n',
+        "member/tests/it.rs": '#[test]\nfn integration() { assert_eq!(member::value(), 7); }\n',
+    }
+    for file, text in files.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
+        open(os.path.join(ws, file), "w").write(text)
+    home = os.path.join(work, "home-selected-member")
+    env = dict(base_env(home), CARGO_TARGET_DIR=os.path.join(work, "target-selected-member"), RUSTD_SPARE="1")
+    ours, theirs = Side(ws, env, True), Side(ws, env, False)
+    rows, wrong = [], []
+    daemon = subprocess.Popen([RUSTD, "daemon"], cwd=ws, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        log = os.path.join(home, "spares", "0", "log")
+        until = time.time() + WARMUP_SECS
+        while time.time() < until:
+            if os.path.exists(log) and re.search(r"^spare: \d+ crates", open(log, errors="replace").read(), re.M):
+                break
+            if daemon.poll() is not None:
+                raise RuntimeError("selected member's daemon ended before loading its spare")
+            time.sleep(0.1)
+        else:
+            raise RuntimeError("selected member's spare did not load")
+        for label in ("cold", "warm", "edit"):
+            if label == "edit":
+                rewrite(os.path.join(ws, "member/src/lib.rs"), "{ 7 }", "{ let _ = 0; 7 }")
+            _, mine = ours.cargo("test", "-p", "member")
+            _, other = theirs.cargo("test", "-p", "member")
+            differs = difference(test_results(mine), test_results(other))
+            how = how_built(mine.stderr)
+            if mine.returncode != 0 or other.returncode != 0 or not test_results(mine)[1]:
+                differs = "; ".join(filter(None, [differs, f"exit {mine.returncode}/{other.returncode} or no tests"]))
+            if by_cargo(how):
+                differs = "; ".join(filter(None, [differs, "the build was cargo's"]))
+            if label == "cold" and "spare: workspace added" not in open(log, errors="replace").read():
+                differs = "; ".join(filter(None, [differs, "the preloaded spare was not used"]))
+            shown = "cargo rustd test -p member (shared target, preloaded spare)"
+            rows.append((label, shown, how, mine.returncode, differs or "same"))
+            print(f"  {label:6} {shown}  exit {mine.returncode}  {differs or 'same'}", flush=True)
+            if differs:
+                wrong.append(f"{label}: {shown}: {differs}\n{mine.stderr[-1000:]}")
+    finally:
+        ours.cargo("stop")
+        daemon.wait(timeout=30)
+    return rows, wrong
 
 
 def unselected_cdylib(work, check):

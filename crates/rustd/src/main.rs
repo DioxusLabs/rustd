@@ -4806,6 +4806,8 @@ impl Held {
         let scriptless = LoadCargoConfig { load_out_dirs_from_check: false, ..load_config() };
         let (db, vfs, mut checkouts) =
             load(&[dir], &cargo_config(&args), scriptless, args.selection, None)?;
+        // The empty package holds the library, not a checkout to reload for a later build.
+        checkouts.inputs = inputs::Inputs::default();
         checkouts.load_config = load_config();
         let all: Vec<ide_db::base_db::Crate> =
             Crate::all(&db).into_iter().map(Into::into).collect();
