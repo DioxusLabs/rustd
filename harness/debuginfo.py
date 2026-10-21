@@ -990,7 +990,12 @@ def edits(tally, apart=False):
 def edited(tally, part):
     ws = tempfile.mkdtemp(prefix="rustd-debuginfo-edits-")
     os.makedirs(os.path.join(ws, "src"))
-    for path, text in (("Cargo.toml", EDITS_TOML), (MAIN, EDITS_MAIN)):
+    source = EDITS_MAIN
+    if os.environ.get("CARGO_PROFILE_DEV_SPLIT_DEBUGINFO"):
+        calls = ", ".join(f'unit_{i}(&Guard("units"))' for i in range(300))
+        source = source.replace("fn main() {", f"fn main() {{\n    std::hint::black_box([{calls}]);")
+        source += "".join(f"\n#[inline(never)]\nfn unit_{i}(guard: &Guard) -> usize {{ guard.0.len() + {i} }}\n" for i in range(300))
+    for path, text in (("Cargo.toml", EDITS_TOML), (MAIN, source)):
         open(os.path.join(ws, path), "w").write(text)
     work = tempfile.mkdtemp(prefix="rustd-debuginfo-out-")
     socket, log_path = os.path.join(work, "rustd.sock"), os.path.join(work, "daemon.log")
@@ -1049,7 +1054,7 @@ def edited(tally, part):
         tally.say(f"{part}: the last binary: gdb prints an argument", "as cargo's" if right else "NOT AS CARGO'S", f"at = {mine}")
     if os.environ.get("CARGO_PROFILE_DEV_SPLIT_DEBUGINFO"):
         kept = sum("DW_AT_GNU_dwo_name" in unit and bool(re.search(r'DW_AT_producer\s+\("rustd ', unit)) for unit in units(binary))
-        tally.say(f"{part}: units of the last binary kept apart", "some" if kept else "NONE", str(kept))
+        tally.say(f"{part}: units of the last binary kept apart", "multiple" if kept > 1 else "NOT MULTIPLE", str(kept))
     daemon.kill()
     if os.environ.get("RUSTD_SPLICE") != "0":
         tally.say(f"{part}: added to the linked binary", "spliced" if spliced else "NONE SPLICED", f"{spliced} of {len(EDITS)} steps")

@@ -17,6 +17,7 @@ use cranelift_codegen::gimli::{
         Address, DebugLine, LineProgram, LineStringTable, Range, Sections, StringTable, Writer,
     },
 };
+use cranelift_codegen::isa::TargetIsa;
 use cranelift_object::object::{
     self, BinaryFormat, SectionFlags, SectionKind, elf,
     write::{Object, StandardSegment},
@@ -101,16 +102,21 @@ pub(super) struct Split {
 
 impl Split {
     pub(super) fn new(
+        isa: &dyn TargetIsa,
         encoding: Encoding,
         directory: Vec<u8>,
         name: String,
-        like: &Object<'_>,
     ) -> Self {
+        let architecture = match isa.triple().architecture {
+            target_lexicon::Architecture::X86_64 => object::Architecture::X86_64,
+            target_lexicon::Architecture::Aarch64(_) => object::Architecture::Aarch64,
+            _ => unreachable!("split DWARF for an unsupported architecture"),
+        };
         Split {
             encoding,
             directory,
             name,
-            object: (like.format(), like.architecture()),
+            object: (BinaryFormat::Elf, architecture),
             info: SectionWriter::default(),
             abbrev: SectionWriter::default(),
             line: DebugLine(SectionWriter::default()),
@@ -119,6 +125,10 @@ impl Split {
             loc_apart: SectionWriter::default(),
             files: Vec::new(),
         }
+    }
+
+    pub(super) fn next_name(&self) -> String {
+        file(&self.name, self.files.len())
     }
 
     /// Writes one unit: its entries apart, and its lines, addresses and skeleton to link.
