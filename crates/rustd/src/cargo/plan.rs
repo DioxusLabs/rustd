@@ -118,7 +118,7 @@ impl Harness {
         let mut given = unit.args.iter();
         while let Some(arg) = given.next() {
             match arg.as_str() {
-                "--crate-name" | "--edition" | "--target" | "--sysroot" => {
+                "--crate-name" | "--edition" | "--target" | "--sysroot" | "--extern" | "-L" => {
                     args.push(arg.clone());
                     args.extend(given.next().cloned());
                 }
@@ -129,7 +129,11 @@ impl Harness {
                         args.extend(["-C".to_owned(), value.clone()]);
                     }
                 }
-                _ if arg.starts_with("--edition=") || arg.starts_with("--target=") => {
+                _ if arg.starts_with("--edition=")
+                    || arg.starts_with("--target=")
+                    || arg.starts_with("--extern=")
+                    || arg.starts_with("-L") =>
+                {
                     args.push(arg.clone())
                 }
                 _ => {}
@@ -547,6 +551,30 @@ mod tests {
             link_line: None,
             env: Default::default(),
         }
+    }
+
+    #[test]
+    fn the_test_harness_can_name_types_of_dependencies() {
+        let unit = unit(&[
+            "--extern",
+            "dependency=/t/libdependency.rlib",
+            "-L",
+            "dependency=/t",
+            "--extern=renamed=/u/libother.rlib",
+            "-Ldependency=/u",
+        ]);
+        let harness = Harness::plan(&unit, Path::new("/harness"), true);
+        assert_eq!(
+            &harness.args[2..8],
+            [
+                "--extern",
+                "dependency=/t/libdependency.rlib",
+                "-L",
+                "dependency=/t",
+                "--extern=renamed=/u/libother.rlib",
+                "-Ldependency=/u"
+            ]
+        );
     }
 
     #[test]
