@@ -156,3 +156,42 @@ mod reexports {
         }
     }
 }
+
+pub mod served {
+    use std::future::Future;
+
+    pub trait Serve {
+        fn serve(&self, step: u32) -> impl Future<Output = u32> + Send;
+    }
+
+    pub struct Auto;
+    pub struct Other;
+
+    pub struct Logged<T, K = Auto>(pub T, pub K);
+
+    impl<T: Sync> Serve for Logged<T, Auto> {
+        async fn serve(&self, step: u32) -> u32 {
+            crate::callsites::site!(step)
+        }
+    }
+
+    impl<T: Sync> Serve for Logged<T, Other> {
+        async fn serve(&self, step: u32) -> u32 {
+            crate::callsites::site!(step * 100)
+        }
+    }
+
+    /// rustc's own instance of the method, whose static rustd's shares.
+    pub fn served_by_rustc(step: u32) -> u32 {
+        crate::ready(Box::pin(Logged(0u8, Auto).serve(step)))
+    }
+}
+
+/// The output of a future that is ready the first time it is polled.
+pub fn ready(mut future: std::pin::Pin<Box<dyn Future<Output = u32> + Send + '_>>) -> u32 {
+    use std::task::{Context, Poll, Waker};
+    match future.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(it) => it,
+        Poll::Pending => unreachable!(),
+    }
+}

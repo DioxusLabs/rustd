@@ -20,6 +20,7 @@ cases![
     explicit_and_glob_reexport,
     chained_rpitit,
     imported_callsite,
+    served_callsite,
     niche_eq,
     simd_cast,
     big_frame,

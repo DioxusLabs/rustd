@@ -681,8 +681,27 @@ impl Resolver<'_> {
             return None;
         }
         // Lifetimes are erased, and rustc leaves erased ones out of the name.
-        let args: Option<Vec<_>> = ty.type_arguments().map(|arg| self.type_path(&arg)).collect();
-        Some(format!("{path}<{}>", args?.join(", ")))
+        let mut args: Vec<String> =
+            ty.type_arguments().map(|arg| self.type_path(&arg)).collect::<Option<_>>()?;
+        // rustc leaves out the trailing arguments that are their parameter's default, so
+        // `TlsConnector<S, ConnectorKindAuto>` is `TlsConnector<_>`. A default that names
+        // another parameter is kept: telling it apart needs the argument of that one.
+        while let Some(param) = args.len().checked_sub(1).and_then(|it| params.get(it)) {
+            let Some(default) = param.as_type_param(self.db).and_then(|it| it.default(self.db))
+            else {
+                break;
+            };
+            if !default.generic_params(self.db).is_empty()
+                || self.type_path(&default).as_ref() != args.last()
+            {
+                break;
+            }
+            args.pop();
+        }
+        if args.is_empty() {
+            return Some(path);
+        }
+        Some(format!("{path}<{}>", args.join(", ")))
     }
 }
 
