@@ -179,6 +179,10 @@ impl Args {
         Ok(root)
     }
 
+    fn symbols_root(&self) -> anyhow::Result<PathBuf> {
+        if self.checkout.as_os_str().is_empty() { self.root() } else { Ok(self.checkout.clone()) }
+    }
+
     fn parse(mut args: impl Iterator<Item = String>) -> anyhow::Result<Args> {
         let mut project = None;
         let mut krate = None;
@@ -3770,7 +3774,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             .filter(|file| rlib_of(file).is_none_or(|owner| owner == krate))
             .cloned()
             .collect();
-        let table = &SymbolTable::load(&symbol_files, &args.root()?)?;
+        let table = &SymbolTable::load(&symbol_files, &args.symbols_root()?)?;
         let args = Args {
             project: args.project.clone(),
             krate: krate.clone(),
@@ -5133,7 +5137,8 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
     }
     process_wide();
     // Nothing asks for a symbol before the first build, so they load next to the workspace.
-    let (symbol_files, root) = (args.symbol_files.clone(), args.root()?);
+    let (symbol_files, root) = (args.symbol_files.clone(), args.symbols_root()?);
+    let loaded_from = root.clone();
     let (said, whole) = match ahead {
         true => {
             let (said, whole) = Said::read();
@@ -5262,7 +5267,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
     known.patching = args.patch.is_some();
     let mut outlines = outline::Outlines::default();
     lower_until(&db, &args, &listed, &|| table.is_finished())?;
-    let (table, whole) =
+    let (mut table, whole) =
         table.join().map_err(|_| anyhow::anyhow!("loading the symbols panicked"))??;
     if let Some((whole, told)) = whole {
         // What cargo says of where it puts the programs, which `env!` reads, is known now.
@@ -5286,6 +5291,10 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
             "cargo built with another toolchain than the one that was loaded"
         );
         known.patching = args.patch.is_some();
+    }
+    let symbols_root = args.symbols_root()?;
+    if symbols_root != loaded_from {
+        table = SymbolTable::load(&args.symbol_files, &symbols_root)?;
     }
     let shared = shared.join().map_err(|_| anyhow::anyhow!("fetching the store panicked"))?;
     if let Some(stale) = stale_copies(&db, &table, &args) {
@@ -5709,9 +5718,10 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                             });
                             let table = match shared {
                                 Some(program) => program.table.clone(),
-                                None => {
-                                    Arc::new(SymbolTable::load(&args.symbol_files, &args.root()?)?)
-                                }
+                                None => Arc::new(SymbolTable::load(
+                                    &args.symbol_files,
+                                    &args.symbols_root()?,
+                                )?),
                             };
                             Ok((args, table))
                         });
@@ -6343,8 +6353,10 @@ impl Program {
                 if linked.link_cmd.is_some() {
                     self.args.link_cmd = linked.link_cmd.clone();
                 }
-                self.table =
-                    Arc::new(SymbolTable::load(&self.args.symbol_files, &self.args.root()?)?);
+                self.table = Arc::new(SymbolTable::load(
+                    &self.args.symbol_files,
+                    &self.args.symbols_root()?,
+                )?);
                 self.distrust_rustc(db, files, None);
                 self.unbuilt.named_anew = true;
                 self.args.widened.clear();
@@ -6419,7 +6431,7 @@ impl Program {
         if !self.table.built_since_read() || !checks_differ(db, &built) {
             return Ok(());
         }
-        self.table = Arc::new(SymbolTable::load(&args.symbol_files, &args.root()?)?);
+        self.table = Arc::new(SymbolTable::load(&args.symbol_files, &args.symbols_root()?)?);
         let patching = self.known.patching;
         self.known = Rejections::default();
         self.known.patching = patching;
@@ -6624,6 +6636,21 @@ fn report_stats(stats: &hir_ty::mir::codegen::BuildStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn symbol_sources_are_relative_to_the_workspace() {
+        let mut args =
+            Args::parse([".", "--crate", "app", "--out", "app.o"].into_iter().map(str::to_owned))
+                .unwrap();
+        assert_eq!(args.symbols_root().unwrap(), args.root().unwrap());
+        let workspace = args.root().unwrap().parent().unwrap().to_owned();
+        args.checkout = workspace.clone();
+        assert_eq!(args.symbols_root().unwrap(), workspace);
+        args.project = PathBuf::from("\0");
+        assert_eq!(args.symbols_root().unwrap(), workspace);
+        args.checkout = PathBuf::new();
+        assert!(args.symbols_root().is_err());
+    }
 
     #[test]
     fn library_sources_are_named_as_rustc_names_them() {
