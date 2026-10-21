@@ -1190,7 +1190,8 @@ LISTEN = "import os, socket, sys\ns = socket.socket(socket.AF_UNIX)\ns.bind(sys.
 def stranger(home, check):
     """A second user at the daemon's socket: kept out by the directory and the socket's
     modes, and turned away by the daemon when those are opened to it."""
-    name = "rustd-stranger"
+    # One of its own for each run, as two runs on one machine would take the other's away.
+    name = f"rustd-stranger-{os.getpid()}"
     sudo = lambda *argv: subprocess.run(["sudo", "-n", *argv], capture_output=True, text=True)
     if sudo("true").returncode != 0:
         check("a second user is turned away (needs sudo, which is not here)", os.environ.get("RUSTD_NO_SUDO") == "1", "not run")
