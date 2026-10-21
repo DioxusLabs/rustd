@@ -10,7 +10,8 @@
 use rustc_next_trait_solver::placeholder::BoundVarReplacer;
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
 use rustc_type_ir::{
-    FallibleTypeFolder, TypeFlags, TypeFoldable, TypeSuperFoldable, TypeVisitableExt, UniverseIndex,
+    FallibleTypeFolder, Interner, TypeFlags, TypeFoldable, TypeSuperFoldable, TypeVisitableExt,
+    UniverseIndex,
 };
 
 use crate::{
@@ -69,6 +70,21 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
                 // First instantiate params.
                 let ty = ty.try_super_fold_with(self)?;
                 let ty = self.impl_opaque(ty);
+
+                // Reveal one opaque at a time so nested trait RPITs pass through impl_opaque
+                // before the solver can normalize them as bodyless trait methods.
+                if let TyKind::Alias(AliasTy {
+                    kind: AliasTyKind::Opaque { def_id }, args, ..
+                }) = ty.kind()
+                {
+                    let hidden = self
+                        .infcx
+                        .interner
+                        .type_of(def_id.into())
+                        .instantiate(self.infcx.interner, args)
+                        .skip_norm_wip();
+                    return hidden.try_fold_with(self);
+                }
 
                 let ty = self.normalized(ty)?;
                 // Normalization could introduce infer vars (for example, if the alias cannot be normalized),
