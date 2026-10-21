@@ -487,12 +487,23 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
             }
             TyKind::FnDef(def, args) => {
                 hasher.write_isize(13);
-                let CallableDefId::FunctionId(func) = def.0 else { return None };
                 // A lifetime of a function is mostly late bound, and then no argument to rustc.
                 if args.iter().any(|arg| matches!(arg.kind(), GenericArgKind::Lifetime(_))) {
                     return None;
                 }
-                self.function_path(func)?.hash(hasher);
+                let path = match def.0 {
+                    CallableDefId::FunctionId(func) => self.function_path(func)?,
+                    CallableDefId::StructId(it) => {
+                        self.adt_path(it.into())?.child(DefPathData::Ctor)
+                    }
+                    CallableDefId::EnumVariantId(it) => {
+                        let variant = it.lookup(self.db);
+                        let name = variant.name.as_str();
+                        let enum_ = self.adt_path(variant.parent.into())?;
+                        enum_.child(DefPathData::TypeNs(name)).child(DefPathData::Ctor)
+                    }
+                };
+                path.hash(hasher);
                 // The arguments are under a binder, which binds nothing.
                 self.binder(hasher, |this, hasher| {
                     this.args(args)?.hash(hasher);

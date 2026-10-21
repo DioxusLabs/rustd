@@ -21,6 +21,7 @@ cases![
     chained_rpitit,
     imported_callsite,
     served_callsite,
+    type_id_of_ctor,
     niche_eq,
     simd_cast,
     big_frame,

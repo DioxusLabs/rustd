@@ -195,3 +195,24 @@ pub fn ready(mut future: std::pin::Pin<Box<dyn Future<Output = u32> + Send + '_>
         Poll::Pending => unreachable!(),
     }
 }
+
+/// Types rustc hashes for `TypeId`s asked for by code rustd compiles.
+pub mod typeids {
+    use std::any::{Any, TypeId};
+
+    pub enum Status {
+        Bad(u32),
+    }
+
+    fn id<A: Any>(_: &A) -> TypeId {
+        TypeId::of::<A>()
+    }
+
+    pub fn ok_id() -> TypeId {
+        id(&Ok::<u8, u16>)
+    }
+
+    pub fn bad_id() -> TypeId {
+        id(&Status::Bad)
+    }
+}
