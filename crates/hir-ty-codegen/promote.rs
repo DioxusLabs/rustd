@@ -111,6 +111,29 @@ pub(super) fn promote(func: &mut ir::Function, kept: impl Iterator<Item = StackS
     }
 }
 
+/// Empties the slots whose address is taken and then used for nothing, which promotion and
+/// the registers locals are kept in leave behind: Cranelift gives a frame every slot it is
+/// told of, used or not. A slot of `kept` is left as it is.
+pub(super) fn empty_unused(func: &mut ir::Function, kept: impl Iterator<Item = StackSlot>) {
+    let mut used: FxHashSet<StackSlot> = kept.collect();
+    let mut read: FxHashSet<Value> = FxHashSet::default();
+    let mut addrs = Vec::new();
+    for block in func.layout.blocks() {
+        for inst in func.layout.block_insts(block) {
+            if let InstructionData::StackAddr { stack_slot, .. } = func.dfg.insts[inst] {
+                addrs.push((func.dfg.first_result(inst), stack_slot));
+            }
+            read.extend(func.dfg.inst_values(inst).map(|it| func.dfg.resolve_aliases(it)));
+        }
+    }
+    used.extend(addrs.into_iter().filter(|(addr, _)| read.contains(addr)).map(|it| it.1));
+    for (slot, data) in func.sized_stack_slots.iter_mut() {
+        if !used.contains(&slot) {
+            data.size = 0;
+        }
+    }
+}
+
 /// What dominates what in `func`. Cranelift times working it out, and `wasm32-unknown-unknown`
 /// has no clock to read: there, the thread is given a profiler that does not look at one.
 fn dominator_tree(func: &ir::Function) -> DominatorTree {

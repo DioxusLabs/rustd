@@ -151,6 +151,7 @@ cases![
     frame_of_results,
     const_black_box,
     frame_of_tables,
+    frame_of_temporaries,
     backtrace_line,
     float_to_int_unchecked,
     static_enum_slice,

@@ -2868,6 +2868,7 @@ fn compile<'db>(
         if *PROMOTE {
             promote::promote(&mut ctx.func, cg.named_slots());
         }
+        promote::empty_unused(&mut ctx.func, cg.named_slots());
         Result::Ok(ctx)
     })?;
     let code = match cg.naked.take() {
