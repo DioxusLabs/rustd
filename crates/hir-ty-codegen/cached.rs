@@ -10,7 +10,10 @@
 //! program may link against a build of the crates without it, so a lookup checks that the
 //! symbols are there.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use cranelift_codegen::{
     binemit::{CodeOffset, Reloc},
@@ -496,10 +499,15 @@ pub(super) struct Entries {
 #[derive(Default)]
 struct Known {
     entries: FxHashMap<[u8; KEY], Option<Arc<Entry>>>,
+    /// Full entries are only a short-lived read cache.  The usability summary below is the
+    /// durable result; entries can be read from the store again when stitching needs one.
+    entry_order: VecDeque<[u8; KEY]>,
     /// Whether the program can be built from an entry and everything it calls.
     usable: FxHashMap<[u8; KEY], bool>,
     types: FxHashMap<[u8; KEY], Option<TypeSet>>,
 }
+
+const ENTRY_CACHE_LIMIT: usize = 4096;
 
 #[derive(Serialize, Deserialize)]
 struct StoredTypeSet {
@@ -716,7 +724,14 @@ impl Entries {
             .then(|| tally.step(super::backend::Step::StoreRead, read))
             .flatten()
             .map(Arc::new);
-        self.known().entries.insert(key, entry.clone());
+        let mut known = self.known();
+        if known.entries.len() >= ENTRY_CACHE_LIMIT {
+            if let Some(old) = known.entry_order.pop_front() {
+                known.entries.remove(&old);
+            }
+        }
+        known.entries.insert(key, entry.clone());
+        known.entry_order.push_back(key);
         entry
     }
 
