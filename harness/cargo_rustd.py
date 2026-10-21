@@ -582,6 +582,8 @@ FLAG_WORKSPACE = {
     "app/examples/demo.rs": 'fn main() {\n    println!("demo: {}", util::greeting("demo"));\n}\n',
     # Integration tests whose harness is the daemon's: tests in modules, `cfg(test)` and a
     # module of helpers beside them; and one test target that has no harness at all.
+    "app/tests/root_main.rs": '#[test]\nfn main() {\n    assert!(std::env::var_os("FLAGS_FAIL").is_none());\n}\n',
+    "app/tests/ordinary_main.rs": 'fn main() {\n    panic!("not a test entry point");\n}\n\n#[test]\nfn the_harness_runs() {}\n',
     "util/tests/host.rs": '#[test]\nfn host_library() {\n    assert!(util::greeting("test").to_lowercase().starts_with("hello"));\n}\n',
     "app/tests/common/mod.rs": "pub fn twice<T: Clone>(it: T) -> (T, T) {\n    (it.clone(), it)\n}\n",
     "app/tests/edge.rs": 'mod common;\n\n#[test]\nfn uses_common() {\n    assert_eq!(common::twice(3u8), (3, 3));\n}\n\n#[test]\n#[should_panic(expected = "boom")]\nfn panics() {\n    panic!("boom now");\n}\n\n#[test]\n#[ignore = "slow"]\nfn ignored() {\n    panic!("never run");\n}\n\n#[test]\n#[cfg_attr(miri, ignore = "under miri")]\nfn not_under_miri() {}\n\n#[cfg(test)]\nmod inner {\n    #[test]\n    fn under_cfg_test() {\n        assert_eq!(super::common::twice("a").0, "a");\n    }\n\n    mod deeper {\n        #[test]\n        fn deepest() {}\n    }\n}\n\n#[cfg(not(test))]\n#[test]\nfn never_built() {\n    panic!();\n}\n',

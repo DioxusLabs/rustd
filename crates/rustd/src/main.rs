@@ -2901,6 +2901,7 @@ fn build(
     let mut main = None;
     let mut local = Vec::new();
     let mut programs_own = Vec::new();
+    let harness = cargo::plan::Harness::of(&args.out)?;
     for (at, krate) in args.crates().enumerate() {
         for krate in crates_to_build(db, table, krate, args)? {
             local.push(krate);
@@ -2910,7 +2911,7 @@ fn build(
             let listed = listed.of(db, krate);
             // With `cfg(test)` the program starts in the harness rustc wrote, which calls
             // every test: the crate's own `main` is one function among the others.
-            if at == 0 && !args.cfg_test {
+            if at == 0 && !args.cfg_test && harness.is_none() {
                 main = main.or(listed.main);
             }
             let listed_here = listed.functions.iter().copied().zip(listed.exported.iter().copied());
@@ -3012,7 +3013,7 @@ fn build(
     if let (Some(path), Some(patch)) = (&args.patch, &unit.patch) {
         replace(path, patch)?;
     }
-    if let Some(harness) = cargo::plan::Harness::of(&args.out)? {
+    if let Some(harness) = harness {
         // What each test can run, for the client to run only the ones an edit can change.
         Reached::of(db, listed, args).write(&args.out)?;
         let text = hir::attach_db(db, || match programs_own.first() {
