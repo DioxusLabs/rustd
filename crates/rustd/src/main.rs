@@ -2705,9 +2705,13 @@ impl ListedCrate {
         let kept = statics
             .into_iter()
             .filter(|&it| {
-                hir_def::attrs::AttrFlags::query(db, it.into())
-                    .contains(hir_def::attrs::AttrFlags::USED)
-                    || hir_def::attrs::AttrFlags::link_section(db, it.into()).is_some()
+                use hir_def::attrs::AttrFlags;
+                // One a name is given is looked up by it, as by the user of a C library.
+                let flags = AttrFlags::query(db, it.into());
+                flags.contains(AttrFlags::USED)
+                    || flags.contains(AttrFlags::NO_MANGLE)
+                    || AttrFlags::export_name(db, it.into()).is_some()
+                    || AttrFlags::link_section(db, it.into()).is_some()
             })
             .collect();
         // A crate with `#![no_main]` has no `main` of Rust's: one it exports is the runtime's.
@@ -3260,7 +3264,7 @@ fn link(
     static SPLICING: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("RUSTD_SPLICE").is_none_or(|it| it != "0"));
     let binary = splice;
-    let splice = splice.filter(|_| *SPLICING);
+    let splice = splice.filter(|it| *SPLICING && !cargo::plan::is_library(it));
     // An executable linked with the object as it was is not one to add to, also when the
     // object was written for a request that does not link.
     let rewritten = match splice {
@@ -3308,6 +3312,8 @@ fn link(
     if let Some(linking) = &linking {
         let _ = std::fs::remove_file(linking);
     }
+    let objects: Vec<&Path> = patch.into_iter().chain([object]).collect();
+    cargo::plan::Exports::write(object, &objects)?;
     let linked = shell(cmd).output()?;
     let status = linked.status;
     let said = String::from_utf8_lossy(&linked.stderr);

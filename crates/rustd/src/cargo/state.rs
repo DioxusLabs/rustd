@@ -659,9 +659,21 @@ impl State {
         };
         let mut checkouts = [checkout(false), checkout(true)];
         let mut tested_libraries = Vec::new();
-        let executables = artifacts.iter().filter(|it| !it.target.is_custom_build());
-        for artifact in executables {
-            let Some(executable) = &artifact.executable else { continue };
+        // A C library of the workspace is linked by the daemon as a program is.
+        let linked = artifacts.iter().filter(|it| !it.target.is_custom_build()).flat_map(|it| {
+            let libraries =
+                it.filenames.iter().filter(|_| !it.profile.test && it.executable.is_none());
+            it.executable.iter().chain(libraries).map(move |file| (it, file))
+        });
+        for (artifact, executable) in linked {
+            let library = artifact.executable.as_ref() != Some(executable);
+            let unit = Record::of_artifact(&used, executable.as_std_path());
+            let is_it = |it: PathBuf| same_file::is_same_file(it, executable).unwrap_or(false);
+            let archive = library && unit.and_then(Record::static_library).is_some_and(is_it);
+            let shared = library && unit.and_then(Record::shared_library).is_some_and(is_it);
+            if library && !archive && !shared {
+                continue;
+            }
             let package = metadata.packages.iter().find(|it| it.id == artifact.package_id);
             let package = package.context("cargo built a package it does not list")?;
             let kind = Kind::of(&artifact.target.kind);
@@ -672,9 +684,13 @@ impl State {
             let default_run = kind == Kind::Bin
                 && !test
                 && package.default_run.as_deref().map_or(bins == 1, |it| it == name);
-            let unit = Record::of_artifact(&used, executable.as_std_path());
             // Named as cargo names the unit, the same in every build of it.
-            let files = dir.join("programs").join(unit.map_or(&name, |it| &it.id));
+            let id = unit.map_or(&name, |it| &it.id);
+            let files = match (archive, shared) {
+                (true, _) => dir.join("programs").join(format!("{id}-staticlib")),
+                (_, true) => dir.join("programs").join(format!("{id}-cdylib")),
+                _ => dir.join("programs").join(id),
+            };
             std::fs::create_dir_all(&files)?;
             let cargos = files.join("cargo");
             place(executable.as_std_path(), &cargos)?;
@@ -691,6 +707,7 @@ impl State {
                 continue;
             }
             let plan = match unit {
+                Some(unit) if archive => Plan::archive(unit, &used, &files)?,
                 Some(unit) => Plan::of(unit, &used, &files, None)?,
                 None => Err(format!(
                     "cargo built `{name}` before rustd recorded what it is linked from; \

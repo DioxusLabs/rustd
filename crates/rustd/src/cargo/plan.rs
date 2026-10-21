@@ -44,6 +44,27 @@ const SYMBOLS_BY_NAME: &str = "/PDBALTPATH:%_PDB%";
 /// The crates of the standard library whose symbols the daemon reads.
 const LIBRARY: [&str; 3] = ["core", "alloc", "std"];
 
+/// How each kind of linker is told the file that lists what a shared library exports.
+const EXPORTS: [&str; 3] = ["-Wl,--version-script=", "-Wl,-exported_symbols_list,", "/DEF:"];
+
+/// What the names of Rust's symbols start with, rustc's and rustd's own: none is exported
+/// from a shared library.
+const RUST_SYMBOL: [&str; 3] = ["_R", "_ZN", "rustd."];
+
+/// The name of the file the daemon links a library to, which it links whole every time: a
+/// splice adds to an executable alone.
+const LIBRARY_STEM: &str = "lib";
+
+/// The flag of a link line that names what a shared library exports, and the file it names.
+pub(crate) fn exports_list(arg: &str) -> Option<(&'static str, &str)> {
+    EXPORTS.iter().find_map(|flag| Some((*flag, arg.strip_prefix(flag)?)))
+}
+
+/// Whether the daemon's file at `binary` is a library, which it does not splice.
+pub(crate) fn is_library(binary: &Path) -> bool {
+    binary.file_stem().is_some_and(|it| it == LIBRARY_STEM)
+}
+
 /// A program as the daemon builds it.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct Plan {
@@ -177,16 +198,74 @@ fn member_that_wrote<'a>(records: &'a [Record], file: &Path) -> Option<&'a Recor
 }
 
 impl Plan {
-    /// Plans the program `unit` built, with the daemon's files for it in `dir`. `records` are
-    /// the units of the workspace. With `examples`, the root of the crate of the examples of
-    /// the library `unit` tests, the program is the examples', linked as the unit tests are.
-    /// `Err` is why the program is left to cargo.
+    /// Plans the program `unit` built, or its shared library, with the daemon's files for it
+    /// in `dir`. `records` are the units of the workspace. With `examples`, the root of the
+    /// crate of the examples of the library `unit` tests, the program is the examples',
+    /// linked as the unit tests are. `Err` is why the program is left to cargo.
     pub(crate) fn of(
         unit: &Record,
         records: &[Record],
         dir: &Path,
         examples: Option<&Path>,
     ) -> anyhow::Result<Result<Plan, String>> {
+        let (mut plan, mut link) = match Plan::linked(unit, records, dir, examples)? {
+            Ok(it) => it,
+            Err(why) => return Ok(Err(why)),
+        };
+        let library = !unit.is_linked();
+        if library {
+            plan.binary = dir.join(format!("{LIBRARY_STEM}{}", std::env::consts::DLL_SUFFIX));
+            Exports::plan(&mut link, unit, &plan.object)?;
+        }
+        let mut ahead = vec![&*plan.patch, &*plan.object];
+        // The tests of an integration test are the daemon's, and so is the harness that runs
+        // them: its `main` comes ahead of the one rustc wrote for none.
+        let harness = unit.is_test().then(|| Harness::plan(unit, dir, examples.is_none()));
+        let beside = Harness::beside(&plan.object);
+        match &harness {
+            Some(harness) => std::fs::write(&beside, serde_json::to_string(harness)?)?,
+            None => _ = std::fs::remove_file(&beside),
+        }
+        ahead.extend(harness.as_ref().map(|it| &*it.object));
+        plan.link_cmd = link.command(&ahead, &plan.binary, &dir.join("link.args"), library)?;
+        Ok(Ok(plan))
+    }
+
+    /// Plans the static library `unit` built: rustc's archive of the crates it compiled and
+    /// the standard library, with the daemon's object in place of what stands in for the
+    /// crates of the workspace. The crates are the ones rustc linked a shared library of the
+    /// same crate from.
+    pub(crate) fn archive(
+        unit: &Record,
+        records: &[Record],
+        dir: &Path,
+    ) -> anyhow::Result<Result<Plan, String>> {
+        let (mut plan, link) = match Plan::linked(unit, records, dir, None)? {
+            Ok(it) => it,
+            Err(why) => return Ok(Err(why)),
+        };
+        let archive = unit.static_library().context("a unit of no static library")?;
+        let Some(archive) = unit.copy_of(&archive) else {
+            return Ok(Err(format!("no copy of {} was kept", archive.display())));
+        };
+        if link.flavor == Flavor::Msvc {
+            return Ok(Err("rustd does not write a static library for `link.exe` yet".to_owned()));
+        }
+        plan.copies.push(archive.to_owned());
+        let extension = if cfg!(target_env = "msvc") { "lib" } else { "a" };
+        plan.binary = dir.join(format!("{LIBRARY_STEM}.{extension}"));
+        plan.link_cmd = link.archive_command(&plan, archive, &dir.join("archived.o"))?;
+        Ok(Ok(plan))
+    }
+
+    /// What `of` and `archive` have in common: the crates of the workspace on rustc's link
+    /// line, the copies of its files the link reads, and the line itself.
+    fn linked(
+        unit: &Record,
+        records: &[Record],
+        dir: &Path,
+        examples: Option<&Path>,
+    ) -> anyhow::Result<Result<(Plan, LinkLine), String>> {
         if let Some(why) = unsupported(unit) {
             return Ok(Err(why));
         }
@@ -238,18 +317,114 @@ impl Plan {
         plan.symbol_files = link.rustc_files();
         std::fs::create_dir_all(dir)?;
         link.give_way(&plan.copies)?;
-        let mut ahead = vec![&*plan.patch, &*plan.object];
-        // The tests of an integration test are the daemon's, and so is the harness that runs
-        // them: its `main` comes ahead of the one rustc wrote for none.
-        let harness = unit.is_test().then(|| Harness::plan(unit, dir, examples.is_none()));
-        let beside = Harness::beside(&plan.object);
-        match &harness {
-            Some(harness) => std::fs::write(&beside, serde_json::to_string(harness)?)?,
-            None => _ = std::fs::remove_file(&beside),
+        Ok(Ok((plan, link)))
+    }
+}
+
+/// What a shared library exports: the names rustc's list has, which are of the crates rustc
+/// compiled, and the names rustd's objects define that are no Rust symbol, which are the
+/// ones `#[no_mangle]` and `#[export_name]` give. Its list is written before every link,
+/// from the objects as they are then.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Exports {
+    flavor: Flavor,
+    rustc: Vec<String>,
+    list: PathBuf,
+}
+
+impl Exports {
+    fn beside(object: &Path) -> PathBuf {
+        object.with_file_name("exports.json")
+    }
+
+    /// Has the link of the shared library `unit` built read its list of exports from the
+    /// daemon's, beside `object`, in place of rustc's.
+    fn plan(link: &mut LinkLine, unit: &Record, object: &Path) -> anyhow::Result<()> {
+        let beside = Exports::beside(object);
+        let _ = std::fs::remove_file(&beside);
+        let flavor = link.flavor;
+        let Some(arg) = link.args.iter_mut().find(|it| exports_list(it).is_some()) else {
+            return Ok(());
+        };
+        let (flag, file) = exports_list(arg).context("a list of exports")?;
+        let kept = unit.copy_of(Path::new(file));
+        let text = kept.map(std::fs::read_to_string).transpose()?;
+        let text = text.with_context(|| format!("no copy of {file} was kept"))?;
+        let list = object.with_file_name("exports");
+        let exports = Exports { flavor, rustc: flavor.exported(&text), list };
+        *arg = format!("{flag}{}", exports.list.display());
+        std::fs::write(&beside, serde_json::to_string(&exports)?)?;
+        Ok(())
+    }
+
+    /// Writes the list of exports of the shared library linked from `objects`, when the
+    /// object among them that is the daemon's has one planned beside it.
+    pub(crate) fn write(object: &Path, objects: &[&Path]) -> anyhow::Result<()> {
+        let Ok(text) = std::fs::read_to_string(Exports::beside(object)) else { return Ok(()) };
+        let exports: Exports = serde_json::from_str(&text)?;
+        let mut names: std::collections::BTreeSet<String> = exports.rustc.into_iter().collect();
+        for object in objects.iter().filter(|it| it.exists()) {
+            let data = std::fs::read(object)?;
+            names.extend(exports.flavor.defined(&data)?);
         }
-        ahead.extend(harness.as_ref().map(|it| &*it.object));
-        plan.link_cmd = link.command(&ahead, &plan.binary, &dir.join("link.args"))?;
-        Ok(Ok(plan))
+        std::fs::write(&exports.list, exports.flavor.list(&names))?;
+        Ok(())
+    }
+}
+
+impl Flavor {
+    /// The names a list of exports rustc wrote for this linker has.
+    fn exported(self, text: &str) -> Vec<String> {
+        let lines = text.lines().map(str::trim);
+        match self {
+            Flavor::Cc => lines
+                .filter_map(|it| it.strip_suffix(';'))
+                .filter(|it| !it.contains(['*', ':', '{', '}']))
+                .map(str::to_owned)
+                .collect(),
+            Flavor::Apple => {
+                lines.filter_map(|it| it.strip_prefix('_')).map(str::to_owned).collect()
+            }
+            Flavor::Msvc => lines
+                .skip_while(|it| *it != "EXPORTS")
+                .skip(1)
+                .filter(|it| !it.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        }
+    }
+
+    /// The list of exports of `names`, as rustc writes one for this linker.
+    fn list(self, names: &std::collections::BTreeSet<String>) -> String {
+        match self {
+            Flavor::Cc => {
+                let global: String = names.iter().map(|it| format!("    {it};\n")).collect();
+                format!("{{\n  global:\n{global}\n  local:\n    *;\n}};\n")
+            }
+            Flavor::Apple => names.iter().map(|it| format!("_{it}\n")).collect(),
+            Flavor::Msvc => {
+                let names: String = names.iter().map(|it| format!("    {it}\n")).collect();
+                format!("EXPORTS\n{names}")
+            }
+        }
+    }
+
+    /// The names an object defines for others to link to that are no Rust symbol.
+    fn defined(self, data: &[u8]) -> anyhow::Result<Vec<String>> {
+        use object::{Object as _, ObjectSymbol as _};
+        let file = object::File::parse(data)?;
+        let names = file
+            .symbols()
+            .filter(|it| it.is_definition() && it.is_global())
+            .filter(|it| it.scope() == object::SymbolScope::Dynamic)
+            .filter_map(|it| it.name().ok())
+            .filter_map(|it| match self {
+                Flavor::Apple => it.strip_prefix('_'),
+                _ => Some(it),
+            })
+            .filter(|it| !RUST_SYMBOL.iter().any(|prefix| it.starts_with(prefix)))
+            .map(str::to_owned);
+        Ok(names.collect())
     }
 }
 
@@ -284,7 +459,7 @@ pub(crate) struct LinkLine {
 }
 
 /// The kinds of linker the daemon can put its objects ahead of rustc's for.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 enum Flavor {
     /// An ELF linker driven by `cc`.
     Cc,
@@ -379,15 +554,19 @@ impl LinkLine {
 
     /// The command that links `binary` with the objects `ahead` before everything rustc
     /// built, with its arguments in the file at `response`: a line with all of them is longer
-    /// than a process may be given.
+    /// than a process may be given. A `library` links no program, and is given no stack.
     pub(crate) fn command(
         mut self,
         ahead: &[&Path],
         binary: &Path,
         response: &Path,
+        library: bool,
     ) -> anyhow::Result<String> {
         if self.flavor == Flavor::Msvc {
             self.args.retain(|it| !it.eq_ignore_ascii_case(WARNINGS_FAIL));
+            if !library && !self.args.iter().any(|it| it.starts_with(STACK)) {
+                self.args.push(STACK_OF_MAIN.to_owned());
+            }
         }
         let first = self
             .args
@@ -437,6 +616,48 @@ impl LinkLine {
         Ok(command.join(" "))
     }
 
+    /// The command that writes the static library `plan` is of from rustc's `archive`, with
+    /// the daemon's objects ahead of it and their definitions the ones that stay. An ELF
+    /// linker merges the objects into one, `merged`, keeping the first definition of each
+    /// name; for Apple's the archive's copy is weak, and the objects are added to it.
+    fn archive_command(
+        &self,
+        plan: &Plan,
+        archive: &Path,
+        merged: &Path,
+    ) -> anyhow::Result<String> {
+        let quoted = |it: &Path| {
+            Ok::<_, anyhow::Error>(shlex::try_quote(&it.display().to_string())?.into_owned())
+        };
+        let (patch, object, linking) =
+            (quoted(&plan.patch)?, quoted(&plan.object)?, quoted(&linking(&plan.binary))?);
+        let mut command = self.without.clone();
+        for (name, value) in &self.env {
+            command.push(format!("{name}={}", shlex::try_quote(value)?));
+        }
+        if self.flavor == Flavor::Apple {
+            let weak = quoted(&weaken::copy_of(archive)?)?;
+            command.extend(
+                ["libtool", "-static", "-no_warning_for_no_symbols", "-o"].map(str::to_owned),
+            );
+            command.extend([linking, patch, object, weak]);
+            return Ok(command.join(" "));
+        }
+        let ar = std::env::var("AR").unwrap_or_else(|_| "ar".to_owned());
+        command.push(shlex::try_quote(&self.linker)?.into_owned());
+        command.extend(["-r", "-nostdlib", "-o"].map(str::to_owned));
+        command.extend([quoted(merged)?, patch, object, FIRST_DEFINITION_STAYS.to_owned()]);
+        command.extend(["-Wl,--whole-archive".to_owned(), quoted(archive)?]);
+        command.extend(["-Wl,--no-whole-archive", "&&"].map(str::to_owned));
+        command.extend([
+            shlex::try_quote(&ar)?.into_owned(),
+            "crs".to_owned(),
+            linking,
+            quoted(merged)?,
+        ]);
+        Ok(command.join(" "))
+    }
+
     /// rustc tells `link.exe` where the libraries of the system are through `LIB`, which
     /// is not in the line; here the line says it.
     fn command_of_msvc(
@@ -455,9 +676,6 @@ impl LinkLine {
             } else if arg == SYMBOLS_BY_NAME {
                 *arg = format!("/PDBALTPATH:{binary}.pdb");
             }
-        }
-        if !self.args.iter().any(|it| it.starts_with(STACK)) {
-            self.args.push(STACK_OF_MAIN.to_owned());
         }
         self.args.extend(system_libraries().iter().map(|it| format!("/LIBPATH:{}", it.display())));
         if self.args.iter().any(|it| it.contains('"')) {
@@ -516,6 +734,19 @@ mod tests {
     use super::*;
 
     const LINE: &str = r#"LC_ALL="C" PATH="/t/bin:/usr/bin" "cc" "-m64" "/t/deps/rustc1/symbols.o" "/t/deps/a.1.rcgu.o" "-Wl,-Bstatic" "/t/deps/libb-2.rlib" "-o" "/t/deps/a-1" "-pie""#;
+
+    #[test]
+    fn lists_of_exports_read_as_written() {
+        let names: std::collections::BTreeSet<String> =
+            ["ffi_add", "FFI_VERSION"].map(str::to_owned).into();
+        for flavor in [Flavor::Cc, Flavor::Apple, Flavor::Msvc] {
+            let read: std::collections::BTreeSet<String> =
+                flavor.exported(&flavor.list(&names)).into_iter().collect();
+            assert_eq!(read, names, "{flavor:?}");
+        }
+        let none = "{\n  local:\n    *;\n};\n";
+        assert!(Flavor::Cc.exported(none).is_empty());
+    }
 
     #[test]
     fn link_line_of_cc() {
@@ -591,8 +822,9 @@ mod tests {
         let mut link = LinkLine::parse(&line).unwrap();
         link.give_way(std::slice::from_ref(&copy)).unwrap();
         let response = dir.join("link.args");
-        let command =
-            link.command(&[Path::new("/p/rustd.o")], Path::new("/p/bin"), &response).unwrap();
+        let command = link
+            .command(&[Path::new("/p/rustd.o")], Path::new("/p/bin"), &response, false)
+            .unwrap();
         assert_eq!(
             shlex::split(&command).unwrap(),
             [
@@ -644,7 +876,8 @@ mod tests {
         let response = dir.join("link.args");
         let link = LinkLine::parse(LINE).unwrap();
         assert_eq!(link.flavor, Flavor::Msvc);
-        let command = link.command(&[&plan.patch, &plan.object], &plan.binary, &response).unwrap();
+        let command =
+            link.command(&[&plan.patch, &plan.object], &plan.binary, &response, false).unwrap();
         assert_eq!(command, format!(r#""C:\v c\link.exe" "@{}""#, response.display()));
         let args = std::fs::read_to_string(&response).unwrap();
         let args: Vec<&str> = args
@@ -690,7 +923,7 @@ mod tests {
         let response = dir.join("link.args");
         let command = LinkLine::parse(LINE)
             .unwrap()
-            .command(&[&plan.patch, &plan.object], &plan.binary, &response)
+            .command(&[&plan.patch, &plan.object], &plan.binary, &response, false)
             .unwrap();
         let response_arg = format!("@{}", response.display());
         assert_eq!(

@@ -367,6 +367,14 @@ def difference(ours, theirs):
     return "differ"
 
 
+def reference_failed_alone(ours, theirs):
+    """Whether every test outcome that differs is a failure of cargo's that rustd's run of the
+    same test passed."""
+    failed = lambda tests: {name for (name, outcome) in tests if outcome == "FAILED"}
+    only = failed(theirs[1]) - failed(ours[1])
+    return bool(only) and failed(ours[1]) <= failed(theirs[1])
+
+
 def asked_by(client):
     """What the server says to the client program `client`, which cargo built: the message
     of its answer."""
@@ -501,6 +509,13 @@ def project(name, spec, work, mode):
         row["times"][label] = (round(took, 2), round(reference, 2))
         how = row["built"][label] = ours.how_built(mine.stderr)
         wrong = difference(compare(mine), compare(other))
+        # A test that fails under plain cargo alone is of the machine, which the other lanes
+        # load: hyperfine's time the shell. cargo runs them once more, and what still
+        # differs is the difference.
+        if wrong and compare is test_results and reference_failed_alone(compare(mine), compare(other)):
+            print(f"  {label:12} cargo alone failed tests, run again: {wrong}", flush=True)
+            _, other = theirs.cargo(command, *args)
+            wrong = difference(compare(mine), compare(other))
         opened = not plain and TESTS_OPEN in how
         if opened:
             wrong = None
@@ -718,17 +733,127 @@ def unselected_cdylib(work, check):
     check("an unstaged workspace member cannot reach real rustc", unexpected.returncode != 0 and "not staged for the daemon" in unexpected.stderr and not os.listdir(output), unexpected.stderr.strip())
     _, built = here.cargo("run", "--bin", "app")
     check("an unselected cdylib member does not refuse the build", built.returncode == 0 and built.stdout.strip() == "selected", built.stderr[-500:] if built.returncode else "")
-    reason = "`shared` is built as `cdylib` and `rlib`, which the daemon does not link yet"
     for args in (("--workspace",), ("-p", "shared")):
-        _, refused = here.cargo("build", *args)
-        check("a selected cdylib member is refused: " + " ".join(args), refused.returncode == 101 and reason in refused.stderr, refused.stderr[-500:] if reason not in refused.stderr else "")
+        _, selected = here.cargo("build", *args)
+        check("a selected cdylib member is built by the daemon: " + " ".join(args), selected.returncode == 0 and here.how_built(selected.stderr) == "daemon", selected.stderr[-500:])
     with open(os.path.join(ws, "app/Cargo.toml"), "a") as manifest:
         manifest.write('\n[dependencies]\nshared = { path = "../shared" }\n')
+    open(os.path.join(ws, "app/src/main.rs"), "w").write('fn main() { println!("selected {}", shared::value()); }\n')
     _, cargo = timed(["cargo", "build", "--bin", "app", "-vv"], ws, dict(here.env, CARGO_TARGET_DIR=os.path.join(ws, "target-ref")))
     check("cargo emits a dependency's cdylib as well as its rlib", cargo.returncode == 0 and "--crate-type cdylib --crate-type rlib" in cargo.stderr, cargo.stderr[-500:] if cargo.returncode else "")
-    _, refused = here.cargo("build", "--bin", "app")
-    check("a cdylib member used only as a dependency is refused", refused.returncode == 101 and reason in refused.stderr, refused.stderr[-500:] if reason not in refused.stderr else "")
+    _, used = here.cargo("run", "--bin", "app")
+    check("a cdylib member used only as a dependency is the daemon's to build", used.returncode == 0 and used.stdout.strip() == "selected 7" and here.how_built(used.stderr) == "daemon", used.stderr[-500:])
     here.cargo("stop")
+
+
+C_LIBRARIES = {
+    "Cargo.toml": '[workspace]\nmembers = ["app", "ffi", "core1", "conly", "sonly"]\nresolver = "2"\n',
+    "core1/Cargo.toml": '[package]\nname = "core1"\nversion = "0.1.0"\nedition = "2021"\n',
+    "core1/src/lib.rs": '#[no_mangle]\npub extern "C" fn core1_mul(a: u32, b: u32) -> u32 { a * b }\npub fn helper(v: &[u32]) -> u32 { v.iter().map(|&x| core1_mul(x, 3)).sum() }\n',
+    "ffi/Cargo.toml": '[package]\nname = "ffi"\nversion = "0.1.0"\nedition = "2021"\n[lib]\ncrate-type = ["lib", "cdylib", "staticlib"]\n[dependencies]\ncore1 = { path = "../core1" }\n',
+    "ffi/src/lib.rs": """use std::fmt::Write;
+pub fn add(a: u32, b: u32) -> u32 { a + b }
+#[no_mangle]
+pub extern "C" fn ffi_add(a: u32, b: u32) -> u32 { add(a, b) + core1::helper(&[a, b]) }
+#[export_name = "ffi_named"]
+pub extern "C" fn named(n: u32) -> u32 {
+    let mut s = String::new();
+    for i in 0..n { write!(s, "{i},").unwrap(); }
+    s.len() as u32
+}
+#[no_mangle]
+pub static FFI_VERSION: u32 = 7;
+#[no_mangle]
+extern "C" fn ffi_private(x: u32) -> u32 { x.rotate_left(3) }
+#[no_mangle]
+pub extern "C" fn ffi_caught(x: u32) -> u32 {
+    std::panic::set_hook(Box::new(|_| {}));
+    std::panic::catch_unwind(|| if x == 0 { panic!("zero") } else { 100 / x }).unwrap_or(u32::MAX)
+}
+""",
+    "conly/Cargo.toml": '[package]\nname = "conly"\nversion = "0.1.0"\nedition = "2021"\n[lib]\ncrate-type = ["cdylib"]\n',
+    "conly/src/lib.rs": 'thread_local! { static COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }\n#[no_mangle]\npub extern "C" fn conly_tick() -> u32 { COUNT.with(|c| { c.set(c.get() + 1); c.get() }) }\n',
+    "sonly/Cargo.toml": '[package]\nname = "sonly"\nversion = "0.1.0"\nedition = "2021"\n[lib]\ncrate-type = ["staticlib"]\n[dependencies]\ncore1 = { path = "../core1" }\n',
+    "sonly/src/lib.rs": 'use std::sync::Mutex;\nstatic LOG: Mutex<Vec<u32>> = Mutex::new(Vec::new());\n#[no_mangle]\npub extern "C" fn sonly_push(x: u32) -> u32 { let mut l = LOG.lock().unwrap(); l.push(core1::core1_mul(x, x)); l.iter().sum() }\n',
+    "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n[dependencies]\nffi = { path = "../ffi" }\n',
+    "app/src/main.rs": 'fn main() { println!("{} {}", ffi::add(5, 7), ffi::ffi_add(1, 2)); }\n',
+    "c/loads.c": """#include <stdio.h>
+#include <stdint.h>
+#include <dlfcn.h>
+typedef uint32_t (*f0)(void); typedef uint32_t (*f1)(uint32_t); typedef uint32_t (*f2)(uint32_t, uint32_t);
+int main(int argc, char **argv) {
+    void *ffi = dlopen(argv[1], RTLD_NOW), *conly = dlopen(argv[2], RTLD_NOW);
+    if (!ffi || !conly) { printf("%s\\n", dlerror()); return 1; }
+    f2 add = (f2)dlsym(ffi, "ffi_add"), mul = (f2)dlsym(ffi, "core1_mul");
+    f1 named = (f1)dlsym(ffi, "ffi_named"), caught = (f1)dlsym(ffi, "ffi_caught");
+    f0 tick = (f0)dlsym(conly, "conly_tick");
+    uint32_t *version = (uint32_t *)dlsym(ffi, "FFI_VERSION");
+    if (!add || !mul || !named || !caught || !tick || !version) { printf("missing\\n"); return 1; }
+    uint32_t first = tick();
+    printf("%u %u %u %u %u %u %u %u\\n", add(3, 4), named(12), caught(0), caught(7), mul(6, 7), *version, first, tick());
+    return 0;
+}
+""",
+    "c/links.c": """#include <stdio.h>
+#include <stdint.h>
+uint32_t ffi_add(uint32_t, uint32_t); uint32_t ffi_named(uint32_t); uint32_t ffi_caught(uint32_t);
+int main(void) { printf("%u %u %u %u\\n", ffi_add(3, 4), ffi_named(12), ffi_caught(0), ffi_caught(9)); return 0; }
+""",
+    "c/pushes.c": """#include <stdio.h>
+#include <stdint.h>
+uint32_t sonly_push(uint32_t);
+int main(void) { sonly_push(2); printf("%u\\n", sonly_push(3)); return 0; }
+""",
+}
+
+
+def c_libraries(work, check):
+    """The C libraries of a workspace, shared and static, as cargo builds them and as the
+    daemon does: what each exports, and what C programs that load them and link them say,
+    before an edit and after."""
+    if os.name == "nt":
+        return
+    ws = os.path.realpath(os.path.join(work, "c-libraries"))
+    for file, text in C_LIBRARIES.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
+        open(os.path.join(ws, file), "w").write(text)
+    env = base_env(os.path.join(work, "home-c-libraries"))
+    ours, theirs = Side(ws, env, True), Side(ws, env, False)
+    darwin = sys.platform == "darwin"
+    shared = "lib{}.dylib" if darwin else "lib{}.so"
+    native = ["-lSystem"] if darwin else ["-lgcc_s", "-lutil", "-lrt", "-lpthread", "-lm", "-ldl", "-lc"]
+
+    def exported(library):
+        listed = subprocess.run(["nm", "-gU" if darwin else "-D", "--defined-only", library], capture_output=True, text=True).stdout
+        names = {line.split()[-1] for line in listed.splitlines() if line.strip()}
+        return sorted(it[1:] if darwin else it for it in names)
+
+    def said(target, tag):
+        """What each library exports and what each C program says, for the libraries in
+        `target`."""
+        out = os.path.join(ws, "c", tag)
+        os.makedirs(out, exist_ok=True)
+        lib = lambda name: os.path.join(ws, target, "debug", name)
+        seen = {name: exported(lib(shared.format(name))) for name in ("ffi", "conly")}
+        programs = [("loads", [], [lib(shared.format("ffi")), lib(shared.format("conly"))]), ("links", [lib("libffi.a"), *native], []), ("pushes", [lib("libsonly.a"), *native], [])]
+        for name, libraries, args in programs:
+            built = subprocess.run(["cc", os.path.join(ws, "c", name + ".c"), "-o", os.path.join(out, name), *libraries], capture_output=True, text=True)
+            ran = built.returncode == 0 and subprocess.run([os.path.join(out, name), *args], capture_output=True, text=True)
+            seen[name] = ran.stdout.strip() if ran else built.stderr.strip()[-300:]
+        return seen
+
+    before = None
+    for when in ("built", "edited"):
+        _, mine = ours.cargo("build", "--workspace")
+        _, other = theirs.cargo("build", "--workspace")
+        built = ours.how_built(mine.stderr)
+        mine, other = said("target", "rustd"), said("target-ref", "cargo")
+        changed = before is None or mine["links"] != before["links"]
+        check(f"C libraries {when}: the daemon's export and say what cargo's do", built == "daemon" and mine == other and changed, f"{built}; {difference(mine, other) or mine}")
+        before = mine
+        if when == "built":
+            rewrite(os.path.join(ws, "ffi/src/lib.rs"), "add(a, b) + core1", "add(a, b) * 2 + core1")
+    ours.cargo("stop")
 
 
 def scripted(work, check):
@@ -1022,6 +1147,7 @@ def daemon(work):
     check("a test file added after the daemon loaded the tests is a target it builds", before.returncode == 0 and found.returncode == 0 and "1 passed" in found.stdout, found.stderr.strip()[-200:])
     scripted(work, check)
     unselected_cdylib(work, check)
+    c_libraries(work, check)
     registry_impls(work, check)
     body_statics(work, check)
     here.cargo("stop")

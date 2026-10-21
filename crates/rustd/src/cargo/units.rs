@@ -150,6 +150,33 @@ impl Record {
         !self.is_test() && self.crate_types().iter().any(|it| matches!(*it, "lib" | "rlib"))
     }
 
+    /// The C library linked of the crate as a shared one, when rustc links it.
+    pub(crate) fn shared_library(&self) -> Option<PathBuf> {
+        let kinds = self.crate_types();
+        if self.is_test() || !kinds.contains(&"cdylib") {
+            return None;
+        }
+        let (prefix, suffix) = (std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX);
+        Some(self.out_dir()?.join(format!(
+            "{prefix}{}{}{suffix}",
+            self.crate_name,
+            self.extra_filename()
+        )))
+    }
+
+    /// The archive of the crate as a static C library, when rustc writes it.
+    pub(crate) fn static_library(&self) -> Option<PathBuf> {
+        if self.is_test() || !self.crate_types().contains(&"staticlib") {
+            return None;
+        }
+        let (name, extra) = (&self.crate_name, self.extra_filename());
+        let file = match cfg!(target_env = "msvc") {
+            true => format!("{name}{extra}.lib"),
+            false => format!("lib{name}{extra}.a"),
+        };
+        Some(self.out_dir()?.join(file))
+    }
+
     pub(crate) fn is_build_script(&self) -> bool {
         self.crate_name.starts_with("build_script_")
     }
@@ -174,6 +201,8 @@ impl Record {
             let (prefix, suffix) = (std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX);
             outputs.push(out_dir.join(format!("{prefix}{name}{extra}{suffix}")));
         }
+        outputs.extend(self.shared_library());
+        outputs.extend(self.static_library());
         outputs
     }
 
