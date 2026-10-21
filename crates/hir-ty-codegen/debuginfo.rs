@@ -430,7 +430,7 @@ impl DebugContext {
 /// A [`DebugContext`] on a thread of its own, which describes the functions it is sent
 /// while the thread that sends them goes on putting code in the object.
 pub(super) struct Describer {
-    functions: std::sync::mpsc::Sender<(FuncId, u32, FunctionDebug)>,
+    functions: std::sync::mpsc::SyncSender<(FuncId, u32, FunctionDebug)>,
     described: std::thread::JoinHandle<Described>,
 }
 
@@ -444,7 +444,7 @@ enum Described {
 
 impl Describer {
     pub(super) fn new(mut context: DebugContext) -> Describer {
-        let (functions, sent) = std::sync::mpsc::channel::<(FuncId, u32, FunctionDebug)>();
+        let (functions, sent) = std::sync::mpsc::sync_channel::<(FuncId, u32, FunctionDebug)>(4);
         let described = std::thread::spawn(move || {
             for (func, len, debug) in sent {
                 context.add_function(func, len, &debug);
@@ -492,9 +492,9 @@ pub(super) struct Dwarf {
     dwarf: DwarfUnit,
     /// The units that have all their functions.
     full: Vec<gimli::write::Unit>,
-    /// What the names of the files the entries of the units are read from start with, when
-    /// they are kept apart from what is linked, and the units that are.
-    apart: Option<(String, Vec<split::Apart>)>,
+    /// The encoded units kept apart from what is linked, and their skeletons.
+    apart: Option<split::Split>,
+    split_error: Option<String>,
     /// What tells the unit functions are being added to from another: what was added.
     id: FxHasher,
     encoding: Encoding,
@@ -541,7 +541,10 @@ impl Dwarf {
         let mut context = Dwarf {
             dwarf: DwarfUnit::new(encoding),
             full: Vec::new(),
-            apart: apart.map(|name| (name, Vec::new())),
+            apart: apart.and_then(|name| {
+                split::Split::new(isa, encoding, directory.as_bytes().to_vec(), name)
+            }),
+            split_error: None,
             id: FxHasher::default(),
             addresses: Vec::new(),
             encoding,
@@ -610,13 +613,18 @@ impl Dwarf {
         }
         let root = unit.root();
         let addresses = std::mem::take(&mut self.addresses);
-        if let Some((name, apart)) = &mut self.apart {
+        if let Some(split) = &mut self.apart {
+            if self.split_error.is_some() {
+                return;
+            }
+            let name = split.next_name().into_bytes();
             let lines = std::mem::replace(&mut unit.line_program, LineProgram::none());
             let root = unit.get_mut(root);
-            let name = split::file(name, apart.len()).into_bytes();
             root.set(DW_AT_GNU_dwo_name, AttributeValue::String(name));
             root.set(DW_AT_GNU_dwo_id, AttributeValue::Data8(id));
-            apart.push(split::Apart { unit, lines, ranges, addresses, id });
+            if let Err(error) = split.add(split::Apart { unit, lines, ranges, addresses, id }) {
+                self.split_error = Some(error);
+            }
             return;
         }
         let ranges = unit.ranges.add(RangeList(ranges));
@@ -1131,14 +1139,13 @@ impl Dwarf {
         if !matches!(product.object.format(), BinaryFormat::Elf | BinaryFormat::MachO) {
             return Ok(Vec::new());
         }
-        let Some((name, apart)) = self.apart.take() else {
+        if let Some(error) = self.split_error {
+            return Err(error);
+        }
+        let Some(split) = self.apart.take() else {
             place(product, self.sections()?)?;
             return Ok(Vec::new());
         };
-        let mut split = split::Split::new(self.encoding, self.directory, name, &product.object);
-        for unit in apart {
-            split.add(unit)?;
-        }
         let (sections, files) = split.finish();
         place(product, sections)?;
         Ok(files)
@@ -1412,6 +1419,47 @@ impl Writer for SectionWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn split_isa() -> cranelift_codegen::isa::OwnedTargetIsa {
+        cranelift_codegen::isa::lookup("x86_64-unknown-linux-gnu".parse().unwrap())
+            .unwrap()
+            .finish(cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()))
+            .unwrap()
+    }
+
+    #[test]
+    fn split_units_are_encoded_at_their_boundary() {
+        let isa = split_isa();
+        let mut dwarf = Dwarf::new(&*isa, "/", true, Some("test.o".to_owned()));
+        dwarf.end_unit();
+        assert_eq!(dwarf.apart.as_ref().unwrap().next_name(), split::file("test.o", 0));
+        for expected in 1..=2 {
+            dwarf.ranges.push(Range::StartLength { begin: Address::Constant(0), length: 4 });
+            dwarf.end_unit();
+            assert!(dwarf.split_error.is_none());
+            assert!(dwarf.full.is_empty());
+            assert_eq!(dwarf.apart.as_ref().unwrap().next_name(), split::file("test.o", expected));
+        }
+        dwarf.end_unit();
+        let (sections, files) = dwarf.apart.take().unwrap().finish();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|file| !file.bytes.is_empty()));
+        assert!(sections.iter().any(|section| section.written.len() > 0));
+    }
+
+    #[test]
+    fn split_encoding_keeps_the_first_error() {
+        let isa = split_isa();
+        let mut dwarf = Dwarf::new(&*isa, "/", true, Some("test.o".to_owned()));
+        dwarf
+            .ranges
+            .push(Range::StartEnd { begin: Address::Constant(0), end: Address::Constant(4) });
+        dwarf.end_unit();
+        let error = dwarf.split_error.clone().unwrap();
+        dwarf.ranges.push(Range::StartLength { begin: Address::Constant(4), length: 4 });
+        dwarf.end_unit();
+        assert_eq!(dwarf.split_error.as_deref(), Some(error.as_str()));
+    }
 
     #[test]
     fn linked_types_share_one_die() {

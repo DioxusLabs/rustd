@@ -676,7 +676,13 @@ def flags(work):
         open(os.path.join(ws, file), "w").write(text)
     env = base_env(os.path.join(work, "home-flags"))
     ours, theirs = Side(ws, env, True), Side(ws, env, False)
-    rows, wrong = [], []
+    rows, wrong = selected_member_tests(work)
+    patched_rows, patched_wrong = first_edit_patches(work)
+    rows.extend(patched_rows)
+    wrong.extend(patched_wrong)
+    ahead_rows, ahead_wrong = unused_ahead(work)
+    rows.extend(ahead_rows)
+    wrong.extend(ahead_wrong)
 
     def round_of(label):
         for command, args, extra in FLAG_CASES:
@@ -711,6 +717,158 @@ def flags(work):
         wrong.append(f"flags: status counts {cargos_builds(counted.stdout)} builds by cargo")
     ours.cargo("stop")
     return rows, wrong, counted.stdout
+
+
+def selected_member_tests(work):
+    """A spare loaded with a shared target before a selected member gets its doc tests."""
+    ws = os.path.realpath(os.path.join(work, "selected-member"))
+    files = {
+        "Cargo.toml": '[workspace]\nmembers = ["member"]\nresolver = "2"\n',
+        "member/Cargo.toml": '[package]\nname = "member"\nversion = "0.1.0"\nedition = "2021"\n',
+        "member/src/lib.rs": 'pub fn value() -> i32 { 7 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn unit() { assert_eq!(super::value(), 7); }\n}\n',
+        "member/tests/it.rs": '#[test]\nfn integration() { assert_eq!(member::value(), 7); }\n',
+    }
+    for file, text in files.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
+        open(os.path.join(ws, file), "w").write(text)
+    home = os.path.join(work, "home-selected-member")
+    env = dict(base_env(home), CARGO_TARGET_DIR=os.path.join(work, "target-selected-member"), RUSTD_SPARE="1")
+    ours, theirs = Side(ws, env, True), Side(ws, env, False)
+    rows, wrong = [], []
+    daemon = subprocess.Popen([RUSTD, "daemon"], cwd=ws, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        log = os.path.join(home, "spares", "0", "log")
+        until = time.time() + WARMUP_SECS
+        while time.time() < until:
+            if os.path.exists(log) and re.search(r"^spare: \d+ crates", open(log, errors="replace").read(), re.M):
+                break
+            if daemon.poll() is not None:
+                raise RuntimeError("selected member's daemon ended before loading its spare")
+            time.sleep(0.1)
+        else:
+            raise RuntimeError("selected member's spare did not load")
+        for label in ("cold", "warm", "edit"):
+            if label == "edit":
+                rewrite(os.path.join(ws, "member/src/lib.rs"), "{ 7 }", "{ let _ = 0; 7 }")
+            _, mine = ours.cargo("test", "-p", "member")
+            _, other = theirs.cargo("test", "-p", "member")
+            differs = difference(test_results(mine), test_results(other))
+            how = how_built(mine.stderr)
+            if mine.returncode != 0 or other.returncode != 0 or not test_results(mine)[1]:
+                differs = "; ".join(filter(None, [differs, f"exit {mine.returncode}/{other.returncode} or no tests"]))
+            if by_cargo(how):
+                differs = "; ".join(filter(None, [differs, "the build was cargo's"]))
+            if label == "cold" and "spare: workspace added" not in open(log, errors="replace").read():
+                differs = "; ".join(filter(None, [differs, "the preloaded spare was not used"]))
+            shown = "cargo rustd test -p member (shared target, preloaded spare)"
+            rows.append((label, shown, how, mine.returncode, differs or "same"))
+            print(f"  {label:6} {shown}  exit {mine.returncode}  {differs or 'same'}", flush=True)
+            if differs:
+                wrong.append(f"{label}: {shown}: {differs}\n{mine.stderr[-1000:]}")
+    finally:
+        ours.cargo("stop")
+        daemon.wait(timeout=30)
+    return rows, wrong
+
+
+def unused_ahead(work):
+    """A unit-only build does not retain its unused non-unit preload."""
+    if not os.path.isdir("/proc/self"):
+        return [], []
+    ws = os.path.realpath(os.path.join(work, "unit-only"))
+    files = {
+        "Cargo.toml": '[package]\nname = "unit-only"\nversion = "0.1.0"\nedition = "2021"\n',
+        "src/lib.rs": '#[test]\nfn unit() { assert_eq!(2 + 2, 4); }\n',
+    }
+    for file, text in files.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
+        open(os.path.join(ws, file), "w").write(text)
+    home = os.path.join(work, "home-unit-only")
+    env = dict(base_env(home), RUSTD_SPARE="1")
+    ours, theirs = Side(ws, env, True), Side(ws, env, False)
+    daemon = subprocess.Popen([RUSTD, "daemon"], cwd=ws, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        log = os.path.join(home, "spares", "0", "log")
+        until = time.time() + WARMUP_SECS
+        while time.time() < until:
+            if os.path.exists(log) and re.search(r"^spare: \d+ crates", open(log, errors="replace").read(), re.M):
+                break
+            if daemon.poll() is not None:
+                raise RuntimeError("unit-only daemon ended before loading its spare")
+            time.sleep(0.1)
+        else:
+            raise RuntimeError("unit-only spare did not load")
+        children = open(f"/proc/{daemon.pid}/task/{daemon.pid}/children").read().split()
+        if len(children) != 1:
+            raise RuntimeError(f"expected one preloaded spare, got {children}")
+        spare = int(children[0])
+        _, mine = ours.cargo("test", "--lib")
+        _, other = theirs.cargo("test", "--lib")
+        differs = difference(test_results(mine), test_results(other))
+        how = how_built(mine.stderr)
+        if mine.returncode or other.returncode or by_cargo(how) or not test_results(mine)[1]:
+            differs = "; ".join(filter(None, [differs, "test failure, Cargo fallback or no tests"]))
+        if alive(spare):
+            differs = "; ".join(filter(None, [differs, "the unused non-unit preload is still alive"]))
+        shown = "cargo rustd test --lib (unused non-unit preload)"
+        row = ("cold", shown, how, mine.returncode, differs or "same; unused preload stopped")
+        print(f"  cold   {shown}  exit {mine.returncode}  {row[-1]}", flush=True)
+        return [row], [f"{shown}: {differs}\n{mine.stderr[-1000:]}"] if differs else []
+    finally:
+        ours.cargo("stop")
+        daemon.wait(timeout=30)
+
+
+def first_edit_patches(work):
+    """Every test program keeps a patchable baseline, including code shared through the store."""
+    ws = os.path.realpath(os.path.join(work, "first-patch"))
+    files = {
+        "Cargo.toml": '[package]\nname = "first-patch"\nversion = "0.1.0"\nedition = "2021"\n\n[profile.dev]\noverflow-checks = false\n\n[profile.test]\noverflow-checks = false\n',
+        "src/lib.rs": 'pub struct Number(i32);\n/// ```\n/// assert_eq!(first_patch::value(), 7);\n/// ```\npub fn value() -> i32 { vec![Number(7)].into_iter().map(|n| n.0).sum() }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn unit() { assert_eq!(super::value(), 7); }\n}\n',
+        "tests/one.rs": '#[test]\nfn one() { assert_eq!(first_patch::value(), 7); }\n',
+        "tests/two.rs": '#[test]\nfn two() { assert_eq!(first_patch::value(), 7); }\n',
+    }
+    for file, text in files.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
+        open(os.path.join(ws, file), "w").write(text)
+    home = os.path.join(work, "home-first-patch")
+    env = base_env(home)
+    # Seal even this small fixture so later programs can hydrate its checkout code.
+    env["RUSTD_CACHE_SEAL_AT"] = "1"
+    ours, theirs = Side(ws, env, True), Side(ws, env, False)
+    rows, wrong = [], []
+    try:
+        for label in ("cold", "edit"):
+            if label == "edit":
+                _, status = ours.cargo("status")
+                logs = re.findall(r"^  worker: .*?, log (.+)$", status.stdout, re.M)
+                offsets = {path: os.path.getsize(path) for path in logs}
+                rewrite(os.path.join(ws, "src/lib.rs"), "{ vec![Number(7)]", "{ let _ = 0; vec![Number(7)]")
+            _, mine = ours.cargo("test")
+            _, other = theirs.cargo("test")
+            differs = difference(test_results(mine), test_results(other))
+            how = how_built(mine.stderr)
+            if mine.returncode or other.returncode or by_cargo(how) or not test_results(mine)[1]:
+                differs = "; ".join(filter(None, [differs, "test failure, Cargo fallback or no tests"]))
+            if label == "edit":
+                if len(logs) != 2:
+                    differs = "; ".join(filter(None, [differs, f"expected two workers, got {len(logs)}"]))
+                for path in logs:
+                    with open(path, errors="replace") as log:
+                        log.seek(offsets[path])
+                        added = log.read()
+                    counts = [len(re.findall(pattern, added, re.M)) for pattern in (r"^edit \(", r"^patch: ", r"^link: .*\(spliced:")]
+                    if counts != [2, 2, 2] or "not spliced:" in added:
+                        differs = "; ".join(filter(None, [differs, f"{path}: builds/patches/splices {counts}\n{added}"]))
+            shown = "cargo rustd test (two integration tests, lib unit tests and doctests)"
+            same = "same; every first edit patched and spliced" if label == "edit" else "same"
+            rows.append((label, shown, how, mine.returncode, differs or same))
+            print(f"  {label:6} {shown}  exit {mine.returncode}  {differs or rows[-1][-1]}", flush=True)
+            if differs:
+                wrong.append(f"{label}: {shown}: {differs}\n{mine.stderr[-1000:]}")
+    finally:
+        ours.cargo("stop")
+    return rows, wrong
 
 
 def unselected_cdylib(work, check):
@@ -1009,6 +1167,9 @@ def incremental(work):
     check("an edit runs the test that reaches it", [it for it in every if it != "ta"])
     open(lib, "w").write(edited.replace("+ 1 }", "+ 2 }"))
     check("an edit of what writes a static runs the tests that reach it", ["abort", "sleep", "ta", "tb", "tp"])
+    isolated = edited.replace("+ 1 }", "+ 2 }").replace("super::hit() >= 1", "super::hit() > 0", 1)
+    open(lib, "w").write(isolated)
+    check("an edit of one test leaves another that shares its static cached", [it for it in every if it != "h1"])
     check("--rerun-all runs every test", [], "--rerun-all")
     check("RUSTD_TEST_CACHE=0 runs every test", [], env={"RUSTD_TEST_CACHE": "0"})
     check("a filter lists the cached test", ["tb"], "tb", listed=1)
@@ -1024,6 +1185,50 @@ def incremental(work):
     check("a test that runs too long is stopped", [], env={"INCREMENTAL_SLEEP": "1", "RUSTD_TEST_TIMEOUT": "2"}, failed=["sleep"])
     held = "---- tests::abort stdout ----" in aborted.stdout and "failures:\n    tests::abort" in aborted.stdout
     checks.append(("incremental: a test that aborts is listed among the failures", held, ""))
+    side.cargo("stop")
+    checks.extend(memory_cache(work))
+    return checks
+
+
+def memory_cache(work):
+    """Memory instrumentation is observable by tests, but need not change per step."""
+    ws = os.path.realpath(os.path.join(work, "memory-cache"))
+    os.makedirs(os.path.join(ws, "src"), exist_ok=True)
+    open(os.path.join(ws, "Cargo.toml"), "w").write('[package]\nname = "memory-cache"\nversion = "0.1.0"\nedition = "2021"\n')
+    open(os.path.join(ws, "src/lib.rs"), "w").write('''#[cfg(test)] mod tests {
+    #[test] fn memory_directory() {
+        assert!(std::env::var("RUSTD_MEMORY").is_ok_and(|it| it.ends_with("memory")));
+    }
+    #[test] fn ordinary() {}
+    #[test] #[ignore] fn ignored() {}
+}
+''')
+    env = base_env(os.path.join(work, "home-memory-cache"))
+    env.pop("RUSTD_MEMORY", None)
+    side, reference = Side(ws, env, True), Side(ws, env, False)
+    checks = []
+    every = ["ignored", "memory_directory", "ordinary"]
+    reports = os.path.join(env["RUSTD_HOME"], "memory")
+
+    def check(name, directory, cached, failed=()):
+        _, cargo = reference.cargo("test", "--lib", env={"RUSTD_MEMORY": reports if directory is None else directory})
+        _, ran = side.cargo("test", "--lib", env={"RUSTD_MEMORY": reports if directory is None else directory})
+        results = dict(re.findall(r"^test tests::(\w+) \.\.\. (.+)$", ran.stdout, re.M))
+        found = sorted(name for name, result in results.items() if result.endswith("(cached)"))
+        failing = sorted(name for name, result in results.items() if result.startswith("FAILED"))
+        same = difference(test_results(cargo), test_results(ran)) is None
+        held = same and len(results) == len(every) and found == sorted(cached) and failing == sorted(failed)
+        checks.append((f"memory cache: {name}", held, f"cached {found}, failed {failing}"))
+        print(f"  {'ok ' if held else 'NOT'} memory cache: {name}  cached {found}, failed {failing}", flush=True)
+
+    changed = os.path.join(work, "changed-reports-directory")
+    check("cold instrumented tests run", None, [])
+    check("stable instrumentation caches ordinary, env-reading and ignored tests", None, every)
+    check("a changed report path is observable and invalidates results", changed, [], ["memory_directory"])
+    check("a failure is rerun with the same instrumentation", changed, ["ignored", "ordinary"], ["memory_directory"])
+    check("an empty report path is observable", "", [], ["memory_directory"])
+    check("restoring the report path reruns tests", None, [])
+    check("the restored instrumentation caches tests again", None, every)
     side.cargo("stop")
     return checks
 

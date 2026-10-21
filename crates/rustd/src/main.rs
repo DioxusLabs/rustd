@@ -4806,6 +4806,8 @@ impl Held {
         let scriptless = LoadCargoConfig { load_out_dirs_from_check: false, ..load_config() };
         let (db, vfs, mut checkouts) =
             load(&[dir], &cargo_config(&args), scriptless, args.selection, None)?;
+        // The empty package holds the library, not a checkout to reload for a later build.
+        checkouts.inputs = inputs::Inputs::default();
         checkouts.load_config = load_config();
         let all: Vec<ide_db::base_db::Crate> =
             Crate::all(&db).into_iter().map(Into::into).collect();
@@ -6817,7 +6819,7 @@ impl Tests {
         let print = |it: Option<u128>| it.map_or("-".to_owned(), |it| format!("{it:032x}"));
         let mut lines = String::new();
         for ((_, name), reached) in std::iter::zip(&tests, &reached) {
-            let _ = writeln!(lines, "test {} {} {name}", print(reached.print), reached.group);
+            let _ = writeln!(lines, "test {} {} {name}", print(reached.alone), reached.group);
         }
         lines
     }

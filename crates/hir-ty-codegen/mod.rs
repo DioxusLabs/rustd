@@ -489,9 +489,9 @@ impl CodegenUnit {
         let on_demand: FxHashSet<FunctionId> = roots.on_demand.iter().copied().collect();
         let all = || roots.entries.iter().chain(roots.on_demand).copied();
         let mut declined = None;
-        // Code of the checkout comes from the store in the first build alone: what a patch is
-        // of has to be compiled here, to tell what an edit changes.
-        let hydrate = known.base.is_none();
+        // A patchable base must compile checkout code itself to track its instances.
+        // Code of dependencies can still come from the store.
+        let hydrate = !known.patching && known.base.is_none();
         if let Some(base) = known.base.take().filter(|it| !it.outdated()) {
             let own_statics = OwnStatics::new(
                 db,
