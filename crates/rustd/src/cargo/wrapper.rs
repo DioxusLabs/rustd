@@ -365,7 +365,7 @@ impl Unit {
             // `symbols.o` asks for what the program needs of the libraries after it, as the
             // panic runtime, and is gone with rustc's directory.
             // The list of what a shared library exports is of rustc's directory too.
-            let exports = args.iter().filter_map(|it| super::plan::exports_list(it)).map(|it| it.1);
+            let exports = super::plan::exports_list(&args).map(|it| it.2);
             let objects = args
                 .iter()
                 .filter(|it| it.ends_with(".rcgu.o") || it.ends_with(SYMBOLS))

@@ -668,7 +668,7 @@ impl State {
         for (artifact, executable) in linked {
             let library = artifact.executable.as_ref() != Some(executable);
             let unit = Record::of_artifact(&used, executable.as_std_path());
-            let is_it = |it: PathBuf| same_file::is_same_file(it, executable).unwrap_or(false);
+            let is_it = |it: PathBuf| units::is_cargos_name(executable.as_std_path(), &it);
             let archive = library && unit.and_then(Record::static_library).is_some_and(is_it);
             let shared = library && unit.and_then(Record::shared_library).is_some_and(is_it);
             if library && !archive && !shared {

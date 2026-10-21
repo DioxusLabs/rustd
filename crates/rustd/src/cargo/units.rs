@@ -73,12 +73,9 @@ impl Record {
         records.iter().find(|record| record.wrote(artifact))
     }
 
-    /// Whether `artifact` is a file the unit wrote, as cargo names it: its hard link to the
-    /// file, or its copy of it, which is what cargo makes of an executable on macOS.
+    /// Whether `artifact` is a file the unit wrote, as cargo names it.
     pub(crate) fn wrote(&self, artifact: &Path) -> bool {
-        let outputs = self.outputs();
-        outputs.iter().any(|it| same_file::is_same_file(it, artifact).unwrap_or(false))
-            || outputs.iter().any(|it| is_copy(it, artifact))
+        self.outputs().iter().any(|it| is_cargos_name(artifact, it))
     }
 
     /// Every record in `dir`.
@@ -315,6 +312,12 @@ pub(crate) fn collect_garbage(dir: &Path, used: &[PathBuf]) -> anyhow::Result<()
         }
     }
     Ok(())
+}
+
+/// Whether `artifact` is the file `output` as cargo names it: its hard link to the file, or
+/// its copy of it, which is what cargo makes of an executable or a C library on macOS.
+pub(crate) fn is_cargos_name(artifact: &Path, output: &Path) -> bool {
+    same_file::is_same_file(output, artifact).unwrap_or(false) || is_copy(output, artifact)
 }
 
 /// Whether one file has the bytes of the other.

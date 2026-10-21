@@ -3065,8 +3065,9 @@ fn build(
     let start = Instant::now();
     if let Some(object) = &mut unit.object {
         // A patch defines again what the object does, and the linker of Mach-O takes two
-        // definitions of a name only when one of them gives way.
-        weaken::definitions(object);
+        // definitions of a name only when one of them gives way. A name that is no Rust
+        // symbol is the one a C library exports.
+        weaken::definitions(object, |name| !cargo::plan::is_rust_symbol(name));
         // The files a debugger is sent to are there before the object that sends it.
         for file in &unit.apart {
             replace(Path::new(&file.name), &file.bytes)?;

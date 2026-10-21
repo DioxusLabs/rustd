@@ -44,20 +44,42 @@ const SYMBOLS_BY_NAME: &str = "/PDBALTPATH:%_PDB%";
 /// The crates of the standard library whose symbols the daemon reads.
 const LIBRARY: [&str; 3] = ["core", "alloc", "std"];
 
-/// How each kind of linker is told the file that lists what a shared library exports.
-const EXPORTS: [&str; 3] = ["-Wl,--version-script=", "-Wl,-exported_symbols_list,", "/DEF:"];
+/// How each kind of linker is told the file that lists what a shared library exports: the
+/// flag, and what the argument after it starts with when that one names the file, as rustc
+/// has Apple's linker told.
+const EXPORTS: [(&str, Option<&str>); 4] = [
+    ("-Wl,--version-script=", None),
+    ("-Wl,-exported_symbols_list,", None),
+    ("-Wl,-exported_symbols_list", Some("-Wl,")),
+    ("/DEF:", None),
+];
 
 /// What the names of Rust's symbols start with, rustc's and rustd's own: none is exported
 /// from a shared library.
 const RUST_SYMBOL: [&str; 3] = ["_R", "_ZN", "rustd."];
 
+/// Whether `name` is one of Rust's symbols, as an object names it without the leading `_`
+/// of Mach-O's.
+pub(crate) fn is_rust_symbol(name: &str) -> bool {
+    RUST_SYMBOL.iter().any(|prefix| name.starts_with(prefix))
+}
+
 /// The name of the file the daemon links a library to, which it links whole every time: a
 /// splice adds to an executable alone.
 const LIBRARY_STEM: &str = "lib";
 
-/// The flag of a link line that names what a shared library exports, and the file it names.
-pub(crate) fn exports_list(arg: &str) -> Option<(&'static str, &str)> {
-    EXPORTS.iter().find_map(|flag| Some((*flag, arg.strip_prefix(flag)?)))
+/// Where a link line names the file that lists what a shared library exports: the argument,
+/// what comes before the file in it, and the file.
+pub(crate) fn exports_list(args: &[String]) -> Option<(usize, &'static str, &str)> {
+    args.iter().enumerate().find_map(|(at, arg)| {
+        EXPORTS.iter().find_map(|&(flag, then)| match then {
+            None => Some((at, flag, arg.strip_prefix(flag)?)),
+            Some(then) if arg == flag => {
+                Some((at + 1, then, args.get(at + 1)?.strip_prefix(then)?))
+            }
+            Some(_) => None,
+        })
+    })
 }
 
 /// Whether the daemon's file at `binary` is a library, which it does not splice.
@@ -343,16 +365,13 @@ impl Exports {
         let beside = Exports::beside(object);
         let _ = std::fs::remove_file(&beside);
         let flavor = link.flavor;
-        let Some(arg) = link.args.iter_mut().find(|it| exports_list(it).is_some()) else {
-            return Ok(());
-        };
-        let (flag, file) = exports_list(arg).context("a list of exports")?;
+        let Some((at, flag, file)) = exports_list(&link.args) else { return Ok(()) };
         let kept = unit.copy_of(Path::new(file));
         let text = kept.map(std::fs::read_to_string).transpose()?;
         let text = text.with_context(|| format!("no copy of {file} was kept"))?;
         let list = object.with_file_name("exports");
         let exports = Exports { flavor, rustc: flavor.exported(&text), list };
-        *arg = format!("{flag}{}", exports.list.display());
+        link.args[at] = format!("{flag}{}", exports.list.display());
         std::fs::write(&beside, serde_json::to_string(&exports)?)?;
         Ok(())
     }
@@ -422,7 +441,7 @@ impl Flavor {
                 Flavor::Apple => it.strip_prefix('_'),
                 _ => Some(it),
             })
-            .filter(|it| !RUST_SYMBOL.iter().any(|prefix| it.starts_with(prefix)))
+            .filter(|it| !is_rust_symbol(it))
             .map(str::to_owned);
         Ok(names.collect())
     }
@@ -746,6 +765,18 @@ mod tests {
         }
         let none = "{\n  local:\n    *;\n};\n";
         assert!(Flavor::Cc.exported(none).is_empty());
+    }
+
+    #[test]
+    fn lists_of_exports_found_in_link_lines() {
+        let args = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        let apple = args("-o lib.dylib -Wl,-exported_symbols_list -Wl,/t/list -Wl,-dead_strip");
+        assert_eq!(exports_list(&apple), Some((3, "-Wl,", "/t/list")));
+        let joined = args("-Wl,-exported_symbols_list,/t/list");
+        assert_eq!(exports_list(&joined), Some((0, "-Wl,-exported_symbols_list,", "/t/list")));
+        let cc = args("-shared -Wl,--version-script=/t/list");
+        assert_eq!(exports_list(&cc), Some((1, "-Wl,--version-script=", "/t/list")));
+        assert_eq!(exports_list(&args("-o a -Wl,-exported_symbols_list")), None);
     }
 
     #[test]
