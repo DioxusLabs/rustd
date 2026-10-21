@@ -30,6 +30,7 @@ pub(crate) struct SymbolTable {
     by_root: FxHashMap<Build, u64>,
     /// The crates of the link, each by its name and the file it starts at.
     linked: FxHashSet<(String, PathBuf)>,
+    programs: FxHashSet<(String, PathBuf)>,
     /// Every symbol defined or referred to, hashed: two that hash alike are not expected.
     names: FxHashSet<u64>,
     /// The paths of the functions defined under a symbol private to its object, hashed.
@@ -280,6 +281,9 @@ impl SymbolTable {
         let mut unplaced: FxHashMap<Build, FxHashMap<u64, usize>> = FxHashMap::default();
         for (name, source, range) in owners {
             table.linked.insert((name.clone(), source.0.clone()));
+            if source.1 {
+                table.programs.insert((name.clone(), source.0.clone()));
+            }
             if table.crates.get(&name) != Some(&None) {
                 continue;
             }
@@ -419,6 +423,10 @@ impl SymbolTable {
     /// bench may be named as the library, start where a test does, and be another program.
     pub(crate) fn links(&self, name: &str, root: &Path) -> bool {
         self.linked.contains(&(name.to_owned(), root.to_owned()))
+    }
+
+    pub(crate) fn links_program(&self, name: &str, root: &Path) -> bool {
+        self.programs.contains(&(name.to_owned(), root.to_owned()))
     }
 
     /// A source that was written after rustc built the crate it is of: what rustc built is

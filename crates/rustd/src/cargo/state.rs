@@ -290,18 +290,16 @@ impl Staged {
         let mut tests = Vec::new();
         let mut at_build = Vec::new();
         for (at, member) in members.iter().enumerate() {
-            if reached.contains(&at) {
-                at_build.extend(
-                    member.targets.iter().map(|it| it.src_path.clone().into_std_path_buf()),
-                );
-                continue;
-            }
             let of_build = |it: &&Target| {
                 let apart = [TargetKind::CustomBuild, TargetKind::Bench];
                 !it.kind.iter().any(|it| apart.contains(it))
             };
             for target in member.targets.iter().filter(of_build) {
                 let source = target.src_path.clone().into_std_path_buf();
+                if reached.contains(&at) && (target.is_lib() || target.is_proc_macro()) {
+                    at_build.push(source);
+                    continue;
+                }
                 // An integration test is a program of its own too. Its harness, when
                 // it has one, is the daemon's to write.
                 if target.is_test() {

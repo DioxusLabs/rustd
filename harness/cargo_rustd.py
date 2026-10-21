@@ -167,7 +167,7 @@ SMALL = ["ripgrep", "fd", "hyperfine"]
 MODES = {"rustd": "`cargo rustd`"}
 
 # What cargo and `cargo rustd` print about the build, which is not the program's output.
-STATUS = re.compile(r"^\s*((Compiling|Checking|Finished|Running|Downloading|Downloaded|Blocking|Locking|Updating|Adding|Fresh|Dirty|Doc-tests)\b|rustd:|warning:)")
+STATUS = re.compile(r"^\s*((Compiling|Checking|Finished|Running|Downloading|Downloaded|Blocking|Locking|Updating|Adding|Fresh|Dirty|Doc-tests)\b|Reloading what runs during the build:|rustd:|warning:)")
 
 
 def base_env(home):
@@ -582,6 +582,7 @@ FLAG_WORKSPACE = {
     "app/examples/demo.rs": 'fn main() {\n    println!("demo: {}", util::greeting("demo"));\n}\n',
     # Integration tests whose harness is the daemon's: tests in modules, `cfg(test)` and a
     # module of helpers beside them; and one test target that has no harness at all.
+    "util/tests/host.rs": '#[test]\nfn host_library() {\n    assert!(util::greeting("test").to_lowercase().starts_with("hello"));\n}\n',
     "app/tests/common/mod.rs": "pub fn twice<T: Clone>(it: T) -> (T, T) {\n    (it.clone(), it)\n}\n",
     "app/tests/edge.rs": 'mod common;\n\n#[test]\nfn uses_common() {\n    assert_eq!(common::twice(3u8), (3, 3));\n}\n\n#[test]\n#[should_panic(expected = "boom")]\nfn panics() {\n    panic!("boom now");\n}\n\n#[test]\n#[ignore = "slow"]\nfn ignored() {\n    panic!("never run");\n}\n\n#[test]\n#[cfg_attr(miri, ignore = "under miri")]\nfn not_under_miri() {}\n\n#[cfg(test)]\nmod inner {\n    #[test]\n    fn under_cfg_test() {\n        assert_eq!(super::common::twice("a").0, "a");\n    }\n\n    mod deeper {\n        #[test]\n        fn deepest() {}\n    }\n}\n\n#[cfg(not(test))]\n#[test]\nfn never_built() {\n    panic!();\n}\n',
     "app/tests/plain.rs": 'fn main() {\n    println!("plain: {}", util::greeting("plain"));\n}\n',
@@ -657,7 +658,10 @@ def flags(work):
     """Every flag case on both sides, cold, warm and after an edit. The result is the rows
     and what differed."""
     ws = os.path.realpath(os.path.join(work, "flags"))
-    for file, text in FLAG_WORKSPACE.items():
+    workspace = dict(FLAG_WORKSPACE)
+    workspace["app/Cargo.toml"] += '\n[build-dependencies]\nutil = { path = "../util" }\n'
+    workspace["app/build.rs"] = 'fn main() {\n    println!("cargo:warning={}", util::greeting("build"));\n}\n'
+    for file, text in workspace.items():
         os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
         open(os.path.join(ws, file), "w").write(text)
     env = base_env(os.path.join(work, "home-flags"))
@@ -692,6 +696,16 @@ def flags(work):
     rewrite(os.path.join(ws, "app/src/main.rs"), ".len(), 7)", ".len(), 8)")
     rewrite(os.path.join(ws, "app/tests/it.rs"), '"hello it"', '"hello it!"')
     round_of("edit")
+    tested = []
+    for path in pathlib.Path(ws, "target").rglob("record.json"):
+        record = json.load(open(path))
+        if "--test" in record["args"]:
+            tested.append(record["source"])
+            if not path.with_name("stands-in").exists():
+                wrong.append(f"flags: rustc compiled the test unit {record['source']}")
+    for source in ("util/src/lib.rs", "util/tests/host.rs"):
+        if os.path.join(ws, source) not in tested:
+            wrong.append(f"flags: no test unit was recorded for {source}")
     _, counted = ours.cargo("status")
     if cargos_builds(counted.stdout):
         wrong.append(f"flags: status counts {cargos_builds(counted.stdout)} builds by cargo")

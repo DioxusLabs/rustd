@@ -213,7 +213,10 @@ impl Unit {
 
     /// Whether the crate is one the first build of the workspace leaves to the daemon.
     fn is_staged(&self) -> bool {
-        self.listed_in(STAGED) && !self.script
+        let tested = std::env::var_os(STAGED).is_some()
+            && self.as_record(0, Vec::new(), None).is_test()
+            && !self.runs_in_build();
+        (self.listed_in(STAGED) || tested) && !self.script
     }
 
     fn listed_in(&self, variable: &str) -> bool {

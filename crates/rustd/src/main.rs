@@ -491,10 +491,15 @@ impl Resolver<'_> {
         let krate = Crate::from(krate);
         let name = krate.display_name(self.db)?;
         let root = self.crate_root(krate)?;
-        if ours && !self.table.links(name.crate_name().as_str(), &root) {
+        let program = is_tested(self.db, krate.into());
+        let linked = if program {
+            self.table.links_program(name.crate_name().as_str(), &root)
+        } else {
+            self.table.links(name.crate_name().as_str(), &root)
+        };
+        if ours && !linked {
             return None;
         }
-        let program = is_tested(self.db, krate.into());
         self.table.stable_crate_id(name.crate_name().as_str(), &root, program)
     }
 
@@ -866,9 +871,13 @@ impl SymbolResolver for Resolver<'_> {
         }
         let named = Crate::from(krate).display_name(self.db);
         let root = self.crate_root(krate.into());
-        named
-            .zip(root)
-            .is_some_and(|(name, root)| self.table.links(name.crate_name().as_str(), &root))
+        named.zip(root).is_some_and(|(name, root)| {
+            if is_tested(self.db, krate) {
+                self.table.links_program(name.crate_name().as_str(), &root)
+            } else {
+                self.table.links(name.crate_name().as_str(), &root)
+            }
+        })
     }
 
     fn stable_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
