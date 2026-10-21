@@ -4094,9 +4094,12 @@ fn named_from_anywhere(
     use hir::HasCrate as _;
     use syntax::ast::HasGenericArgs as _;
     let db = sema.db;
-    let written = sema.source(function).and_then(|it| it.value.ret_type()?.ty());
+    let source = sema.source(function).ok_or("its source is not known")?;
+    let written = source.value.ret_type().and_then(|it| it.ty());
     let written = written.ok_or("its return type is not written")?;
     let module = function.module(db);
+    let scope = hir_def::resolver::HasResolver::resolver(hir_def::ModuleId::from(module), db);
+    let spans = source.file_id.span_map(db);
     let edition = module.krate(db).edition(db);
     let cfg = hir::FindPathConfig {
         prefer_no_std: false,
@@ -4110,7 +4113,11 @@ fn named_from_anywhere(
     let paths: Vec<_> = paths.filter(|it| it.parent_path().is_none()).collect();
     // From the last, so that the ranges of those before stay where they are.
     for path in paths.iter().rev() {
-        let Some(hir::PathResolution::Def(def)) = sema.resolve_path(path) else {
+        let lowered = hir_expand::mod_path::ModPath::from_src(db, path.clone(), &mut |range| {
+            spans.span_for_range(range).ctx
+        });
+        let resolved = lowered.and_then(|it| scope.resolve_module_path_in_items(db, &it).types);
+        let Some(def) = resolved.map(|it| hir::ModuleDef::from(it.def)) else {
             return Err(format!("`{path}` is not an item"));
         };
         if matches!(def, hir::ModuleDef::BuiltinType(_)) {
