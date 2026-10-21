@@ -23,6 +23,7 @@ cases![
     served_callsite,
     type_id_of_ctor,
     type_id_nested_fn,
+    default_method_callsite,
     niche_eq,
     simd_cast,
     big_frame,

@@ -187,6 +187,30 @@ pub mod served {
     }
 }
 
+pub mod default_callsites {
+    pub trait DefaultCallsites {
+        fn visit(&self, first: bool, step: u32) -> u32 {
+            if first { crate::callsites::site!(step) } else { crate::callsites::site!(step * 100) }
+        }
+
+        async fn visit_async(&self, first: bool, step: u32) -> u32 {
+            if first { crate::callsites::site!(step) } else { crate::callsites::site!(step * 100) }
+        }
+    }
+
+    pub struct Rustc;
+
+    impl DefaultCallsites for Rustc {}
+
+    pub fn served_callsite(first: bool, step: u32) -> u32 {
+        Rustc.visit(first, step)
+    }
+
+    pub async fn served_async_callsite(first: bool, step: u32) -> u32 {
+        Rustc.visit_async(first, step).await
+    }
+}
+
 /// The output of a future that is ready the first time it is polled.
 pub fn ready(mut future: std::pin::Pin<Box<dyn Future<Output = u32> + Send + '_>>) -> u32 {
     use std::task::{Context, Poll, Waker};

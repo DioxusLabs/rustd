@@ -1078,7 +1078,19 @@ impl Resolver<'_> {
                 }
                 let func = self.function_at(&sema, module, &func)?;
                 let func: FunctionId = func.try_into().ok()?;
-                owner = Some((self.path(func)?, func));
+                let function = match ModuleDef::from(ModuleDefId::FunctionId(func)) {
+                    ModuleDef::Function(function) => function,
+                    _ => return None,
+                };
+                let path = match function.as_assoc_item(self.db).map(|it| it.container(self.db)) {
+                    Some(AssocItemContainer::Trait(trait_)) => {
+                        let trait_path =
+                            self.item_path(trait_.module(self.db), trait_.name(self.db).as_str())?;
+                        format!("{trait_path}::{}", function.name(self.db).as_str())
+                    }
+                    _ => self.path(func)?,
+                };
+                owner = Some((path, func));
                 break;
             }
             let name = match_ast! {
