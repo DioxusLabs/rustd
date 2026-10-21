@@ -53,6 +53,7 @@ impl Node {
 
 #[derive(Default)]
 struct Graph {
+    homes: super::home::Homes,
     ids: FxHashMap<Node, usize>,
     /// The print of each node's own code and of the source locations it reports.
     own: Vec<Option<u128>>,
@@ -153,7 +154,7 @@ impl Graph {
         let funcs = requests.funcs.iter().filter_map(|it| match &it.target {
             FuncTarget::Instance(instance, env) => Some(match instance.def {
                 InstanceDef::Fn(func) if instance.args.as_ref().is_empty() => Node::Root(func),
-                _ => Node::Instance(instance.clone(), env.clone()),
+                _ => Node::Instance(instance.clone(), self.homes.home(db, instance, env)),
             }),
             // Code rustc compiled, which is the same until cargo builds again, or a name the
             // linker resolves, which the caller hands in as reached by everything.

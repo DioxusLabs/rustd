@@ -838,7 +838,7 @@ pub fn hit() -> usize { HITS.fetch_add(1, Ordering::SeqCst) + 1 }
 const A: u32 = 1;
 #[cfg(test)]
 mod tests {
-    #[test] fn ta() { assert_eq!(super::a(), 1); }
+    #[test] fn ta() { assert_eq!(shared::identity(super::a()), 1); }
     #[test] fn tb() { assert_eq!(super::b(), 2); }
     #[test] fn h1() { assert!(super::hit() >= 1); }
     #[test] fn h2() { assert!(super::hit() >= 1); }
@@ -855,7 +855,10 @@ def incremental(work):
     ws = os.path.realpath(os.path.join(work, "incremental"))
     lib = os.path.join(ws, "src/lib.rs")
     os.makedirs(os.path.dirname(lib), exist_ok=True)
-    open(os.path.join(ws, "Cargo.toml"), "w").write('[package]\nname = "lib"\nversion = "0.1.0"\nedition = "2021"\n')
+    open(os.path.join(ws, "Cargo.toml"), "w").write('[package]\nname = "lib"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nshared = { path = "shared" }\n')
+    os.makedirs(os.path.join(ws, "shared/src"), exist_ok=True)
+    open(os.path.join(ws, "shared/Cargo.toml"), "w").write('[package]\nname = "shared"\nversion = "0.1.0"\nedition = "2021"\n')
+    open(os.path.join(ws, "shared/src/lib.rs"), "w").write('pub fn identity<T>(value: T) -> T { value }\n')
     open(lib, "w").write(INCREMENTAL_LIB)
     side = Side(ws, base_env(os.path.join(work, "home-incremental")), True)
     checks = []
