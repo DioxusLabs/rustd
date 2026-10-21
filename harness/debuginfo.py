@@ -238,7 +238,7 @@ fn show(seed: u32) -> u32 {
     let _ = std::hint::black_box(&once);
     let sum = by_ref(1) + by_move(2) + by_mut() as u32 + object.name() + boxed.name();
     println!("{}", sum);
-    std::hint::black_box((&leaf, &node, &wide, &wide_b, &wide_c, &nested_option, &ordering, &fresh));
+    std::hint::black_box((&leaf, &node, &wide, &wide_b, &wide_c, &nested_option, &nested, &ordering, &fresh));
     let _ = future.as_mut().poll(&mut cx);
     let _ = future.as_mut().poll(&mut cx);
     sum
