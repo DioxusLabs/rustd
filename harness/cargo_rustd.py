@@ -1206,6 +1206,37 @@ def workspace_workers(work, check):
         f"workers {len(workers)}, joins {joined}, Cargo builds {cargos_builds(status)}",
     )
 
+    budget_env = base_env(os.path.join(work, "home-worker-budget"))
+    budget_env["RUSTD_WORKER_BUDGET"] = "1"
+    budget_env["CARGO_TARGET_DIR"] = os.path.join(work, "target-worker-budget")
+    budget_side = Side(ws, budget_env, True)
+    budget_results = []
+    for package in ("a", "b"):
+        args = ["-p", package, "--no-fail-fast"]
+        _, mine = budget_side.cargo("test", *args)
+        _, reference = theirs.cargo("test", *args)
+        matches = mine.returncode == reference.returncode and test_results(mine) == test_results(reference)
+        how = how_built(mine.stderr)
+        budget_results.append(matches and how == "daemon")
+        check(
+            f"worker budget test -p {package} matches cargo and is daemon-served",
+            matches and how == "daemon",
+            f"{how}; exit {mine.returncode}/{reference.returncode}",
+        )
+    daemon_log = os.path.join(budget_env["RUSTD_HOME"], "daemon.log")
+    daemon_log_text = open(daemon_log, errors="replace").read() if os.path.exists(daemon_log) else ""
+    restart = re.search(
+        rf"^worker \S+: \d+ over budget 1; starting fresh for {re.escape(os.path.join(ws, 'b'))}$",
+        daemon_log_text,
+        re.M,
+    )
+    check(
+        "worker budget starts a fresh worker for package b",
+        bool(restart) and all(budget_results),
+        restart[0] if restart else daemon_log_text,
+    )
+    budget_side.cargo("stop")
+
     for order, home, sequence in (
         ("test then build", "home-tb", (("test", ["-p", "threaded", "--no-fail-fast"]), ("build", ["-p", "threaded"]))),
         ("build then test", "home-bt", (("build", ["-p", "threaded"]), ("test", ["-p", "threaded", "--no-fail-fast"]))),

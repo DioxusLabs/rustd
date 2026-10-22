@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Arc, Mutex, MutexGuard, PoisonError,
+        Arc, Condvar, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicUsize, Ordering::Relaxed},
     },
     time::{Duration, Instant, SystemTime},
@@ -326,6 +326,8 @@ struct Worker {
     env: ide_db::base_db::Env,
     child: Mutex<Child>,
     checkouts: Mutex<FxHashMap<String, Loaded>>,
+    active: Mutex<usize>,
+    idle: Condvar,
     asked: Mutex<Instant>,
 }
 
@@ -408,6 +410,8 @@ impl Worker {
             env,
             child: Mutex::new(child),
             checkouts: Mutex::new(FxHashMap::from_iter([(checkout.key.clone(), loading)])),
+            active: Mutex::new(0),
+            idle: Condvar::new(),
             asked: Mutex::new(Instant::now()),
         })
     }
@@ -437,8 +441,28 @@ impl Worker {
             env,
             child: Mutex::new(told.child),
             checkouts: Mutex::new(FxHashMap::default()),
+            active: Mutex::new(0),
+            idle: Condvar::new(),
             asked: Mutex::new(Instant::now()),
         })
+    }
+
+    fn activity(self: &Arc<Self>) -> WorkerActivity {
+        *lock(&self.active) += 1;
+        WorkerActivity { worker: self.clone() }
+    }
+
+    fn over_budget(&self) -> Option<(u64, u64)> {
+        let rss = crate::memory::resident_bytes(lock(&self.child).id())?;
+        let budget = crate::memory::worker_budget()?;
+        (rss > budget).then_some((rss, budget))
+    }
+
+    fn wait_idle(&self) {
+        let mut active = lock(&self.active);
+        while *active != 0 {
+            active = self.idle.wait(active).unwrap_or_else(PoisonError::into_inner);
+        }
     }
 
     /// Whether the process has ended, and how.
@@ -459,6 +483,7 @@ impl Worker {
     }
 
     fn stop(&self) {
+        self.wait_idle();
         let mut child = lock(&self.child);
         // One that has exited already has nothing to kill.
         let _ = child.kill();
@@ -580,9 +605,20 @@ impl Worker {
         }
     }
 
-    /// Whether it is loading a checkout.
-    fn loading(&self) -> bool {
-        lock(&self.checkouts).values().any(|it| matches!(it.warmth, Warmth::Loading(_)))
+    fn checkout_loading(&self, checkout: &Checkout) -> bool {
+        lock(&self.checkouts).get(&checkout.key).is_some_and(|it| {
+            it.generation == checkout.generation && matches!(it.warmth, Warmth::Loading(_))
+        })
+    }
+
+    fn warmth(&self, checkout: &Checkout) -> Warmth {
+        match lock(&self.checkouts).get(&checkout.key) {
+            Some(loaded) if loaded.generation == checkout.generation => loaded.warmth.clone(),
+            _ => Warmth::Failed(
+                "the daemon has not loaded this build of the workspace".to_owned(),
+                SystemTime::now(),
+            ),
+        }
     }
 
     fn status(&self) -> WorkerStatus {
@@ -595,6 +631,20 @@ impl Worker {
                 .values()
                 .map(|it| (it.root.clone(), it.warmth.describe()))
                 .collect(),
+        }
+    }
+}
+
+struct WorkerActivity {
+    worker: Arc<Worker>,
+}
+
+impl Drop for WorkerActivity {
+    fn drop(&mut self) {
+        let mut active = lock(&self.worker.active);
+        *active -= 1;
+        if *active == 0 {
+            self.worker.idle.notify_all();
         }
     }
 }
@@ -829,7 +879,7 @@ impl Daemon {
             Request::Sync(checkout) => self.sync(&checkout, "sync"),
             Request::Lint(checkout) => self.sync(&checkout, "lint"),
             Request::Warm(checkout) => match self.warm(checkout) {
-                Ok(()) => Reply::Warming,
+                Ok(_activity) => Reply::Warming,
                 Err(why) => Reply::Cold { reason: format!("{why:#}") },
             },
             Request::Ahead(ahead) => {
@@ -849,7 +899,7 @@ impl Daemon {
                 Reply::Warming
             }
             Request::Build(checkout) => match self.warm(checkout.clone()) {
-                Ok(()) => self.built(&checkout),
+                Ok(activity) => self.built(&checkout, activity),
                 Err(why) => Reply::Cold { reason: format!("{why:#}") },
             },
             Request::Results(object) => Reply::Results(lock(&self.results).get(&object).cloned()),
@@ -868,18 +918,18 @@ impl Daemon {
     }
 
     fn sync(&self, checkout: &Checkout, verb: &str) -> Reply {
-        let worker = lock(&self.workers).get(&checkout.config.id()).cloned();
-        let Some(worker) = worker else {
-            return Reply::Cold { reason: "the daemon has not loaded this workspace".to_owned() };
+        let (worker, _activity) = {
+            let workers = lock(&self.workers);
+            let Some(worker) = workers.get(&checkout.config.id()).cloned() else {
+                return Reply::Cold {
+                    reason: "the daemon has not loaded this workspace".to_owned(),
+                };
+            };
+            let activity = worker.activity();
+            (worker, activity)
         };
         *lock(&worker.asked) = Instant::now();
-        let warmth = match lock(&worker.checkouts).get(&checkout.key) {
-            Some(loaded) if loaded.generation == checkout.generation => loaded.warmth.clone(),
-            _ => Warmth::Failed(
-                "the daemon has not loaded this build of the workspace".to_owned(),
-                SystemTime::now(),
-            ),
-        };
+        let warmth = worker.warmth(checkout);
         match warmth {
             Warmth::Ready => worker.sync(checkout, verb),
             Warmth::Loading(since) => Reply::Cold {
@@ -895,25 +945,26 @@ impl Daemon {
     /// What the worker that loads `checkout` has to say of its programs once it has. Asked
     /// once the load is over: a load that ends between the two would leave a "still
     /// loading" for the answer.
-    fn built(&self, checkout: &Checkout) -> Reply {
-        while self.loads(checkout) {
+    fn built(&self, checkout: &Checkout, activity: WorkerActivity) -> Reply {
+        let worker = activity.worker.clone();
+        while worker.checkout_loading(checkout) {
             std::thread::sleep(POLL);
         }
-        self.sync(checkout, "sync")
-    }
-
-    /// Whether a worker is loading this build of `checkout`.
-    fn loads(&self, checkout: &Checkout) -> bool {
-        let worker = lock(&self.workers).get(&checkout.config.id()).cloned();
-        worker.is_some_and(|worker| {
-            lock(&worker.checkouts).get(&checkout.key).is_some_and(|it| {
-                it.generation == checkout.generation && matches!(it.warmth, Warmth::Loading(_))
-            })
-        })
+        *lock(&worker.asked) = Instant::now();
+        match worker.warmth(checkout) {
+            Warmth::Ready => worker.sync(checkout, "sync"),
+            Warmth::Loading(since) => Reply::Cold {
+                reason: format!(
+                    "the daemon is still loading the workspace ({:.0?} so far)",
+                    since.elapsed()
+                ),
+            },
+            Warmth::Failed(reason, _) => Reply::Cold { reason },
+        }
     }
 
     /// Has a worker load `checkout`, adding a root to a live worker when needed.
-    fn warm(&self, checkout: Checkout) -> anyhow::Result<()> {
+    fn warm(&self, checkout: Checkout) -> anyhow::Result<WorkerActivity> {
         let id = checkout.config.id();
         let mut workers = lock(&self.workers);
         // What a worker could not load once it can't load again, until cargo builds anew or
@@ -937,21 +988,38 @@ impl Daemon {
         }
         let running = workers.get(&id).filter(|it| it.ended().is_none()).cloned();
         if let Some(worker) = &running {
-            let mut checkouts = lock(&worker.checkouts);
-            match checkouts.get(&checkout.key) {
-                Some(loaded) if loaded.generation == checkout.generation => return Ok(()),
+            let generation = lock(&worker.checkouts).get(&checkout.key).map(|it| it.generation);
+            match generation {
+                Some(generation) if generation == checkout.generation => {
+                    return Ok(worker.activity());
+                }
                 // What it linked against is not what cargo has now.
                 Some(_) => {}
                 None => {
-                    let loading = Loaded {
-                        generation: checkout.generation,
-                        root: checkout.root.clone(),
-                        warmth: Warmth::Loading(Instant::now()),
-                    };
-                    checkouts.insert(checkout.key.clone(), loading);
-                    let worker = worker.clone();
-                    std::thread::spawn(move || worker.warm(&checkout, false));
-                    return Ok(());
+                    if let Some((rss, budget)) = worker.over_budget() {
+                        eprintln!(
+                            "worker {id}: {rss} over budget {budget}; starting fresh for {}",
+                            checkout.project().display()
+                        );
+                        if let Some(old) = workers.remove(&id) {
+                            old.stop();
+                        }
+                    } else {
+                        let loading = Loaded {
+                            generation: checkout.generation,
+                            root: checkout.root.clone(),
+                            warmth: Warmth::Loading(Instant::now()),
+                        };
+                        lock(&worker.checkouts).insert(checkout.key.clone(), loading);
+                        let worker = worker.clone();
+                        let warm_activity = worker.activity();
+                        let request_activity = worker.activity();
+                        std::thread::spawn(move || {
+                            let _activity = warm_activity;
+                            worker.warm(&checkout, false);
+                        });
+                        return Ok(request_activity);
+                    }
                 }
             }
         }
@@ -962,25 +1030,45 @@ impl Daemon {
         let ahead = lock(&self.ahead).remove(&id);
         let worker = match ahead {
             Some(ahead) if !ahead.ahead.config.same_root(&checkout.config) => {
-                eprintln!(
-                    "ahead worker {id}: keeping root {:?} (cfg_test={}, selection={:?}) for incoming {:?} (cfg_test={}, selection={:?})",
-                    ahead.ahead.config.project,
-                    ahead.ahead.config.cfg_test,
-                    ahead.ahead.config.selection,
-                    checkout.config.project,
-                    checkout.config.cfg_test,
-                    checkout.config.selection,
-                );
-                let worker = Arc::new(Worker::start_ahead(ahead, dir)?);
-                let loading = Loaded {
-                    generation: checkout.generation,
-                    root: checkout.root.clone(),
-                    warmth: Warmth::Loading(Instant::now()),
-                };
-                lock(&worker.checkouts).insert(checkout.key.clone(), loading);
-                workers.insert(id.clone(), worker.clone());
-                std::thread::spawn(move || worker.warm(&checkout, false));
-                return Ok(());
+                let ahead_config = ahead.ahead.config.clone();
+                let worker = Arc::new(Worker::start_ahead(ahead, dir.clone())?);
+                if let Some((rss, budget)) = worker.over_budget() {
+                    eprintln!(
+                        "worker {id}: {rss} over budget {budget}; starting fresh for {}",
+                        checkout.project().display()
+                    );
+                    let _ = worker.connected();
+                    worker.stop();
+                    Arc::new(Worker::start(
+                        &checkout,
+                        dir,
+                        lock(&self.spare).take().map(|it| (it, checkout.config.clone())),
+                    )?)
+                } else {
+                    eprintln!(
+                        "ahead worker {id}: keeping root {:?} (cfg_test={}, selection={:?}) for incoming {:?} (cfg_test={}, selection={:?})",
+                        ahead_config.project,
+                        ahead_config.cfg_test,
+                        ahead_config.selection,
+                        checkout.config.project,
+                        checkout.config.cfg_test,
+                        checkout.config.selection,
+                    );
+                    let loading = Loaded {
+                        generation: checkout.generation,
+                        root: checkout.root.clone(),
+                        warmth: Warmth::Loading(Instant::now()),
+                    };
+                    lock(&worker.checkouts).insert(checkout.key.clone(), loading);
+                    workers.insert(id.clone(), worker.clone());
+                    let warm_activity = worker.activity();
+                    let request_activity = worker.activity();
+                    std::thread::spawn(move || {
+                        let _activity = warm_activity;
+                        worker.warm(&checkout, false);
+                    });
+                    return Ok(request_activity);
+                }
             }
             Some(ahead) => {
                 Arc::new(Worker::start(&checkout, dir, Some((ahead.spare, ahead.ahead.config)))?)
@@ -1004,8 +1092,13 @@ impl Daemon {
             worker.project.display()
         );
         workers.insert(id, worker.clone());
-        std::thread::spawn(move || worker.warm(&checkout, true));
-        Ok(())
+        let warm_activity = worker.activity();
+        let request_activity = worker.activity();
+        std::thread::spawn(move || {
+            let _activity = warm_activity;
+            worker.warm(&checkout, true);
+        });
+        Ok(request_activity)
     }
 
     /// Stops the workers nobody has asked for the idle time, and the daemon when nobody has
@@ -1014,13 +1107,13 @@ impl Daemon {
         loop {
             std::thread::sleep(self.idle.map_or(TICK, |idle| idle.min(TICK)));
             // The next spare starts when the worker that was one has loaded its workspace.
-            let loading = lock(&self.workers).values().any(|it| it.loading());
+            let loading = lock(&self.workers).values().any(|it| it.loads());
             if !loading && lock(&self.ahead).is_empty() {
                 self.spare();
             }
             let Some(idle) = self.idle else { continue };
             // Loading is what the last build asked for: the idle time starts after it.
-            for worker in lock(&self.workers).values().filter(|it| it.loading()) {
+            for worker in lock(&self.workers).values().filter(|it| it.loads()) {
                 *lock(&worker.asked) = Instant::now();
                 *lock(&self.asked) = Instant::now();
             }
