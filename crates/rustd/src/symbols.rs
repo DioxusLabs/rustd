@@ -3,6 +3,7 @@
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
+    sync::{Arc, LazyLock, Mutex, Weak},
     time::SystemTime,
 };
 
@@ -39,7 +40,7 @@ pub(crate) struct SymbolTable {
     /// When the files started to be read.
     read: Option<SystemTime>,
     /// The copies crates made of one instance, by the symbol without the crate that made it.
-    copies: FxHashMap<String, Vec<String>>,
+    copies: SharedMap<Vec<String>>,
     /// The crates that made a copy of an instance of a function, by the function's name
     /// alone: what there is to go by for an instance whose types cannot be spelled.
     makers: FxHashMap<String, FxHashSet<u64>>,
@@ -51,11 +52,64 @@ pub(crate) struct Paths {
     /// More than one symbol for the items that print as one path: of two `const _` blocks of
     /// a module, or of one name in one function. Linking one to another's symbol is a
     /// miscompile.
-    by_path: FxHashMap<String, Vec<Placed>>,
+    by_path: SharedMap<Vec<Placed>>,
     /// Symbols of items nested in closures and anonymous constants, by their path without the
     /// `{closure#0}`-like segments, with the numbers of the closures among those.
-    nested: FxHashMap<String, Vec<NestedSymbol>>,
+    nested: SharedMap<Vec<NestedSymbol>>,
 }
+
+#[derive(Default)]
+struct SharedMap<V> {
+    entries: FxHashMap<Arc<str>, Arc<V>>,
+}
+
+type SharedEntries<V> = FxHashMap<u64, Vec<(Weak<str>, Weak<V>)>>;
+
+impl<V: Clone + Default + Eq + Hash> SharedMap<V> {
+    fn or_default(&mut self, key: String) -> &mut V {
+        Arc::make_mut(self.entries.entry(key.into()).or_default())
+    }
+
+    fn get(&self, key: &str) -> Option<&V> {
+        self.entries.get(key).map(|value| &**value)
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn share(&mut self, cache: &Mutex<SharedEntries<V>>) {
+        use std::hash::BuildHasher;
+        let mut cache = cache.lock().unwrap();
+        cache.retain(|_, entries| {
+            entries.retain(|(key, value)| key.strong_count() != 0 && value.strong_count() != 0);
+            !entries.is_empty()
+        });
+        self.entries = self
+            .entries
+            .drain()
+            .map(|(key, value)| {
+                let hash = rustc_hash::FxBuildHasher.hash_one((&*key, &*value));
+                let candidates = cache.entry(hash).or_default();
+                for (known_key, known_value) in &*candidates {
+                    if let (Some(known_key), Some(known_value)) =
+                        (known_key.upgrade(), known_value.upgrade())
+                    {
+                        if known_key == key && known_value == value {
+                            return (known_key, known_value);
+                        }
+                    }
+                }
+                candidates.push((Arc::downgrade(&key), Arc::downgrade(&value)));
+                (key, value)
+            })
+            .collect();
+    }
+}
+
+static PLACED: LazyLock<Mutex<SharedEntries<Vec<Placed>>>> = LazyLock::new(Mutex::default);
+static NESTED: LazyLock<Mutex<SharedEntries<Vec<NestedSymbol>>>> = LazyLock::new(Mutex::default);
+static COPIES: LazyLock<Mutex<SharedEntries<Vec<String>>>> = LazyLock::new(Mutex::default);
 
 /// Who can refer to a symbol an object defines.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -68,6 +122,7 @@ enum Reach {
     PrivateStatic,
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct NestedSymbol {
     name: String,
     closures: Vec<u32>,
@@ -75,6 +130,7 @@ struct NestedSymbol {
     around: Vec<u64>,
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct Placed {
     name: String,
     /// The place of the item among those of its name in what it is written in, which rustc
@@ -292,6 +348,7 @@ impl SymbolTable {
         }
         table.place(unplaced);
         table.index(symbols);
+        table.share();
         table.files = files.to_vec();
         Ok(table)
     }
@@ -305,7 +362,16 @@ impl SymbolTable {
             table.add_name(Named::new(name, Reach::Linkable, 0), &mut symbols);
         }
         table.index(symbols);
+        table.share();
         table
+    }
+
+    fn share(&mut self) {
+        self.linkable.by_path.share(&PLACED);
+        self.linkable.nested.share(&NESTED);
+        self.private_statics.by_path.share(&PLACED);
+        self.private_statics.nested.share(&NESTED);
+        self.copies.share(&COPIES);
     }
 
     /// Files the symbols under their paths, once every crate named in one is known.
@@ -347,7 +413,7 @@ impl SymbolTable {
             && self.names.insert(Self::hashed(&name))
             && instance.len() != name.len()
         {
-            self.copies.entry(instance.to_owned()).or_default().push(name.clone());
+            self.copies.or_default(instance.to_owned()).push(name.clone());
         }
         let Some((with_ids, path)) = demangled else { return };
         for (krate, id) in crate_ids(&with_ids) {
@@ -528,13 +594,13 @@ impl Paths {
                 .split("::")
                 .filter_map(|it| it.strip_prefix("{closure#")?.strip_suffix('}')?.parse().ok())
                 .collect();
-            let symbols = self.nested.entry(named.join("::")).or_default();
+            let symbols = self.nested.or_default(named.join("::"));
             if symbols.iter().all(|it| it.name != name) {
                 let around = around.clone();
                 symbols.push(NestedSymbol { name: name.clone(), closures, place, around });
             }
         }
-        let known = self.by_path.entry(path).or_default();
+        let known = self.by_path.or_default(path);
         let same = |it: &Placed| {
             without_instantiating_crate(&it.name) == without_instantiating_crate(&name)
         };
@@ -1046,11 +1112,83 @@ impl V0<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        hash::BuildHasher,
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
 
     use rustc_hash::FxHashMap;
 
-    use super::{Paths, SymbolTable, V0, function_name};
+    use super::{Paths, SharedEntries, SharedMap, SymbolTable, V0, function_name};
+
+    #[test]
+    fn tables_share_normalized_symbols_and_copies() {
+        let of_lib = "_RINvCslFwujm09uXn_4kdep3sumhECsjPNOOTmEH7l_4klib";
+        let of_app = "_RINvCslFwujm09uXn_4kdep3sumhECsjSK0TBt3L2V_4kapp";
+        let first = SymbolTable::of_names([of_lib, of_app]);
+        let second = SymbolTable::of_names([of_lib, of_app, "_RNvCslFwujm09uXn_4kdep5small"]);
+        for (key, value) in &first.linkable.by_path.entries {
+            let (other_key, other_value) =
+                second.linkable.by_path.entries.get_key_value(&**key).unwrap();
+            assert!(Arc::ptr_eq(key, other_key));
+            assert!(Arc::ptr_eq(value, other_value));
+        }
+        for (key, value) in &first.copies.entries {
+            let (other_key, other_value) = second.copies.entries.get_key_value(&**key).unwrap();
+            assert!(Arc::ptr_eq(key, other_key));
+            assert!(Arc::ptr_eq(value, other_value));
+        }
+        assert!(second.len() > first.len());
+    }
+
+    #[test]
+    fn shared_paths_keep_ambiguity_and_mutate_independently() {
+        let cache = Mutex::new(SharedEntries::default());
+        let mut first = Paths::default();
+        let mut second = Paths::default();
+        for paths in [&mut first, &mut second] {
+            paths.insert("dep::f".to_owned(), "first".to_owned(), Some(0), vec![]);
+            paths.by_path.share(&cache);
+        }
+        second.insert("dep::f".to_owned(), "second".to_owned(), Some(0), vec![]);
+        second.by_path.share(&cache);
+        assert_eq!(first.get("dep::f"), Some("first"));
+        assert_eq!(second.get("dep::f"), None);
+        assert_eq!(first.get("dep::missing"), None);
+        let mut empty = Paths::default();
+        empty.by_path.share(&cache);
+        assert_eq!(empty.get("dep::f"), None);
+    }
+
+    #[test]
+    fn shared_entries_check_hash_collisions_and_release_dead_data() {
+        let cache = Mutex::new(SharedEntries::default());
+        let mut first = SharedMap::<Vec<String>>::default();
+        first.or_default("path".to_owned()).push("first".to_owned());
+        first.share(&cache);
+        let (key, value) = first.entries.get_key_value("path").unwrap();
+        let weak_key = Arc::downgrade(key);
+        let weak_value = Arc::downgrade(value);
+        let hash = rustc_hash::FxBuildHasher.hash_one(("path", &vec!["second".to_owned()]));
+        cache.lock().unwrap().insert(hash, vec![(weak_key.clone(), weak_value.clone())]);
+        let mut second = SharedMap::<Vec<String>>::default();
+        second.or_default("path".to_owned()).push("second".to_owned());
+        second.share(&cache);
+        assert_eq!(second.get("path").unwrap(), &["second"]);
+        drop(first);
+        assert!(weak_key.upgrade().is_none());
+        assert!(weak_value.upgrade().is_none());
+        drop(second);
+        SharedMap::<Vec<String>>::default().share(&cache);
+        assert!(cache.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn missing_symbol_file_is_not_a_cached_table() {
+        let missing = PathBuf::from("/no-such-rustd-symbol-file");
+        assert!(SymbolTable::load(&[missing], &PathBuf::from(".")).is_err());
+    }
 
     fn placed(crates: &[(&str, &[(u64, usize)])]) -> Vec<(String, u64)> {
         let mut table = SymbolTable::default();
