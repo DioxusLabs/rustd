@@ -1031,6 +1031,64 @@ def incremental(work):
     return checks
 
 
+def test_graph(work):
+    ws = os.path.realpath(os.path.join(work, "test-graph"))
+    files = {
+        "Cargo.toml": '[package]\nname = "test_graph"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\nmembers = ["probe"]\n\n[dev-dependencies]\nprobe = { path = "probe" }\n',
+        "probe/Cargo.toml": '[package]\nname = "probe"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\ntest_graph = { path = ".." }\n',
+        "probe/src/lib.rs": 'pub fn tested() -> bool { test_graph::tested() }\n',
+        "src/lib.rs": '''pub fn tested() -> bool { cfg!(test) }
+pub fn value() -> u32 { 40 + 2 }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unit() {
+        assert!(super::tested());
+        assert!(!probe::tested());
+        assert_eq!(super::value(), 42);
+    }
+}
+''',
+        "tests/integration.rs": '''#[test]
+fn integration() {
+    assert!(cfg!(test));
+    assert!(!test_graph::tested());
+    assert_eq!(test_graph::value(), 42);
+}
+''',
+    }
+    for file, text in files.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
+        open(os.path.join(ws, file), "w").write(text)
+    side = Side(ws, base_env(os.path.join(work, "home-test-graph")), True)
+    checks = []
+
+    def check(name, held, detail):
+        checks.append((f"test graph: {name}", held, detail))
+        print(f"  {'ok ' if held else 'NOT'} test graph: {name}  {detail}", flush=True)
+
+    try:
+        _, cold = side.cargo("test")
+        check("cold unit and integration tests", cold.returncode == 0, cold.stderr[-200:])
+        _, states = wait_warm(side, ws)
+        _, status = side.cargo("status")
+        workers = re.findall(r"worker: pid (\d+)", status.stdout)
+        check("both checkouts share one worker", len(workers) == 1 and states == ["ready", "ready"], f"workers {workers}, states {states}")
+        for label in ("warm", "edited"):
+            if label == "edited":
+                rewrite(os.path.join(ws, "src/lib.rs"), "40 + 2", "41 + 2")
+                for file in ("src/lib.rs", "tests/integration.rs"):
+                    rewrite(os.path.join(ws, file), ", 42)", ", 43)")
+            _, ran = side.cargo("test")
+            check(f"{label} unit and integration tests are daemon-built", ran.returncode == 0 and how_built(ran.stderr) == "daemon" and "tests::unit" in ran.stdout and "test integration" in ran.stdout, f"exit {ran.returncode}, {how_built(ran.stderr)}; {ran.stderr[-200:]}")
+        logs = pathlib.Path(side.env["RUSTD_HOME"])
+        loads = sum(path.read_text(errors="replace").count("load workspace:") for path in logs.glob("**/log"))
+        check("the graph was loaded once", loads == 1, f"loads {loads}")
+    finally:
+        side.cargo("stop")
+    return checks
+
+
 def daemon(work):
     """The life of the daemon. The result is each check with whether it held."""
     ws = os.path.realpath(os.path.join(work, "life"))
@@ -1611,7 +1669,7 @@ def main():
         result["flags"], result["flags_status"] = rows, counted
         result["wrong"] += wrong
         print("daemon:", flush=True)
-        result["daemon"] = daemon(work) + incremental(work)
+        result["daemon"] = daemon(work) + incremental(work) + test_graph(work)
         result["wrong"] += [f"daemon: {name} {detail}" for name, held, detail in result["daemon"] if not held]
         print("plain cargo:", flush=True)
         result["plain"] = plain(work)
