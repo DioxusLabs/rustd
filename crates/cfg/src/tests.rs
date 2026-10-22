@@ -10,6 +10,39 @@ use syntax_bridge::{
 
 use crate::{CfgAtom, CfgExpr, CfgOptions, DnfExpr};
 
+#[test]
+fn cfg_read_recording() {
+    let options = CfgOptions::default();
+    let (recorded, reads) = options.recording();
+    let test = CfgAtom::Flag(Symbol::intern("test"));
+    let feature = CfgAtom::KeyValue { key: Symbol::intern("feature"), value: Symbol::intern("x") };
+    assert_eq!(recorded, options);
+    assert_eq!(
+        recorded.check(&CfgExpr::All(Box::new([
+            CfgExpr::Atom(test.clone()),
+            CfgExpr::Atom(feature.clone())
+        ]))),
+        Some(false)
+    );
+    assert_eq!(reads.finish().atoms.len(), 1);
+    assert!(!reads.finish().atoms[&test]);
+    assert!(!reads.finish().atoms.contains_key(&feature));
+    assert!(!recorded.check_atom(&feature));
+    assert!(!reads.finish().atoms[&feature]);
+    let mut changed = options.clone();
+    changed.insert_atom(Symbol::intern("test"));
+    assert!(!reads.finish().agrees_with(&changed));
+    assert!(reads.finish().agrees_with(&options));
+    let (_, empty) = options.recording();
+    assert!(empty.finish().agrees_with(&changed));
+    recorded.to_hashable();
+    assert!(reads.finish().read_all.is_some());
+    assert_eq!(recorded.check(&CfgExpr::Invalid), None);
+    assert!(reads.finish().unknown);
+    assert!(!reads.finish().agrees_with(&options));
+    assert!(empty.finish().atoms.is_empty());
+}
+
 #[track_caller]
 fn parse_ast_cfg(pred: ast::CfgPredicate) -> CfgExpr {
     CfgExpr::parse_from_ast(pred)

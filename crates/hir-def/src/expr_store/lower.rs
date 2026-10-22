@@ -9,7 +9,7 @@ mod path;
 use std::{cell::OnceCell, mem};
 
 use base_db::{FxIndexSet, SourceDatabase};
-use cfg::CfgOptions;
+use cfg::{CfgOptions, CfgReadRecorder};
 use either::Either;
 use hir_expand::{
     HirFileId, InFile, MacroDefId,
@@ -129,9 +129,10 @@ pub(super) fn lower_body(
 
             collector.missing_expr()
         });
+        let cfg_reads = collector.cfg_reads.finish();
         let (store, source_map) = collector.store.finish();
         return (
-            Body { store, params: params.into_boxed_slice(), self_param },
+            Body { cfg_reads, store, params: params.into_boxed_slice(), self_param },
             BodySourceMap { self_param: source_map_self_param, store: source_map },
         );
     }
@@ -201,9 +202,11 @@ pub(super) fn lower_body(
         )
     });
 
+    let mut cfg_reads = collector.cfg_reads.finish();
+    cfg_reads.unknown |= collector.has_macro_expansion;
     let (store, source_map) = collector.store.finish();
     (
-        Body { store, params: params.into_boxed_slice(), self_param },
+        Body { cfg_reads, store, params: params.into_boxed_slice(), self_param },
         BodySourceMap { self_param: source_map_self_param, store: source_map },
     )
 }
@@ -508,7 +511,9 @@ pub(crate) fn lower_function(
 
 pub struct ExprCollector<'db> {
     db: &'db dyn SourceDatabase,
-    cfg_options: &'db CfgOptions,
+    cfg_options: CfgOptions,
+    cfg_reads: CfgReadRecorder,
+    has_macro_expansion: bool,
     expander: Expander<'db>,
     def_map: &'db DefMap,
     local_def_map: &'db LocalDefMap,
@@ -677,9 +682,12 @@ impl<'db> ExprCollector<'db> {
         let (def_map, local_def_map) = module.local_def_map(db);
         let expander = Expander::new(db, current_file_id, def_map);
         let krate = module.krate(db);
+        let (cfg_options, cfg_reads) = krate.cfg_options(db).recording();
         let mut result = ExprCollector {
             db,
-            cfg_options: krate.cfg_options(db),
+            cfg_options,
+            cfg_reads,
+            has_macro_expansion: false,
             module,
             lowering_mode,
             def_map,
@@ -2730,6 +2738,7 @@ impl<'db> ExprCollector<'db> {
         let res = match res {
             Ok(res) => res,
             Err(UnresolvedMacro { path }) => {
+                self.has_macro_expansion = true;
                 if record_diagnostics {
                     self.store.diagnostics.push(ExpressionStoreDiagnostics::UnresolvedMacroCall {
                         node: self.expander.in_file(syntax_ptr),
@@ -2746,6 +2755,13 @@ impl<'db> ExprCollector<'db> {
                 // Keep collecting even with expansion errors so we can provide completions and
                 // other services in incomplete macro expressions.
                 if let Some(macro_file) = self.expander.current_file_id().macro_file() {
+                    self.has_macro_expansion |= !matches!(
+                        macro_file.loc(self.db).def.kind,
+                        hir_expand::MacroDefKind::BuiltIn(
+                            _,
+                            hir_expand::builtin::BuiltinFnLikeExpander::Cfg
+                        )
+                    );
                     self.store.expansions.insert(macro_call_ptr, macro_file);
                 }
 
@@ -2753,7 +2769,10 @@ impl<'db> ExprCollector<'db> {
                 self.expander.exit(mark);
                 id
             }
-            None => collector(self, None),
+            None => {
+                self.has_macro_expansion = true;
+                collector(self, None)
+            }
         }
     }
 
@@ -3423,10 +3442,18 @@ impl<'db> ExprCollector<'db> {
     /// Returns `false` (and emits diagnostics) when `owner` if `#[cfg]`d out, and `true` when
     /// not.
     fn check_cfg(&mut self, owner: &dyn ast::HasAttrs) -> bool {
-        let enabled = self.expander.is_cfg_enabled(owner, self.cfg_options);
+        if ast::attrs_including_inner(owner).next().is_some()
+            && let Some(owner) = ast::AnyHasAttrs::cast(owner.syntax().clone())
+        {
+            let mut reads = cfg::CfgReads::default();
+            crate::twins::observe_attrs(&owner, &self.cfg_options, &mut reads);
+            self.has_macro_expansion |= reads.unknown;
+        }
+        let enabled = self.expander.is_cfg_enabled(owner, &self.cfg_options);
         match enabled {
             Ok(()) => true,
             Err(cfg) => {
+                _ = self.cfg_options.to_hashable();
                 self.store.diagnostics.push(ExpressionStoreDiagnostics::InactiveCode {
                     node: self.expander.in_file(SyntaxNodePtr::new(owner.syntax())),
                     cfg,

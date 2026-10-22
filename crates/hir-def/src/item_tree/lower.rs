@@ -1,6 +1,6 @@
 //! AST -> `ItemTree` lowering code.
 
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 
 use base_db::{Crate, FxIndexSet, SourceDatabase};
 use cfg::CfgOptions;
@@ -22,9 +22,10 @@ use crate::item_tree::{
 };
 
 pub(super) struct Ctx<'db> {
+    pub(super) cfg_reads: RefCell<rustc_hash::FxHashMap<span::ErasedFileAstId, cfg::CfgReads>>,
     pub(super) db: &'db dyn SourceDatabase,
     tree: ItemTree,
-    source_ast_id_map: &'db AstIdMap,
+    pub(super) source_ast_id_map: &'db AstIdMap,
     span_map: OnceCell<SpanMap<'db>>,
     file: HirFileId,
     cfg_options: OnceCell<&'db CfgOptions>,
@@ -36,6 +37,7 @@ pub(super) struct Ctx<'db> {
 impl<'db> Ctx<'db> {
     pub(super) fn new(db: &'db dyn SourceDatabase, file: HirFileId, krate: Crate) -> Self {
         Self {
+            cfg_reads: RefCell::default(),
             db,
             tree: ItemTree::default(),
             source_ast_id_map: file.ast_id_map(db),
@@ -61,6 +63,7 @@ impl<'db> Ctx<'db> {
         self.top_level = item_owner.items().filter_map(|item| self.lower_mod_item(&item)).collect();
         self.tree.vis.arena = self.visibilities.into_iter().collect();
         self.tree.top_level = self.top_level.into_boxed_slice();
+        self.tree.cfg_reads = self.cfg_reads.into_inner();
         self.tree
     }
 
@@ -96,6 +99,7 @@ impl<'db> Ctx<'db> {
 
         self.tree.vis.arena = self.visibilities.into_iter().collect();
         self.tree.top_level = self.top_level.into_boxed_slice();
+        self.tree.cfg_reads = self.cfg_reads.into_inner();
         self.tree
     }
 
@@ -121,6 +125,7 @@ impl<'db> Ctx<'db> {
         }
         self.tree.vis.arena = self.visibilities.into_iter().collect();
         self.tree.top_level = self.top_level.into_boxed_slice();
+        self.tree.cfg_reads = self.cfg_reads.into_inner();
         self.tree
     }
 

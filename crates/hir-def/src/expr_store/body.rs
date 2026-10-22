@@ -38,6 +38,7 @@ impl<Id: Copy> Param<Id> {
 /// The body of an item (function, const etc.).
 #[derive(Debug, Eq, PartialEq)]
 pub struct Body {
+    pub cfg_reads: cfg::CfgReads,
     pub store: ExpressionStore,
     /// The patterns for the function's parameters. While the parameter types are
     /// part of the function signature, the patterns are not (they don't change
@@ -137,6 +138,19 @@ impl Body {
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &dyn SourceDatabase, def: DefWithBodyId) -> Arc<Body> {
         Self::with_source_map(db, def).0.clone()
+    }
+
+    #[salsa::tracked(returns(ref))]
+    pub fn cfg_reads(db: &dyn SourceDatabase, def: DefWithBodyId) -> cfg::CfgReads {
+        let mut reads = Self::of(db, def).cfg_reads.clone();
+        let item = match def {
+            DefWithBodyId::FunctionId(id) => id.into(),
+            DefWithBodyId::ConstId(id) => id.into(),
+            DefWithBodyId::StaticId(id) => id.into(),
+            DefWithBodyId::VariantId(id) => id.into(),
+        };
+        reads.merge(crate::twins::item_cfg_reads(db, item));
+        reads
     }
 }
 

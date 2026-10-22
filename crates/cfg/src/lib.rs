@@ -10,7 +10,11 @@ mod dnf;
 #[cfg(test)]
 mod tests;
 
-use std::fmt;
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 use rustc_hash::FxHashSet;
 
@@ -29,14 +33,67 @@ pub use dnf::DnfExpr;
 /// of key and value in `key_values`.
 ///
 /// See: <https://doc.rust-lang.org/reference/conditional-compilation.html#set-configuration-options>
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct CfgOptions {
     enabled: FxHashSet<CfgAtom>,
+    reads: Option<CfgReadRecorder>,
+}
+
+impl PartialEq for CfgOptions {
+    fn eq(&self, other: &Self) -> bool {
+        self.enabled == other.enabled
+    }
+}
+
+impl Eq for CfgOptions {}
+
+/// Observations made by one lowering operation, including absent atoms.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CfgReads {
+    pub atoms: BTreeMap<CfgAtom, bool>,
+    pub read_all: Option<HashableCfgOptions>,
+    pub unknown: bool,
+}
+
+impl CfgReads {
+    pub fn merge(&mut self, other: &Self) {
+        self.unknown |= other.unknown;
+        for (atom, answer) in &other.atoms {
+            if self.atoms.insert(atom.clone(), *answer).is_some_and(|old| old != *answer) {
+                self.unknown = true;
+            }
+        }
+        if let Some(all) = &other.read_all {
+            if self.read_all.as_ref().is_some_and(|old| old != all) {
+                self.unknown = true;
+            }
+            self.read_all = Some(all.clone());
+        }
+    }
+
+    pub fn agrees_with(&self, options: &CfgOptions) -> bool {
+        !self.unknown && !self.differs_from(options)
+    }
+
+    pub fn differs_from(&self, options: &CfgOptions) -> bool {
+        self.atoms.iter().any(|(atom, answer)| options.check_atom(atom) != *answer)
+            || self.read_all.as_ref().is_some_and(|all| *all != options.to_hashable())
+    }
+}
+
+/// A recorder belongs to a local copy of options, never to a database input.
+#[derive(Clone, Debug, Default)]
+pub struct CfgReadRecorder(Arc<Mutex<CfgReads>>);
+
+impl CfgReadRecorder {
+    pub fn finish(&self) -> CfgReads {
+        self.0.lock().unwrap().clone()
+    }
 }
 
 impl Default for CfgOptions {
     fn default() -> Self {
-        Self { enabled: FxHashSet::from_iter([CfgAtom::Flag(sym::true_)]) }
+        Self { enabled: FxHashSet::from_iter([CfgAtom::Flag(sym::true_)]), reads: None }
     }
 }
 
@@ -56,12 +113,28 @@ impl fmt::Debug for CfgOptions {
 }
 
 impl CfgOptions {
+    pub fn recording(&self) -> (Self, CfgReadRecorder) {
+        let reads = CfgReadRecorder::default();
+        let options = Self { enabled: self.enabled.clone(), reads: Some(reads.clone()) };
+        (options, reads)
+    }
+
     pub fn check(&self, cfg: &CfgExpr) -> Option<bool> {
-        cfg.fold(&|atom| self.enabled.contains(atom))
+        let result = cfg.fold(&|atom| self.check_atom(atom));
+        if result.is_none()
+            && let Some(reads) = &self.reads
+        {
+            reads.0.lock().unwrap().unknown = true;
+        }
+        result
     }
 
     pub fn check_atom(&self, cfg: &CfgAtom) -> bool {
-        self.enabled.contains(cfg)
+        let answer = self.enabled.contains(cfg);
+        if let Some(reads) = &self.reads {
+            reads.0.lock().unwrap().atoms.insert(cfg.clone(), answer);
+        }
+        answer
     }
 
     pub fn insert_atom(&mut self, key: Symbol) {
@@ -97,6 +170,7 @@ impl CfgOptions {
     }
 
     pub fn get_cfg_keys(&self) -> impl Iterator<Item = &Symbol> {
+        self.record_all();
         self.enabled.iter().map(|it| match it {
             CfgAtom::Flag(key) => key,
             CfgAtom::KeyValue { key, .. } => key,
@@ -104,6 +178,7 @@ impl CfgOptions {
     }
 
     pub fn get_cfg_values<'a>(&'a self, cfg_key: &'a str) -> impl Iterator<Item = &'a Symbol> + 'a {
+        self.record_all();
         self.enabled.iter().filter_map(move |it| match it {
             CfgAtom::KeyValue { key, value } if cfg_key == key.as_str() => Some(value),
             _ => None,
@@ -111,6 +186,17 @@ impl CfgOptions {
     }
 
     pub fn to_hashable(&self) -> HashableCfgOptions {
+        self.record_all();
+        self.hashable()
+    }
+
+    fn record_all(&self) {
+        if let Some(reads) = &self.reads {
+            reads.0.lock().unwrap().read_all = Some(self.hashable());
+        }
+    }
+
+    fn hashable(&self) -> HashableCfgOptions {
         let mut enabled = self.enabled.iter().cloned().collect::<Box<[_]>>();
         enabled.sort_unstable();
         HashableCfgOptions { _enabled: enabled }
@@ -141,6 +227,7 @@ impl IntoIterator for CfgOptions {
     type IntoIter = <FxHashSet<CfgAtom> as IntoIterator>::IntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
+        self.record_all();
         <FxHashSet<CfgAtom> as IntoIterator>::into_iter(self.enabled)
     }
 }
@@ -151,6 +238,7 @@ impl<'a> IntoIterator for &'a CfgOptions {
     type IntoIter = <&'a FxHashSet<CfgAtom> as IntoIterator>::IntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
+        self.record_all();
         <&FxHashSet<CfgAtom> as IntoIterator>::into_iter(&self.enabled)
     }
 }

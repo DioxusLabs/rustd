@@ -172,7 +172,22 @@ impl ops::Deref for Attrs<'_> {
 impl Ctx<'_> {
     #[inline]
     pub(super) fn lower_attrs(&self, owner: &dyn ast::HasAttrs) -> AttrsOrCfg {
-        AttrsOrCfg::lower(self.db, owner, &|| self.cfg_options(), self.span_map())
+        if ast::attrs_including_inner(owner).next().is_none() {
+            return AttrsOrCfg::lower(self.db, owner, &|| self.cfg_options(), self.span_map());
+        }
+        let (options, recorder) = self.cfg_options().recording();
+        let attrs = AttrsOrCfg::lower(self.db, owner, &|| &options, self.span_map());
+        let reads = recorder.finish();
+        if reads != cfg::CfgReads::default()
+            && let Some(item) = owner.syntax().ancestors().find_map(ast::Item::cast)
+        {
+            self.cfg_reads
+                .borrow_mut()
+                .entry(self.source_ast_id_map.ast_id(&item).erase())
+                .or_default()
+                .merge(&reads);
+        }
+        attrs
     }
 }
 

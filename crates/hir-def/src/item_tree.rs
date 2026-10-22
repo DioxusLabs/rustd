@@ -127,6 +127,7 @@ pub fn file_item_tree(db: &dyn SourceDatabase, file_id: HirFileId, krate: Crate)
         None => {
             static EMPTY: OnceLock<ItemTree> = OnceLock::new();
             EMPTY.get_or_init(|| ItemTree {
+                cfg_reads: Default::default(),
                 top_level: Box::new([]),
                 attrs: ThinVec::new(),
                 small_data: ThinVec::new(),
@@ -207,6 +208,7 @@ pub(crate) fn block_item_tree_query(
 /// The item tree of a source file.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct ItemTree {
+    pub(crate) cfg_reads: rustc_hash::FxHashMap<span::ErasedFileAstId, cfg::CfgReads>,
     top_level: Box<[ModItemId]>,
     /// Sorted by the id. The last item, if it has [`ModItemId::TOP_OWNER`], is the top level attrs.
     attrs: ThinVec<(ModItemId, AttrsOrCfg)>,
@@ -265,7 +267,7 @@ impl ItemTree {
     }
 
     fn is_empty(&self) -> bool {
-        let ItemTree { top_level, attrs, vis: _, big_data: _, small_data: _ } = self;
+        let ItemTree { top_level, attrs, vis: _, big_data: _, small_data: _, cfg_reads: _ } = self;
         // We don't need to check the rest since if those are empty, everything is empty.
         // `attrs` might contain the top-level attrs so we need to check it separately.
         top_level.is_empty() && attrs.is_empty()
@@ -274,7 +276,7 @@ impl ItemTree {
     fn finalize(&mut self) {
         self.attrs.sort_unstable_by_key(|(id, _)| *id);
 
-        let ItemTree { top_level: _, attrs, big_data, small_data, vis } = self;
+        let ItemTree { top_level: _, attrs, big_data, small_data, vis, cfg_reads: _ } = self;
         attrs.shrink_to_fit();
         big_data.shrink_to_fit();
         small_data.shrink_to_fit();
