@@ -1047,7 +1047,7 @@ def workspace_workers(work, check):
     for file, text in files.items():
         os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
         open(os.path.join(ws, file), "w").write(text)
-    env = base_env(os.path.join(work, "home-worker-per-workspace"))
+    env = base_env(os.path.join(work, "home"))
     env["RUSTD_STATS"] = "1"
     ours, theirs = Side(ws, env, True), Side(ws, env, False)
     commands = [
@@ -1203,11 +1203,11 @@ def workspace_workers(work, check):
         f"workers {len(workers)}, joins {joined}, Cargo builds {cargos_builds(status)}",
     )
 
-    for order, sequence in (
-        ("test then build", (("test", ["-p", "threaded", "--no-fail-fast"]), ("build", ["-p", "threaded"]))),
-        ("build then test", (("build", ["-p", "threaded"]), ("test", ["-p", "threaded", "--no-fail-fast"]))),
+    for order, home, sequence in (
+        ("test then build", "home-tb", (("test", ["-p", "threaded", "--no-fail-fast"]), ("build", ["-p", "threaded"]))),
+        ("build then test", "home-bt", (("build", ["-p", "threaded"]), ("test", ["-p", "threaded", "--no-fail-fast"]))),
     ):
-        env = base_env(os.path.join(work, f"home-threaded-{order.replace(' ', '-')}"))
+        env = base_env(os.path.join(work, home))
         env["RUSTD_STATS"] = "1"
         env["CARGO_TARGET_DIR"] = os.path.join(work, f"target-threaded-{order.replace(' ', '-')}")
         side = Side(ws, env, True)
