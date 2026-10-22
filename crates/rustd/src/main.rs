@@ -5644,27 +5644,35 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
         known.touch(&db, None);
         listed.touch(&db, None);
     }
-    let mut cold = build(&db, &table, &args, &mut known, &listed)?;
+    let mut cold = if args.symbol_files.is_empty() {
+        None
+    } else {
+        Some(build(&db, &table, &args, &mut known, &listed)?)
+    };
     // An `include!` in a body is first seen when the body is compiled.
     if WatchedFile::include_sources(&mut files, &mut tree, &mut db) {
         known.touch(&db, None);
-        cold = build(&db, &table, &args, &mut known, &listed)?;
+        if let Some(cold) = &mut cold {
+            *cold = build(&db, &table, &args, &mut known, &listed)?;
+        }
     }
-    if let Some(unfit) = &cold.unfit {
+    if let Some(cold) = &cold {
+        if let Some(unfit) = &cold.unfit {
+            report(&cold);
+            bail!("{unfit}");
+        }
+        eprint!("cold: ");
         report(&cold);
-        bail!("{unfit}");
+        memory::report(&mut db, "build")?;
+        report_stats(&known.stats);
+        link(
+            args.link_cmd.as_deref(),
+            args.splice.as_deref(),
+            args.patch.as_deref(),
+            &args.out,
+            false,
+        )?;
     }
-    eprint!("cold: ");
-    report(&cold);
-    memory::report(&mut db, "build")?;
-    report_stats(&known.stats);
-    link(
-        args.link_cmd.as_deref(),
-        args.splice.as_deref(),
-        args.patch.as_deref(),
-        &args.out,
-        false,
-    )?;
     // What this build added goes to the other machines while the daemon waits for edits; a
     // build that is not a daemon's has nothing to wait for but this.
     match shared {
@@ -6069,6 +6077,10 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                         });
                     match loaded {
                         Ok((args, table)) => {
+                            let _ = resolve_crates(&db, &args);
+                            while WatchedFile::include_sources(&mut files, &mut tree, &mut db) {
+                                let _ = resolve_crates(&db, &args);
+                            }
                             // Never built: every file is as good as edited, but those were
                             // checked when the programs before it were built.
                             let unbuilt = Unbuilt {

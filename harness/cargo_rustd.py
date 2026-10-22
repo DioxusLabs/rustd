@@ -1033,14 +1033,14 @@ def workspace_workers(work, check):
     ws = os.path.realpath(os.path.join(work, "worker-per-workspace"))
     files = {
         "Cargo.toml": '[workspace]\nmembers = ["a", "b", "shared", "threaded"]\nresolver = "2"\n',
-        "shared/Cargo.toml": '[package]\nname = "shared"\nversion = "0.1.0"\nedition = "2021"\n\n[features]\ndefault = ["defaulted"]\ndefaulted = []\nextra = []\n\n[dependencies]\nitoa = "1"\n',
-        "shared/src/lib.rs": 'pub fn defaulted() -> bool { cfg!(feature = "defaulted") }\npub fn extra() -> bool { cfg!(feature = "extra") }\npub fn format(value: u32) -> String { let mut buffer = itoa::Buffer::new(); buffer.format(value).to_owned() }\n',
+        "shared/Cargo.toml": '[package]\nname = "shared"\nversion = "0.1.0"\nedition = "2021"\n\n[features]\ndefault = ["defaulted"]\ndefaulted = []\nextra = []\n\n[dependencies]\nitoa = "1"\nserde = { version = "1", features = ["derive"] }\n',
+        "shared/src/lib.rs": 'pub fn defaulted() -> bool { cfg!(feature = "defaulted") }\npub fn extra() -> bool { cfg!(feature = "extra") }\npub fn format(value: u32) -> String { let mut buffer = itoa::Buffer::new(); buffer.format(value).to_owned() }\n#[derive(serde::Deserialize, serde::Serialize)]\npub struct Envelope { pub items: Vec<u8> }\n#[inline]\npub fn first<T: Copy>(items: &[T]) -> Result<T, ()> { Ok(*items.first().ok_or(())?) }\n#[inline]\npub fn indexed<T: Copy>(items: &[T]) -> T { items[0] }\n',
         "a/Cargo.toml": '[package]\nname = "a"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\ndoctest = false\n\n[[bin]]\nname = "a"\npath = "src/main.rs"\ntest = false\n\n[dependencies]\nshared = { path = "../shared" }\n',
-        "a/src/lib.rs": 'mod edit;\n\npub fn edited_value() -> u32 { edit::value() }\n\n#[test]\nfn selected_features() {\n    assert!(shared::defaulted());\n    assert!(!shared::extra());\n    assert_eq!(shared::format(12), "12");\n    assert_eq!(edited_value(), 0);\n}\n',
+        "a/src/lib.rs": 'mod edit;\n\npub fn edited_value() -> u32 { edit::value() }\n\nfn selected_value() -> Result<u8, ()> {\n    let envelope = shared::Envelope { items: vec![12] };\n    let first = shared::first(&envelope.items)?;\n    Ok(shared::indexed(&[first]))\n}\n\n#[test]\nfn selected_features() {\n    assert!(shared::defaulted());\n    assert!(!shared::extra());\n    assert_eq!(shared::format(12), "12");\n    assert_eq!(edited_value(), 0);\n    assert_eq!(selected_value(), Ok(12));\n}\n',
         "a/src/edit.rs": "pub fn value() -> u32 { 0 }\n",
         "a/src/main.rs": "fn main() { let _ = a::edited_value(); }\n",
-        "b/Cargo.toml": '[package]\nname = "b"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\ndoctest = false\n\n[dependencies]\nshared = { path = "../shared", default-features = false, features = ["extra"] }\n',
-        "b/src/lib.rs": '#[test]\nfn selected_features() {\n    assert!(!shared::defaulted());\n    assert!(shared::extra());\n    assert_eq!(shared::format(12), "12");\n}\n',
+        "b/Cargo.toml": '[package]\nname = "b"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\ndoctest = false\n\n[dependencies]\nshared = { path = "../shared", default-features = false, features = ["extra"] }\n\n[dev-dependencies]\nserde = { version = "1", features = ["rc"] }\n',
+        "b/src/lib.rs": 'fn selected_value() -> Result<u8, ()> {\n    let envelope = shared::Envelope { items: vec![12] };\n    let first = shared::first(&envelope.items)?;\n    Ok(shared::indexed(&[first]))\n}\n\n#[test]\nfn selected_features() {\n    assert!(!shared::defaulted());\n    assert!(shared::extra());\n    assert_eq!(shared::format(12), "12");\n    assert_eq!(selected_value(), Ok(12));\n}\n',
         "threaded/Cargo.toml": '[package]\nname = "threaded"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\ncrossbeam-channel = { version = "0.5.15", default-features = false, features = ["std"] }\n\n[dev-dependencies]\ncrossbeam-channel = { version = "0.5.15", default-features = false, features = ["std"] }\ncrossbeam-utils = { version = "0.8", default-features = false, features = ["nightly"] }\n',
         "threaded/src/lib.rs": '#[cfg(test)]\n#[inline]\npub fn render() -> bool {\n    let (_sender, receiver) = crossbeam_channel::unbounded::<u8>();\n    matches!(\n        receiver.recv_timeout(std::time::Duration::from_millis(1)),\n        Err(crossbeam_channel::RecvTimeoutError::Timeout),\n    )\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn thread_local_from_registry_inline_generic() {\n        assert!(super::render());\n    }\n}\n',
     }
@@ -1155,6 +1155,14 @@ def workspace_workers(work, check):
         and row["root"].endswith("/shared/src/lib.rs")
     ]
     shared_features = {feature for row in shared for feature in ("defaulted", "extra") if "feature=" + feature in row["cfg"]}
+    serde_crates = [
+        row
+        for row in graph
+        if row["id"] in selected_crates
+        and row["name"] == "serde"
+        and row["root"].endswith("/src/lib.rs")
+    ]
+    serde_rc_features = {"feature=rc" in row["cfg"] for row in serde_crates}
     common = (
         reachable(test_a) & reachable(test_b)
         if test_a is not None and test_b is not None
@@ -1171,9 +1179,12 @@ def workspace_workers(work, check):
         "shared feature graphs stay distinct and common registry/sysroot crates deduplicate",
         len(shared) == 2
         and shared_features == {"defaulted", "extra"}
+        and len(serde_crates) == 2
+        and serde_rc_features == {False, True}
         and len([row for row in common_crates if row["name"] == "itoa"]) == 1
         and len([row for row in common_crates if row["name"] == "core"]) == 1,
         f"shared {[(row['id'], row['cfg']) for row in shared]}, "
+        f"serde {[(row['id'], row['cfg']) for row in serde_crates]}, "
         f"common registry/sysroot crates {len(common_crates)} (registry {len(registry_crates)}, sysroot {len(sysroot_crates)})",
     )
     check(
@@ -1221,6 +1232,13 @@ def workspace_workers(work, check):
         )
         worker_log = second_workers[0][1] if len(second_workers) == 1 else None
         worker_log_text = open(worker_log, errors="replace").read() if worker_log else ""
+        daemon_log = os.path.join(env["RUSTD_HOME"], "daemon.log")
+        daemon_log_text = open(daemon_log, errors="replace").read() if os.path.exists(daemon_log) else ""
+        kept_ahead_root = any(
+            'keeping root "threaded" (cfg_test=false, selection=' in line
+            and 'for incoming "threaded" (cfg_test=true, selection=' in line
+            for line in daemon_log_text.splitlines()
+        )
         snapshots = []
         log_lines = worker_log_text.splitlines()
         for index, line in enumerate(log_lines):
@@ -1260,7 +1278,8 @@ def workspace_workers(work, check):
                 and worker_log
                 and os.path.commonpath((worker_log, os.path.join(env["RUSTD_HOME"], "spares")))
                 == os.path.join(env["RUSTD_HOME"], "spares")
-                and re.search(r"^cold: compiled \d+ of \d+ fns", worker_log_text, re.M)
+                and kept_ahead_root
+                and re.search(r"^join: .*threaded cfg_test=true", worker_log_text, re.M)
             )
         )
         workers_match = bool(
