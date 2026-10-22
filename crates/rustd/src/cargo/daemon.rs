@@ -982,11 +982,9 @@ impl Daemon {
                 std::thread::spawn(move || worker.warm(&checkout, false));
                 return Ok(());
             }
-            Some(ahead) => Arc::new(Worker::start(
-                &checkout,
-                dir,
-                Some((ahead.spare, ahead.ahead.config)),
-            )?),
+            Some(ahead) => {
+                Arc::new(Worker::start(&checkout, dir, Some((ahead.spare, ahead.ahead.config)))?)
+            }
             None => {
                 // A plain spare starts this root, so an obsolete ahead for this id cannot
                 // be left waiting for cargo lines.
@@ -1060,14 +1058,8 @@ impl Daemon {
         let socket = dir.join("sock");
         let _ = std::fs::remove_file(&socket);
         let mut args = ahead.config.args(&ahead.root, &ahead.crates);
-        args.extend([
-            "--out".into(),
-            "none".into(),
-            "--socket".into(),
-            socket.into(),
-        ]);
-        if let Some(spare) =
-            spare.told(&ahead.config, &args, &ahead.config.env, &ahead.root, true)
+        args.extend(["--out".into(), "none".into(), "--socket".into(), socket.into()]);
+        if let Some(spare) = spare.told(&ahead.config, &args, &ahead.config.env, &ahead.root, true)
         {
             eprintln!(
                 "ahead worker {id}: project {:?} cfg_test={} selection={:?}",

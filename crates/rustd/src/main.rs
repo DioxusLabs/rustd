@@ -1868,9 +1868,7 @@ fn crates_called(db: &RootDatabase, krate: &str, args: &Args) -> Vec<Crate> {
             }),
             false => it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate),
         })
-        .filter(|it| {
-            !args.cfg_test || args.as_built(db, *it, krate)
-        })
+        .filter(|it| !args.cfg_test || args.as_built(db, *it, krate))
         .filter(|it| !doctest::is_documented(db, (*it).into()))
         .collect()
 }
@@ -4693,11 +4691,8 @@ fn join(
         for hir_crate in crates {
             let krate: ide_db::base_db::Crate = hir_crate.into();
             let data = krate.data(db);
-            let dependencies = data
-                .dependencies
-                .iter()
-                .map(|it| format!("{:?}", it.crate_id))
-                .collect::<Vec<_>>();
+            let dependencies =
+                data.dependencies.iter().map(|it| format!("{:?}", it.crate_id)).collect::<Vec<_>>();
             eprintln!(
                 "crate graph: {}",
                 serde_json::json!({
