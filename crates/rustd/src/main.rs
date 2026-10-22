@@ -111,6 +111,7 @@ struct Args {
     isolate: Option<PathBuf>,
     /// Build the workspace's crates as `cargo test` does, with `cfg(test)`.
     cfg_test: bool,
+    unit_test: bool,
     /// Run build scripts and build proc macros in a directory of rustd's own under the
     /// target directory, so that nothing here waits for a cargo that is building there.
     own_target: bool,
@@ -131,6 +132,7 @@ struct Args {
     base: Option<PathBuf>,
     /// The crates of `checkout`. One that is the same in another checkout is of both.
     members: Arc<FxHashSet<ide_db::base_db::Crate>>,
+    unit_roots: Arc<FxHashSet<PathBuf>>,
 }
 
 impl Args {
@@ -151,6 +153,12 @@ impl Args {
     /// `cfg(test)` as the program of the tests, and without for whatever links it.
     fn as_built(&self, db: &RootDatabase, krate: Crate, named: &str) -> bool {
         let krate = ide_db::base_db::Crate::from(krate);
+        if !self.unit_test {
+            return !self.selection.dev_deps
+                || !is_tested(db, krate)
+                || crate_root_file(db, krate.into())
+                    .is_none_or(|root| !self.unit_roots.contains(&root));
+        }
         let member = matches!(krate.data(db).origin, CrateOrigin::Local { .. });
         let own = named == self.krate;
         // What the tests of a library use may use the library: the program then has both.
@@ -262,6 +270,7 @@ impl Args {
             deny,
             isolate,
             cfg_test,
+            unit_test: cfg_test,
             own_target,
             selection: plan::Selection {
                 profile: profile.unwrap_or_else(|| "dev".to_owned()),
@@ -279,6 +288,7 @@ impl Args {
             checkout: PathBuf::new(),
             base: None,
             members: Arc::default(),
+            unit_roots: Arc::default(),
         })
     }
 }
@@ -1867,7 +1877,7 @@ fn crates_called(db: &RootDatabase, krate: &str, args: &Args) -> Vec<Crate> {
             }),
             false => it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate),
         })
-        .filter(|it| !args.cfg_test || args.as_built(db, *it, krate))
+        .filter(|it| args.as_built(db, *it, krate))
         .filter(|it| !doctest::is_documented(db, (*it).into()))
         .collect()
 }
@@ -1981,6 +1991,17 @@ impl Checkouts {
         let at = self.roots.iter().position(|(_, it)| *it == root).expect("it has a root");
         let base = self.splits[at].as_ref().map(|it| it.base.clone());
         let members = Arc::new(self.loaded.crates(at).iter().copied().collect());
+        let mut unit_roots = FxHashSet::default();
+        if let ProjectWorkspaceKind::Cargo { cargo, .. } = &self.loaded.workspaces()[at].kind {
+            for package in cargo.packages().filter(|&it| cargo[it].is_member) {
+                for &target in &cargo[package].targets {
+                    if matches!(cargo[target].kind, TargetKind::Lib { .. } | TargetKind::Bin) {
+                        unit_roots.insert(PathBuf::from(cargo[target].root.clone()));
+                    }
+                }
+            }
+        }
+        let unit_roots = Arc::new(unit_roots);
         // An override for measuring one against the other.
         let level = match std::env::var("RUSTD_DEBUGINFO").ok().as_deref() {
             Some("0") => plan::Level::Nothing,
@@ -1989,7 +2010,7 @@ impl Checkouts {
             None => self.debug[at].debug.level,
         };
         let debug = plan::Described { level, ..self.debug[at].debug };
-        Ok(Parts { root, base, members, debug })
+        Ok(Parts { root, base, members, unit_roots, debug })
     }
 
     /// Whether the program of the checkout `project` is of is one rustc links from bitcode.
@@ -2380,6 +2401,7 @@ struct Parts {
     root: PathBuf,
     base: Option<PathBuf>,
     members: Arc<FxHashSet<ide_db::base_db::Crate>>,
+    unit_roots: Arc<FxHashSet<PathBuf>>,
     /// What the build has a debugger told.
     debug: plan::Described,
 }
@@ -3043,7 +3065,7 @@ fn build(
             let listed = listed.of(db, krate);
             // With `cfg(test)` the program starts in the harness rustc wrote, which calls
             // every test: the crate's own `main` is one function among the others.
-            if at == 0 && !args.cfg_test {
+            if at == 0 && !args.unit_test {
                 main = main.or(listed.main);
             }
             let listed_here = listed.functions.iter().copied().zip(listed.exported.iter().copied());
@@ -3958,6 +3980,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             deny: None,
             isolate: None,
             cfg_test: args.cfg_test,
+            unit_test: args.unit_test,
             own_target: args.own_target,
             selection: args.selection.clone(),
             also: Vec::new(),
@@ -3965,6 +3988,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             checkout: args.checkout.clone(),
             base: args.base.clone(),
             members: args.members.clone(),
+            unit_roots: args.unit_roots.clone(),
         };
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             build(db, table, &args, &mut Rejections::default(), &mut Listed::default())
@@ -4023,6 +4047,7 @@ struct Target {
     /// The checkout it is a program of. `None` is the one the daemon was started in.
     project: Option<PathBuf>,
     krate: String,
+    unit_test: bool,
     /// The other crates of the workspace that are in it, when the client says: the names
     /// after the first in `--crate a,b,c`. Otherwise the ones the daemon was started with.
     batch: Option<Vec<String>>,
@@ -4038,14 +4063,16 @@ struct Target {
 
 impl Target {
     fn is(&self, args: &Args) -> bool {
-        self.krate == args.krate && self.out == args.out
+        self.krate == args.krate && self.out == args.out && self.unit_test == args.unit_test
     }
 
     /// The daemon's arguments, were it started for this program.
     fn args(self, daemon: &Args, checkouts: &Checkouts) -> anyhow::Result<Args> {
-        let Target { project, krate, batch, out, patch, link_cmd, splice, symbol_files } = self;
+        let Target { project, krate, unit_test, batch, out, patch, link_cmd, splice, symbol_files } =
+            self;
         let project = project.unwrap_or_else(|| daemon.project.clone());
-        let Parts { root: checkout, base, members, debug } = checkouts.parts(&project)?;
+        let Parts { root: checkout, base, members, unit_roots, debug } =
+            checkouts.parts(&project)?;
         let symbol_files =
             if symbol_files.is_empty() { daemon.symbol_files.clone() } else { symbol_files };
         let batch = batch.unwrap_or_else(|| {
@@ -4057,8 +4084,10 @@ impl Target {
             checkout,
             base,
             members,
+            unit_roots,
             debug,
             krate,
+            unit_test,
             batch,
             widened: Vec::new(),
             out,
@@ -4075,7 +4104,12 @@ impl Target {
         let (mut krate, mut out, mut patch, mut link_cmd) = (None, None, None, None);
         let (mut project, mut splice) = (None, None);
         let mut symbol_files = Vec::new();
+        let mut unit_test = false;
         while let Some(flag) = flags.next() {
+            if flag == "--cfg-test" {
+                unit_test = true;
+                continue;
+            }
             let value = flags.next().with_context(|| format!("{flag} needs a value"))?;
             match flag.as_str() {
                 "--crate" => krate = Some(value),
@@ -4094,6 +4128,7 @@ impl Target {
                 Ok(Some(Target {
                     project,
                     krate,
+                    unit_test,
                     batch,
                     out,
                     patch,
@@ -4107,7 +4142,8 @@ impl Target {
                     && link_cmd.is_none()
                     && splice.is_none()
                     && symbol_files.is_empty()
-                    && project.is_none() =>
+                    && project.is_none()
+                    && !unit_test =>
             {
                 Ok(None)
             }
@@ -4117,7 +4153,9 @@ impl Target {
 
     /// The fields after the request's name on its line, each after a tab. Empty is absent.
     fn parse(fields: &[&str]) -> Option<Target> {
-        let &[project, krate, out, patch, link_cmd, splice, ref symbol_files @ ..] = fields else {
+        let &[project, krate, out, patch, link_cmd, splice, unit_test, ref symbol_files @ ..] =
+            fields
+        else {
             return None;
         };
         let given = |it: &str| (!it.is_empty()).then(|| it.to_owned());
@@ -4125,6 +4163,7 @@ impl Target {
         Some(Target {
             project: given(project).map(PathBuf::from),
             krate,
+            unit_test: unit_test.parse().ok()?,
             batch,
             out: PathBuf::from(out),
             patch: given(patch).map(PathBuf::from),
@@ -4152,13 +4191,14 @@ impl Target {
             None => self.krate.clone(),
         };
         let mut fields = format!(
-            "\t{}\t{}\t{}\t{}\t{}\t{}",
+            "\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.project.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
             crates,
             self.out.display(),
             self.patch.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
             self.link_cmd.as_deref().unwrap_or_default(),
-            self.splice.as_ref().map(|it| it.display().to_string()).unwrap_or_default()
+            self.splice.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
+            self.unit_test
         );
         for file in &self.symbol_files {
             fields.push('\t');
@@ -4751,7 +4791,7 @@ fn cargo_config(args: &Args) -> CargoConfig {
         extra_env_for_commands_only: true,
         sysroot: Some(sysroot),
         target: args.selection.target.clone(),
-        set_test: args.cfg_test,
+        set_test: args.cfg_test || args.selection.dev_deps,
         features: match args.selection.all_features {
             true => CargoFeatures::All,
             false => CargoFeatures::Selected {
@@ -5140,7 +5180,7 @@ fn follow_cargo(
             }
             seen.1
         };
-        let Parts { root, base, members, debug } = checkouts.parts(&args.project)?;
+        let Parts { root, base, members, unit_roots, debug } = checkouts.parts(&args.project)?;
         let mut names = args.crates().filter(|it| ready.contains(&root.join(it.as_str()))).cloned();
         if let Some(krate) = names.next() {
             let of_ready = Args {
@@ -5150,6 +5190,7 @@ fn follow_cargo(
                 checkout: root,
                 base,
                 members,
+                unit_roots,
                 debug,
                 ..args.clone()
             };
@@ -5307,8 +5348,9 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
         None => eprintln!("store: the toolchain of the library cannot be told from another"),
     }
     let built = follow_cargo(&mut db, &mut vfs, &mut checkouts, &args, &listed)?;
-    let Parts { root, base, members, debug } = checkouts.parts(&args.project)?;
+    let Parts { root, base, members, unit_roots, debug } = checkouts.parts(&args.project)?;
     (args.checkout, args.base, args.members, args.debug) = (root, base, members, debug);
+    args.unit_roots = unit_roots;
     // The names are resolved before cargo says which program it built: those of the crates
     // it built are, and not of every crate of the workspace.
     if let Some(built) = built {
@@ -5351,8 +5393,8 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
     // What the other checkouts don't share with this one, before a request waits for it.
     for also in &args.also {
         let start = Instant::now();
-        let Parts { root: checkout, base, members, debug } = checkouts.parts(also)?;
-        let of_it = Args { checkout, base, members, debug, ..args.clone() };
+        let Parts { root: checkout, base, members, unit_roots, debug } = checkouts.parts(also)?;
+        let of_it = Args { checkout, base, members, unit_roots, debug, ..args.clone() };
         let resolved = resolve_crates(&db, &of_it)?;
         eprintln!("resolve {}: {resolved} crates in {:.1?}", also.display(), start.elapsed());
     }
@@ -5389,6 +5431,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
             checkout: args.checkout,
             base: args.base,
             members: args.members,
+            unit_roots: args.unit_roots,
             debug: args.debug,
             selection: args.selection,
             ..whole
@@ -5646,6 +5689,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                                     .filter(|it| it.is(&program.args))
                                     .filter(|it| !it.symbol_files.is_empty());
                                 let same = parts.members == program.args.members
+                                    && parts.unit_roots == program.args.unit_roots
                                     && parts.debug == program.args.debug;
                                 if same && (linked.is_none() || new.is_empty()) {
                                     program.known.touch(&db, (!included).then_some(&new));
@@ -5748,7 +5792,9 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                         }
                         // The checkouts read as one share its programs.
                         (Some(target), Some(view)) if shared => programs.iter().position(|it| {
-                            it.args.krate == target.krate && it.args.checkout == view.base
+                            it.args.krate == target.krate
+                                && it.args.unit_test == target.unit_test
+                                && it.args.checkout == view.base
                         }),
                         (Some(_), _) => None,
                         (None, _) => Some(0),
@@ -5881,9 +5927,11 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                     checkouts.share(&mut db, tree.vfs(), differences)?;
                     watch_loaded(&mut db, &mut tree, &mut files);
                     for program in &mut programs {
-                        let Parts { base, members, .. } = checkouts.parts(&program.args.project)?;
+                        let Parts { base, members, unit_roots, .. } =
+                            checkouts.parts(&program.args.project)?;
                         program.moved |= program.args.members != members;
                         (program.args.base, program.args.members) = (base, members);
+                        program.args.unit_roots = unit_roots;
                         program.unbuilt.stale = true;
                         program.known.touch(&db, None);
                     }
@@ -6442,9 +6490,10 @@ impl Program {
         new: &[ide_db::base_db::Crate],
         files: &[WatchedFile],
     ) -> anyhow::Result<()> {
-        let Parts { root, base, members, debug } = parts;
+        let Parts { root, base, members, unit_roots, debug } = parts;
         (self.args.checkout, self.args.base) = (root, base);
         (self.args.members, self.args.debug) = (members, debug);
+        self.args.unit_roots = unit_roots;
         let patching = self.known.patching;
         self.known = Rejections::default();
         self.known.patching = patching;
@@ -6555,7 +6604,7 @@ impl Program {
             && self.known.patches()
             && self.known.patching == other.known.patching
             && Arc::ptr_eq(&self.table, &other.table)
-            && (ours.cfg_test, &ours.selection) == (theirs.cfg_test, &theirs.selection)
+            && (ours.unit_test, &ours.selection) == (theirs.unit_test, &theirs.selection)
             && crates(ours).is_some_and(|it| Some(it) == crates(theirs))
     }
 
@@ -6737,6 +6786,29 @@ fn report_stats(stats: &hir_ty::mir::codegen::BuildStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_requests_keep_the_programs_test_configuration() {
+        assert!(Target::from_flags(["--cfg-test".to_owned()].into_iter()).is_err());
+        assert!(Target::from_flags(std::iter::empty()).unwrap().is_none());
+        for unit_test in [false, true] {
+            let mut flags = vec!["--crate", "lib,dep", "--out", "lib.o", "--symbols", "dep.rlib"];
+            if unit_test {
+                flags.push("--cfg-test");
+            }
+            let target = Target::from_flags(flags.into_iter().map(str::to_owned)).unwrap().unwrap();
+            assert_eq!(target.unit_test, unit_test);
+            let fields = target.fields();
+            let fields: Vec<_> = fields[1..].split('\t').collect();
+            let parsed = Target::parse(&fields).unwrap();
+            assert_eq!(parsed.unit_test, unit_test);
+            assert_eq!(parsed.krate, "lib");
+            assert_eq!(parsed.batch, Some(vec!["dep".to_owned()]));
+            assert_eq!(parsed.symbol_files, vec![PathBuf::from("dep.rlib")]);
+        }
+        assert!(Target::parse(&["", "lib", "lib.o", "", "", "", "invalid"]).is_none());
+        assert!(Target::parse(&[]).is_none());
+    }
 
     #[test]
     fn library_sources_are_named_as_rustc_names_them() {
