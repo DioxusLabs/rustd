@@ -212,10 +212,7 @@ impl Semantics<'_, dyn HirDatabase> {
     }
 
     /// Creates an instance that prefers the given crate when mapping source files.
-    pub fn new_dyn_for(
-        db: &'_ dyn HirDatabase,
-        krate: Crate,
-    ) -> Semantics<'_, dyn HirDatabase> {
+    pub fn new_dyn_for(db: &'_ dyn HirDatabase, krate: Crate) -> Semantics<'_, dyn HirDatabase> {
         let impl_ = SemanticsImpl::new(db, Some(krate));
         Semantics { db, imp: impl_ }
     }
