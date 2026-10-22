@@ -514,10 +514,10 @@ impl Known {
         if let Some(known) = self.entries.get(&key) {
             return known.clone();
         }
-        if self.entries.len() == ENTRY_CACHE_LIMIT {
-            if let Some(old) = self.entry_order.pop_front() {
-                self.entries.remove(&old);
-            }
+        if self.entries.len() == ENTRY_CACHE_LIMIT
+            && let Some(old) = self.entry_order.pop_front()
+        {
+            self.entries.remove(&old);
         }
         self.entries.insert(key, entry.clone());
         self.entry_order.push_back(key);

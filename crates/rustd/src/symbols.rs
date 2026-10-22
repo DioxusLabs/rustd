@@ -94,10 +94,10 @@ impl<V: Clone + Default + Eq + Hash> SharedMap<V> {
                 for (known_key, known_value) in &*candidates {
                     if let (Some(known_key), Some(known_value)) =
                         (known_key.upgrade(), known_value.upgrade())
+                        && known_key == key
+                        && known_value == value
                     {
-                        if known_key == key && known_value == value {
-                            return (known_key, known_value);
-                        }
+                        return (known_key, known_value);
                     }
                 }
                 candidates.push((Arc::downgrade(&key), Arc::downgrade(&value)));
