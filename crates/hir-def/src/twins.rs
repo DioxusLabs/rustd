@@ -288,6 +288,9 @@ pub struct TwinIndex {
     pub cfg_differing: usize,
     pub unknown: usize,
     pub function_bodies: TwinBodyCounts,
+    pub cfg_differing_items: FxHashSet<AttrDefId>,
+    pub unknown_items: FxHashSet<AttrDefId>,
+    pub function_items: FxHashSet<AttrDefId>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -339,15 +342,17 @@ fn scope_items(db: &dyn SourceDatabase, scope: &ItemScope, items: &mut FxHashSet
     items.extend(scope.unnamed_consts().map(AttrDefId::from));
 }
 
-#[derive(Default)]
-struct CrateItems {
-    items: FxHashSet<AttrDefId>,
-    definitions: FxHashMap<MacroDefId, AttrDefId>,
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CrateItems {
+    pub items: FxHashSet<AttrDefId>,
+    pub definitions: FxHashMap<MacroDefId, AttrDefId>,
+    pub scopes: Vec<crate::ModuleId>,
     body_calls: FxHashMap<DefWithBodyId, Vec<MacroCallId>>,
 }
 
 fn collect(db: &dyn SourceDatabase, map: &DefMap, items: &mut CrateItems) {
-    for (_, module) in map.modules(db) {
+    for (id, module) in map.modules(db) {
+        items.scopes.push(id);
         let scope = module.scope(db);
         scope_items(db, scope, &mut items.items);
         for id in scope
@@ -360,7 +365,8 @@ fn collect(db: &dyn SourceDatabase, map: &DefMap, items: &mut CrateItems) {
     }
 }
 
-fn crate_items(db: &dyn SourceDatabase, krate: Crate) -> CrateItems {
+#[salsa::tracked(returns(ref))]
+pub fn crate_items(db: &dyn SourceDatabase, krate: Crate) -> CrateItems {
     let mut items = CrateItems::default();
     collect(db, crate_def_map(db, krate), &mut items);
     let mut seen = FxHashSet::default();
@@ -399,6 +405,41 @@ fn crate_items(db: &dyn SourceDatabase, krate: Crate) -> CrateItems {
         }
     }
     items
+}
+
+pub fn scope_pairs(
+    db: &dyn SourceDatabase,
+    normal: Crate,
+    test: Crate,
+) -> Vec<(crate::ModuleId, crate::ModuleId)> {
+    let key = |module: crate::ModuleId| {
+        let mut keys = Vec::new();
+        if let Some(block) = module.block(db) {
+            keys.push(ast_key(db, block.ast_id(db).erase(), 0)?);
+        }
+        let mut next = Some(module);
+        while let Some(module) = next {
+            if let Some(declaration) = module.def_map(db).module(db, module).origin.declaration() {
+                keys.push(ast_key(db, declaration.erase(), 0)?);
+            }
+            next = module.containing_module(db);
+        }
+        Some(keys)
+    };
+    let mut normals = FxHashMap::default();
+    for &module in &crate_items(db, normal).scopes {
+        if let Some(key) = key(module) {
+            normals.entry(key).or_insert_with(Vec::new).push(module);
+        }
+    }
+    crate_items(db, test)
+        .scopes
+        .iter()
+        .filter_map(|&module| {
+            let matches = normals.get(&key(module)?)?;
+            (matches.len() == 1).then_some((matches[0], module))
+        })
+        .collect()
 }
 
 struct CallMatcher<'a> {
@@ -697,7 +738,12 @@ pub fn twin_index(db: &dyn SourceDatabase, normal: Crate, test: Crate) -> TwinIn
         db,
         normal,
         test,
-        definitions: normal_items.definitions.into_iter().chain(test_items.definitions).collect(),
+        definitions: normal_items
+            .definitions
+            .iter()
+            .chain(&test_items.definitions)
+            .map(|(&k, &v)| (k, v))
+            .collect(),
         calls: FxHashMap::default(),
         active: FxHashSet::default(),
         pending: Vec::new(),
@@ -709,8 +755,11 @@ pub fn twin_index(db: &dyn SourceDatabase, normal: Crate, test: Crate) -> TwinIn
         }
     }
     let mut matched = FxHashSet::default();
-    for item in test_items.items {
+    for &item in &test_items.items {
         let is_body = usize::from(function_body(db, item));
+        if is_body != 0 {
+            result.function_items.insert(item);
+        }
         if gated_off(db, item, normal.cfg_options(db)) {
             result.test_only.insert(item);
             result.function_bodies.test_only += is_body;
@@ -758,6 +807,12 @@ pub fn twin_index(db: &dyn SourceDatabase, normal: Crate, test: Crate) -> TwinIn
             n.differs_from(test.cfg_options(db)) || t.differs_from(normal.cfg_options(db)),
         );
         let unknown = usize::from(n.unknown || t.unknown || !macros_known);
+        if differs != 0 {
+            result.cfg_differing_items.insert(item);
+        }
+        if unknown != 0 {
+            result.unknown_items.insert(item);
+        }
         result.cfg_differing += differs;
         result.unknown += unknown;
         result.function_bodies.twins += is_body;
@@ -809,6 +864,21 @@ fn shared() {}
         assert!(index.unmatched.is_empty());
         assert_eq!(index.normal_only, 1);
         assert_eq!(index.unknown, 0);
+    }
+
+    #[test]
+    fn pairs_module_and_block_scopes_without_test_only_scopes() {
+        let (db, normal, test) = pair(
+            r#"
+mod common { pub struct Item; }
+fn nested() { fn inner() {} }
+#[cfg(test)] mod tests { fn only() {} }
+"#,
+        );
+        let pairs = scope_pairs(&db, normal, test);
+        assert_eq!(pairs.len(), crate_items(&db, normal).scopes.len());
+        assert!(pairs.len() < crate_items(&db, test).scopes.len());
+        assert!(pairs.iter().all(|(n, t)| n.krate(&db) == normal && t.krate(&db) == test));
     }
 
     #[test]
