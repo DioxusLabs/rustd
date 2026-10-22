@@ -1096,9 +1096,14 @@ impl Dwarf {
         self.variables(function, start, len, debug);
 
         // The code ahead of the first statement sets the frame up, which is of the line the
-        // function is declared on, or of the first statement when that line is not known.
+        // function is declared on, or of the first statement when that line is not known or is
+        // below it in the file: a debugger takes lines above the first for more of the prologue,
+        // and so stepped into a body a macro wrote past its calls.
         let first = debug.rows.first().map(|it| it.1);
-        let entry_place = debug.declared.or(first).filter(|_| first.is_some());
+        let above = |declared: &Place| {
+            first.is_some_and(|first| declared.file != first.file || declared.line <= first.line)
+        };
+        let entry_place = debug.declared.filter(above).or(first);
         let lead = entry_place.filter(|_| debug.rows.first().is_some_and(|it| it.0 != 0));
         let rows = lead.map(|place| (0, place)).into_iter().chain(debug.rows.iter().copied());
         let program = &mut self.dwarf.unit.line_program;
