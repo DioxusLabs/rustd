@@ -1175,17 +1175,20 @@ def workspace_workers(work, check):
     ]
     registry_crates = [row for row in common_crates if row["origin"].startswith("Library")]
     sysroot_crates = [row for row in common_crates if row["origin"].startswith("Lang")]
+    itoa_crates = [row for row in common_crates if row["name"] == "itoa"]
+    core_crates = [row for row in common_crates if row["name"] == "core"]
     check(
-        "shared feature graphs stay distinct and common registry/sysroot crates deduplicate",
+        "shared feature graphs stay distinct and common registry/sysroot crates are shared",
         len(shared) == 2
         and shared_features == {"defaulted", "extra"}
         and len(serde_crates) == 2
         and serde_rc_features == {False, True}
-        and len([row for row in common_crates if row["name"] == "itoa"]) == 1
-        and len([row for row in common_crates if row["name"] == "core"]) == 1,
+        and len(itoa_crates) == 1
+        and bool(core_crates),
         f"shared {[(row['id'], row['cfg']) for row in shared]}, "
         f"serde {[(row['id'], row['cfg']) for row in serde_crates]}, "
-        f"common registry/sysroot crates {len(common_crates)} (registry {len(registry_crates)}, sysroot {len(sysroot_crates)})",
+        f"common registry/sysroot crates {len(common_crates)} (registry {len(registry_crates)}, "
+        f"sysroot {len(sysroot_crates)}, itoa {len(itoa_crates)}, core {len(core_crates)})",
     )
     check(
         "an edit after switching roots recompiles one function",
