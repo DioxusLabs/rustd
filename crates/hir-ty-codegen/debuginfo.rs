@@ -1445,6 +1445,13 @@ impl Writer for SectionWriter {
 mod tests {
     use super::*;
 
+    fn split_isa() -> cranelift_codegen::isa::OwnedTargetIsa {
+        cranelift_codegen::isa::lookup_by_name("x86_64-unknown-linux-gnu")
+            .unwrap()
+            .finish(cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()))
+            .unwrap()
+    }
+
     fn staging_directory() -> std::path::PathBuf {
         let nonce =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -1457,8 +1464,7 @@ mod tests {
     fn split_units_are_staged_and_cleaned_up() {
         let directory = staging_directory();
         let object = directory.join("unit.o");
-        let isa =
-            super::super::Target::selected().and_then(|it| it.isa("backtracking", false)).unwrap();
+        let isa = split_isa();
         let mut dwarf = Dwarf::new(&*isa, "/", true, Some(object.to_str().unwrap().to_owned()));
         let debug = FunctionDebug::new("f".to_owned(), "f".to_owned());
         dwarf.add_function(FuncId::from_u32(0), 8, &debug);
@@ -1480,8 +1486,7 @@ mod tests {
     fn unfinished_split_build_removes_staged_units() {
         let directory = staging_directory();
         let object = directory.join("unit.o");
-        let isa =
-            super::super::Target::selected().and_then(|it| it.isa("backtracking", false)).unwrap();
+        let isa = split_isa();
         let mut dwarf = Dwarf::new(&*isa, "/", true, Some(object.to_str().unwrap().to_owned()));
         let debug = FunctionDebug::new("f".to_owned(), "f".to_owned());
         dwarf.add_function(FuncId::from_u32(0), 8, &debug);
@@ -1497,8 +1502,7 @@ mod tests {
     fn split_write_errors_reach_emit() {
         let directory = staging_directory();
         let object = directory.join("missing/unit.o");
-        let isa =
-            super::super::Target::selected().and_then(|it| it.isa("backtracking", false)).unwrap();
+        let isa = split_isa();
         let mut dwarf = Dwarf::new(&*isa, "/", true, Some(object.to_str().unwrap().to_owned()));
         let debug = FunctionDebug::new("f".to_owned(), "f".to_owned());
         dwarf.add_function(FuncId::from_u32(0), 8, &debug);
