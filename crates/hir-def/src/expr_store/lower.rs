@@ -2755,13 +2755,6 @@ impl<'db> ExprCollector<'db> {
                 // Keep collecting even with expansion errors so we can provide completions and
                 // other services in incomplete macro expressions.
                 if let Some(macro_file) = self.expander.current_file_id().macro_file() {
-                    self.has_macro_expansion |= !matches!(
-                        macro_file.loc(self.db).def.kind,
-                        hir_expand::MacroDefKind::BuiltIn(
-                            _,
-                            hir_expand::builtin::BuiltinFnLikeExpander::Cfg
-                        )
-                    );
                     self.store.expansions.insert(macro_call_ptr, macro_file);
                 }
 

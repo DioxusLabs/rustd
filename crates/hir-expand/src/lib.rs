@@ -488,6 +488,13 @@ impl MacroCallId {
 
 #[salsa::tracked]
 impl MacroCallId {
+    /// The actual expansion, before parsing and without discarding token hygiene.
+    #[salsa::tracked(returns(ref), lru = 512)]
+    pub fn expansion_tokens(self, db: &dyn SourceDatabase) -> ExpandResult<tt::TopSubtree> {
+        let expanded = self.macro_expand(db, self.loc(db));
+        ExpandResult { value: expanded.value.0.into_owned(), err: expanded.err }
+    }
+
     /// Implementation of [`HirFileId::parse_or_expand`] for the macro case.
     // FIXME: We should verify that the parsed node is one of the many macro node variants we expect
     // instead of having it be untyped
