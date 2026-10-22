@@ -1230,11 +1230,18 @@ def workspace_workers(work, check):
         daemon_log_text,
         re.M,
     )
-    check(
-        "worker budget starts a fresh worker for package b",
-        bool(restart) and all(budget_results),
-        restart[0] if restart else daemon_log_text,
-    )
+    if os.path.isdir("/proc/self"):
+        check(
+            "worker budget starts a fresh worker for package b",
+            bool(restart) and all(budget_results),
+            restart[0] if restart else daemon_log_text,
+        )
+    else:
+        check(
+            "worker budget restart is skipped without /proc RSS",
+            all(budget_results),
+            "RSS unavailable; fresh-worker check skipped",
+        )
     budget_side.cargo("stop")
 
     for order, home, sequence in (
