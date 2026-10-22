@@ -1045,6 +1045,9 @@ pub fn configured() -> u32 { CONFIG }
 #[cfg_attr(test, inline)] pub fn attributed() {}
 pub fn gated() -> u32 { let mut n = 0; #[cfg(test)] { n = 1; } n }
 pub struct Shape;
+#[derive(Debug, Clone)]
+pub struct Derived;
+pub fn formatted() -> String { format!("{:?}", Derived.clone()) }
 pub enum Choice { One }
 pub type Alias = Shape;
 pub const SHARED: u32 = 1;
@@ -1064,6 +1067,7 @@ mod tests {
         assert_eq!(super::value(), 42);
         assert_eq!(super::configured(), 8);
         assert_eq!(super::gated(), 1);
+        assert_eq!(super::formatted(), "Derived");
     }
 }
 ''',
@@ -1105,8 +1109,11 @@ fn integration() {
         loads = sum(path.read_text(errors="replace").count("load workspace:") for path in logs.glob("**/log"))
         check("the graph was loaded once", loads == 1, f"loads {loads}")
         twin_counts = [tuple(map(int, match)) for path in logs.glob("**/log") for match in re.findall(
-            r"cfg twins: test_graph: twins (\d+), cfg-differing (\d+), unmatched (\d+)", path.read_text(errors="replace"))]
-        check("cfg source twins before and after the edit", len(twin_counts) >= 2 and all(count == (19, 3, 4) for count in twin_counts), str(twin_counts))
+            r"cfg twins: test_graph: twins (\d+), cfg-differing (\d+), test-only (\d+), unmatched (\d+)", path.read_text(errors="replace"))]
+        check("cfg source and expansion twins before and after the edit", len(twin_counts) >= 2 and all(count == (26, 3, 3, 0) for count in twin_counts), str(twin_counts))
+        body_counts = [tuple(map(int, match)) for path in logs.glob("**/log") for match in re.findall(
+            r"cfg twins: test_graph: [^\n]+; function bodies: twins (\d+), cfg-differing (\d+), test-only (\d+), unmatched (\d+), unknown (\d+)", path.read_text(errors="replace"))]
+        check("generated and format bodies have known twins", len(body_counts) >= 2 and all(count == (13, 3, 1, 0, 0) for count in body_counts), str(body_counts))
     finally:
         side.cargo("stop")
     return checks

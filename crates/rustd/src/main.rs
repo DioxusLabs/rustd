@@ -2683,12 +2683,18 @@ fn dump_twins(db: &RootDatabase, args: &Args) {
             .map(|name| name.to_string())
             .unwrap_or_default();
         eprintln!(
-            "cfg twins: {name}: twins {}, cfg-differing {}, unmatched {}, normal-only {}, unknown {}",
+            "cfg twins: {name}: twins {}, cfg-differing {}, test-only {}, unmatched {}, normal-only {}, unknown {}; function bodies: twins {}, cfg-differing {}, test-only {}, unmatched {}, unknown {}",
             index.twins.len(),
             index.cfg_differing,
+            index.test_only.len(),
             index.unmatched.len(),
             index.normal_only,
-            index.unknown
+            index.unknown,
+            index.function_bodies.twins,
+            index.function_bodies.cfg_differing,
+            index.function_bodies.test_only,
+            index.function_bodies.unmatched,
+            index.function_bodies.unknown
         );
     }
 }
