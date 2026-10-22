@@ -1039,6 +1039,22 @@ def test_graph(work):
         "probe/src/lib.rs": 'pub fn tested() -> bool { test_graph::tested() }\n',
         "src/lib.rs": '''pub fn tested() -> bool { cfg!(test) }
 pub fn value() -> u32 { 40 + 2 }
+#[cfg(not(test))] const CONFIG: u32 = 7;
+#[cfg(test)] const CONFIG: u32 = 8;
+pub fn configured() -> u32 { CONFIG }
+#[cfg_attr(test, inline)] pub fn attributed() {}
+pub fn gated() -> u32 { let mut n = 0; #[cfg(test)] { n = 1; } n }
+pub struct Shape;
+pub enum Choice { One }
+pub type Alias = Shape;
+pub const SHARED: u32 = 1;
+pub static STATE: u32 = 2;
+pub trait Value { fn get(&self) -> u32; }
+impl Value for Shape { fn get(&self) -> u32 { SHARED } }
+impl Shape { pub fn own(&self) -> u32 { STATE } }
+pub fn nested() { fn local() {} local(); }
+macro_rules! generate { () => { pub fn generated() {} } }
+generate!();
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1046,6 +1062,8 @@ mod tests {
         assert!(super::tested());
         assert!(!probe::tested());
         assert_eq!(super::value(), 42);
+        assert_eq!(super::configured(), 8);
+        assert_eq!(super::gated(), 1);
     }
 }
 ''',
@@ -1060,7 +1078,7 @@ fn integration() {
     for file, text in files.items():
         os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
         open(os.path.join(ws, file), "w").write(text)
-    side = Side(ws, base_env(os.path.join(work, "home-test-graph")), True)
+    side = Side(ws, dict(base_env(os.path.join(work, "home-test-graph")), RUSTD_CFG_TWINS="1"), True)
     checks = []
 
     def check(name, held, detail):
@@ -1086,6 +1104,9 @@ fn integration() {
         logs = pathlib.Path(side.env["RUSTD_HOME"])
         loads = sum(path.read_text(errors="replace").count("load workspace:") for path in logs.glob("**/log"))
         check("the graph was loaded once", loads == 1, f"loads {loads}")
+        twin_counts = [tuple(map(int, match)) for path in logs.glob("**/log") for match in re.findall(
+            r"cfg twins: test_graph: twins (\d+), cfg-differing (\d+), unmatched (\d+)", path.read_text(errors="replace"))]
+        check("cfg source twins before and after the edit", len(twin_counts) >= 2 and all(count == (19, 3, 4) for count in twin_counts), str(twin_counts))
     finally:
         side.cargo("stop")
     return checks

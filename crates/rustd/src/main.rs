@@ -2653,7 +2653,44 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
         }
     }
     resolve_all(db, &crates);
+    dump_twins(db, args);
     Ok(crates.len())
+}
+
+fn dump_twins(db: &RootDatabase, args: &Args) {
+    if std::env::var_os("RUSTD_CFG_TWINS").is_none() {
+        return;
+    }
+    let roots: FxHashSet<_> = args
+        .crates()
+        .flat_map(|name| crates_named(db, name, args).unwrap_or_default())
+        .map(|krate| ide_db::base_db::Crate::from(krate).root_file_id(db))
+        .collect();
+    for &test in args
+        .members
+        .iter()
+        .filter(|&&krate| is_tested(db, krate) && roots.contains(&krate.root_file_id(db)))
+    {
+        let mut normal = args.members.iter().copied().filter(|&krate| {
+            !is_tested(db, krate)
+                && !doctest::is_documented(db, krate)
+                && krate.root_file_id(db) == test.root_file_id(db)
+        });
+        let Some(normal) = normal.next().filter(|_| normal.next().is_none()) else { continue };
+        let index = hir_def::twins::twin_index(db, normal, test);
+        let name = hir::Crate::from(test)
+            .display_name(db)
+            .map(|name| name.to_string())
+            .unwrap_or_default();
+        eprintln!(
+            "cfg twins: {name}: twins {}, cfg-differing {}, unmatched {}, normal-only {}, unknown {}",
+            index.twins.len(),
+            index.cfg_differing,
+            index.unmatched.len(),
+            index.normal_only,
+            index.unknown
+        );
+    }
 }
 
 /// Resolves the names of `crates` again after an edit to many files, on every core: whoever
@@ -3027,6 +3064,7 @@ fn build(
     listed: &Listed,
 ) -> anyhow::Result<Build> {
     let start = Instant::now();
+    dump_twins(db, args);
     let contents = &content::Contents::default();
     let (root, base) = (args.checkout.clone(), args.base.clone());
     let debug = args.debug;
