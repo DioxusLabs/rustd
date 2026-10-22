@@ -3,19 +3,23 @@
 //! The reference inventory follows rustc's `MirNeighborCollector` in
 //! <https://github.com/rust-lang/rust/blob/1.93.0/compiler/rustc_monomorphize/src/collector.rs>:
 //! function operands, constants, statics, drops and unsizing can introduce code dependencies.
-//! Unlike monomorphization this is a definition-level proof: unresolved dispatch,
-//! opaque allocations and vtables are rejected rather than guessed.
+//! At definition level, trait dispatch and vtables conservatively reach every local impl
+//! of the trait, instead of rustc's instance-selected methods. Drop likewise reaches local
+//! destructors. PairSafety must hold before using either diagnostic sharing class.
+//! Textual macro escape follows `define_macro` and module visitation in
+//! `rustc_resolve/src/build_reduced_graph.rs` at the same rustc tag.
 
 use std::collections::VecDeque;
 
-use base_db::{Crate, CrateOrigin, LangCrateOrigin};
+use base_db::Crate;
 use hir_def::{
-    AdtId, AttrDefId, CallableDefId, DefWithBodyId, FunctionId, GenericDefId, HasModule,
-    ItemContainerId, Lookup, ModuleDefId, VariantId,
+    AdtId, AttrDefId, CallableDefId, DefWithBodyId, FunctionId, GenericDefId, HasModule, ImplId,
+    ItemContainerId, Lookup, ModuleDefId, TraitId, VariantId,
+    attrs::AttrFlags,
     expr_store::Body,
     hir::{Expr, Pat},
     resolver::{HasResolver, ValueNs},
-    signatures::{FunctionSignature, ImplSignature, StructSignature, TraitSignature},
+    signatures::{ConstSignature, FunctionSignature, ImplSignature, TypeAliasSignature},
     twins::{crate_items, scope_pairs, twin_index},
 };
 use hir_expand::mod_path::{ModPath, PathKind};
@@ -28,7 +32,10 @@ use crate::{
     db::{GeneralConstId, HirDatabase},
     method_resolution::CandidateId,
     mir::{Operand, OperandKind, Rvalue, StatementKind, TerminatorKind},
-    next_solver::{ClauseKind, Const, ConstKind, DbInterner, GenericArgs, Ty, TyKind},
+    next_solver::{
+        AliasTyKind, ClauseKind, Const, ConstKind, DbInterner, ExistentialPredicate, GenericArgs,
+        Ty, TyKind, TypingMode, infer::DbInternerInferExt,
+    },
     traits::ParamEnvAndCrate,
 };
 
@@ -36,15 +43,15 @@ use crate::{
 pub enum Rejection {
     CfgDiffering,
     Transitive,
-    StaticClosure,
     GenericUnresolved,
     Unknown,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Eligibility {
-    /// Potentially eligible T items before the crate-wide safety veto.
+    /// Fully shareable T items before the crate-wide safety veto.
     pub candidates: FxHashSet<AttrDefId>,
+    pub analysis_shared: FxHashSet<AttrDefId>,
     pub rejected: FxHashMap<AttrDefId, Rejection>,
     pub pair_veto: Vec<&'static str>,
     pub statics: usize,
@@ -56,33 +63,6 @@ struct References {
     items: FxHashSet<AttrDefId>,
     unknown: bool,
     generic_unresolved: bool,
-    type_id_types: FxHashSet<AdtId>,
-    type_id_unknown: bool,
-}
-
-#[derive(Default)]
-struct TypeArguments {
-    adts: FxHashSet<AdtId>,
-    unknown: bool,
-}
-
-impl<'db> TypeVisitor<DbInterner<'db>> for TypeArguments {
-    type Result = ();
-    fn visit_ty(&mut self, ty: Ty<'db>) {
-        match ty.kind() {
-            TyKind::Adt(adt, _) => {
-                self.adts.insert(adt.def_id());
-            }
-            TyKind::Param(_)
-            | TyKind::Alias(..)
-            | TyKind::Infer(_)
-            | TyKind::Error(_)
-            | TyKind::Dynamic(..)
-            | TyKind::FnPtr(..) => self.unknown = true,
-            _ => (),
-        }
-        ty.super_visit_with(self);
-    }
 }
 
 struct Collector<'db> {
@@ -91,6 +71,8 @@ struct Collector<'db> {
     env: ParamEnvAndCrate<'db>,
     result: References,
     seen: FxHashSet<Ty<'db>>,
+    traits: FxHashSet<TraitId>,
+    coroutines: FxHashSet<crate::db::InternedCoroutineId<'db>>,
 }
 
 fn generic(item: AttrDefId) -> Option<GenericDefId> {
@@ -106,60 +88,63 @@ fn generic(item: AttrDefId) -> Option<GenericDefId> {
     })
 }
 
-fn body(item: AttrDefId) -> Option<DefWithBodyId> {
+fn body(db: &dyn HirDatabase, item: AttrDefId) -> Option<DefWithBodyId> {
     match item {
-        AttrDefId::FunctionId(id) => Some(id.into()),
-        AttrDefId::ConstId(id) => Some(id.into()),
+        AttrDefId::FunctionId(id) if FunctionSignature::of(db, id).has_body() => Some(id.into()),
+        AttrDefId::ConstId(id) if ConstSignature::of(db, id).has_body() => Some(id.into()),
         AttrDefId::StaticId(id) => Some(id.into()),
-        AttrDefId::EnumVariantId(id) => Some(id.into()),
+        AttrDefId::EnumVariantId(id) => {
+            let body = Body::of(db, id.into());
+            (!matches!(body[body.root_expr()], Expr::Missing)).then_some(id.into())
+        }
         _ => None,
     }
 }
 
-fn names_type_id(db: &dyn HirDatabase, func: FunctionId) -> bool {
-    if !matches!(func.krate(db).data(db).origin, CrateOrigin::Lang(LangCrateOrigin::Core)) {
-        return false;
-    }
-    let name = FunctionSignature::of(db, func).name.as_str();
-    if name == "type_id" && FunctionSignature::is_intrinsic(db, func) {
-        return true;
-    }
-    match func.lookup(db).container {
-        ItemContainerId::TraitId(id) => TraitSignature::of(db, id).name.as_str() == "Any",
-        ItemContainerId::ImplId(id) => {
-            if db.impl_trait(id).is_some_and(|tr| {
-                TraitSignature::of(db, tr.skip_binder().def_id.0).name.as_str() == "Any"
-            }) {
-                return true;
-            }
-            matches!(db.impl_self_ty(id).skip_binder().kind(), TyKind::Adt(adt, _)
-                if matches!(adt.def_id(), AdtId::StructId(id) if StructSignature::of(db, id).name.as_str() == "TypeId"))
-                && name == "of"
+#[salsa::tracked(returns(ref))]
+fn local_trait_impls(db: &dyn HirDatabase, krate: Crate) -> FxHashMap<TraitId, Vec<ImplId>> {
+    let mut result: FxHashMap<TraitId, Vec<ImplId>> = FxHashMap::default();
+    for &item in &crate_items(db, krate).items {
+        if let AttrDefId::ImplId(id) = item
+            && let Some(tr) = db.impl_trait(id)
+        {
+            result.entry(tr.skip_binder().def_id.0).or_default().push(id);
         }
-        _ => false,
     }
+    result
 }
 
 impl<'db> Collector<'db> {
-    fn function(&mut self, func: FunctionId, args: GenericArgs<'db>) {
-        let mut types = TypeArguments::default();
-        args.visit_with(&mut types);
-        if names_type_id(self.db, func) {
-            self.result.type_id_types.extend(types.adts);
-            self.result.type_id_unknown |= types.unknown;
+    fn trait_impls(&mut self, id: TraitId) {
+        if !self.traits.insert(id) {
             return;
         }
-        if func.krate(self.db) != self.krate && types.unknown {
-            self.result.generic_unresolved = true;
+        self.result.items.insert(id.into());
+        if let Some(impls) = local_trait_impls(self.db, self.krate).get(&id) {
+            self.result.items.extend(impls.iter().copied().map(AttrDefId::from));
         }
-        if func.krate(self.db) != self.krate
-            && types.adts.iter().any(|adt| adt.krate(self.db) == self.krate)
-        {
-            self.result.unknown = true;
+    }
+
+    fn bounds(&mut self, def: GenericDefId) {
+        let env = self.db.trait_environment(def);
+        for clause in env.clauses().iter() {
+            if let ClauseKind::Trait(pred) = clause.kind().skip_binder() {
+                self.trait_impls(pred.trait_ref.def_id.0);
+            }
         }
+        env.visit_with(self);
+    }
+
+    fn function(&mut self, func: FunctionId, args: GenericArgs<'db>) {
+        args.visit_with(self);
+        self.bounds(func.into());
         let (resolved, _) = self.db.lookup_impl_method(self.env, func, args);
         let either::Either::Left(resolved) = resolved else {
-            self.result.unknown = true;
+            if let ItemContainerId::TraitId(id) = func.lookup(self.db).container {
+                self.trait_impls(id);
+            } else {
+                self.result.generic_unresolved = true;
+            }
             return;
         };
         self.result.items.insert(resolved.into());
@@ -167,7 +152,7 @@ impl<'db> Collector<'db> {
             ItemContainerId::ImplId(id) => {
                 self.result.items.insert(id.into());
             }
-            ItemContainerId::TraitId(_) => self.result.generic_unresolved = true,
+            ItemContainerId::TraitId(id) => self.trait_impls(id),
             _ => (),
         }
     }
@@ -202,14 +187,9 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Collector<'db> {
             return;
         }
         match ty.kind() {
-            TyKind::Adt(adt, args) => {
+            TyKind::Adt(adt, _) => {
                 self.result.items.insert(adt.def_id().into());
-                if adt.def_id().krate(self.db) != self.krate {
-                    let mut types = TypeArguments::default();
-                    args.visit_with(&mut types);
-                    self.result.unknown |=
-                        types.adts.iter().any(|adt| adt.krate(self.db) == self.krate);
-                }
+                self.bounds(adt.def_id().into());
             }
             TyKind::FnDef(def, args) => match def.0 {
                 CallableDefId::FunctionId(id) => self.function(id, args),
@@ -220,15 +200,44 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Collector<'db> {
                     self.result.items.insert(id.into());
                 }
             },
-            TyKind::Alias(..) => self.result.generic_unresolved = true,
-            TyKind::Dynamic(..)
-            | TyKind::FnPtr(..)
-            | TyKind::Closure(..)
-            | TyKind::Coroutine(..)
-            | TyKind::CoroutineClosure(..)
-            | TyKind::CoroutineWitness(..)
-            | TyKind::Error(..)
-            | TyKind::Infer(..) => self.result.unknown = true,
+            TyKind::Alias(alias) => match alias.kind {
+                AliasTyKind::Projection { def_id } => match def_id.0.lookup(self.db).container {
+                    ItemContainerId::TraitId(id) => self.trait_impls(id),
+                    ItemContainerId::ImplId(id) => {
+                        self.result.items.insert(id.into());
+                    }
+                    _ => self.result.generic_unresolved = true,
+                },
+                AliasTyKind::Opaque { .. } => {
+                    if let Some(bounds) = ty.impl_trait_bounds(self.db) {
+                        for clause in bounds {
+                            if let ClauseKind::Trait(pred) = clause.kind().skip_binder() {
+                                self.trait_impls(pred.trait_ref.def_id.0);
+                            }
+                            clause.visit_with(self);
+                        }
+                    } else {
+                        self.result.generic_unresolved = true;
+                    }
+                }
+                _ => self.result.generic_unresolved = true,
+            },
+            TyKind::Dynamic(bounds, _) => {
+                use rustc_type_ir::inherent::BoundExistentialPredicates;
+                if let Some(id) = bounds.principal_def_id() {
+                    self.trait_impls(id.0);
+                }
+                for bound in bounds.iter() {
+                    if let ExistentialPredicate::AutoTrait(id) = bound.skip_binder() {
+                        self.trait_impls(id.0);
+                    }
+                }
+            }
+            TyKind::Coroutine(id, _) => {
+                self.coroutines.insert(id.0);
+            }
+            TyKind::Closure(..) | TyKind::CoroutineClosure(..) | TyKind::CoroutineWitness(..) => (),
+            TyKind::Error(..) | TyKind::Infer(..) => self.result.unknown = true,
             _ => (),
         }
         ty.super_visit_with(self);
@@ -260,10 +269,18 @@ fn references(db: &dyn HirDatabase, item: AttrDefId) -> References {
             .map_or_else(crate::next_solver::ParamEnv::empty, |id| db.trait_environment(id)),
         krate,
     };
-    let mut c =
-        Collector { db, krate, env, result: References::default(), seen: FxHashSet::default() };
+    let mut c = Collector {
+        db,
+        krate,
+        env,
+        result: References::default(),
+        seen: FxHashSet::default(),
+        traits: FxHashSet::default(),
+        coroutines: FxHashSet::default(),
+    };
     env.param_env.visit_with(&mut c);
     if let Some(def) = generic(item) {
+        c.bounds(def);
         let defaults = db.generic_defaults(def);
         for index in 0..crate::generics::generics(db, def).len(false) {
             if let Some(default) = defaults.get(index) {
@@ -297,13 +314,24 @@ fn references(db: &dyn HirDatabase, item: AttrDefId) -> References {
             db.type_for_static(id).skip_binder().visit_with(&mut c);
         }
         AttrDefId::TypeAliasId(id) => {
-            db.ty(TyDefId::TypeAliasId(id)).skip_binder().visit_with(&mut c);
+            if let ItemContainerId::TraitId(trait_id) = id.lookup(db).container
+                && TypeAliasSignature::of(db, id).ty.is_none()
+            {
+                c.trait_impls(trait_id);
+            } else {
+                db.ty(TyDefId::TypeAliasId(id)).skip_binder().visit_with(&mut c);
+            }
         }
         AttrDefId::ImplId(id) => {
+            c.result
+                .items
+                .extend(id.impl_items(db).items.iter().map(|(_, item)| AttrDefId::from(*item)));
             db.impl_self_ty(id).skip_binder().visit_with(&mut c);
             if let Some(tr) = db.impl_trait(id) {
                 c.result.items.insert(tr.skip_binder().def_id.0.into());
                 tr.skip_binder().visit_with(&mut c);
+            } else if ImplSignature::of(db, id).target_trait.is_some() {
+                c.result.generic_unresolved = true;
             }
         }
         AttrDefId::AdtId(id) => {
@@ -356,7 +384,7 @@ fn references(db: &dyn HirDatabase, item: AttrDefId) -> References {
         }
         _ => (),
     }
-    if let Some(owner) = body(item) {
+    if let Some(owner) = body(db, item) {
         let lowered = Body::of(db, owner);
         let infer = InferenceResult::of(db, owner);
         c.result.unknown |= infer.has_errors;
@@ -390,6 +418,7 @@ fn references(db: &dyn HirDatabase, item: AttrDefId) -> References {
                     }
                     Some(_) => (),
                     None if infer.assoc_resolutions_for_expr(expr).is_some() => (),
+                    None if infer.variant_resolution_for_expr(expr).is_some() => (),
                     None => c.result.unknown = true,
                 }
                 resolver.reset_to_guard(guard);
@@ -405,61 +434,99 @@ fn references(db: &dyn HirDatabase, item: AttrDefId) -> References {
                 c.result.unknown = true;
             }
         }
+        let infcx = DbInterner::new_with(db, krate).infer_ctxt().build(TypingMode::PostAnalysis);
         match db.mir_body(owner.into()) {
             Err(_) => c.result.unknown = true,
             Ok(mir) => {
-                c.result.unknown |= !mir.closures.is_empty();
-                for (_, local) in mir.locals.iter() {
-                    local.ty.as_ref().visit_with(&mut c);
-                }
-                for (_, block) in mir.basic_blocks.iter() {
-                    for statement in &block.statements {
-                        match &statement.kind {
-                            StatementKind::Assign(_, value) => match value {
-                                Rvalue::Use(op) | Rvalue::UnaryOp(_, op) => c.operand(op),
-                                Rvalue::Cast(_, op, ty) => {
-                                    c.operand(op);
-                                    ty.as_ref().visit_with(&mut c);
+                let mut pending = vec![mir];
+                let mut seen_coroutines = FxHashSet::default();
+                while let Some(mir) = pending.pop() {
+                    for &closure in &mir.closures {
+                        match db.mir_body_for_closure(closure) {
+                            Ok(body) => pending.push(body),
+                            Err(_) => c.result.unknown = true,
+                        }
+                    }
+                    for (_, local) in mir.locals.iter() {
+                        local.ty.as_ref().visit_with(&mut c);
+                    }
+                    for (_, block) in mir.basic_blocks.iter() {
+                        for statement in &block.statements {
+                            match &statement.kind {
+                                StatementKind::Assign(_, value) => match value {
+                                    Rvalue::Use(op) | Rvalue::UnaryOp(_, op) => c.operand(op),
+                                    Rvalue::Cast(_, op, ty) => {
+                                        c.operand(op);
+                                        ty.as_ref().visit_with(&mut c);
+                                    }
+                                    Rvalue::Repeat(op, count) => {
+                                        c.operand(op);
+                                        count.as_ref().visit_with(&mut c);
+                                    }
+                                    Rvalue::CheckedBinaryOp(_, a, b) => {
+                                        c.operand(a);
+                                        c.operand(b);
+                                    }
+                                    Rvalue::Aggregate(_, ops) => {
+                                        for op in ops {
+                                            c.operand(op);
+                                        }
+                                    }
+                                    _ => (),
+                                },
+                                StatementKind::InlineAsm(_) => c.result.unknown = true,
+                                _ => (),
+                            }
+                        }
+                        if let Some(term) = &block.terminator {
+                            if let TerminatorKind::Drop { place, .. }
+                            | TerminatorKind::DropAndReplace { place, .. } = &term.kind
+                            {
+                                mir.locals[place.local].ty.as_ref().visit_with(&mut c);
+                                if !crate::collect_params(&mir.locals[place.local].ty.as_ref())
+                                    .is_empty()
+                                    && let Some(id) = hir_def::lang_item::lang_items(db, krate).Drop
+                                {
+                                    c.trait_impls(id);
                                 }
-                                Rvalue::Repeat(op, count) => {
-                                    c.operand(op);
-                                    count.as_ref().visit_with(&mut c);
-                                }
-                                Rvalue::CheckedBinaryOp(_, a, b) => {
-                                    c.operand(a);
-                                    c.operand(b);
-                                }
-                                Rvalue::Aggregate(_, ops) => {
-                                    for op in ops {
+                            }
+                            match &term.kind {
+                                TerminatorKind::Call { func, args, .. } => {
+                                    let ty = match &func.kind {
+                                        OperandKind::Copy(place) | OperandKind::Move(place) => {
+                                            place.as_ref().ty(mir, &infcx, env.param_env).ty
+                                        }
+                                        OperandKind::Constant { ty, .. } => ty.as_ref(),
+                                        OperandKind::Allocation { allocation } => {
+                                            allocation.as_ref().ty
+                                        }
+                                        OperandKind::Static(id) => {
+                                            db.type_for_static(*id).skip_binder()
+                                        }
+                                    };
+                                    if matches!(ty.kind(), TyKind::FnPtr(..)) {
+                                        c.result.unknown = true;
+                                    }
+                                    ty.visit_with(&mut c);
+                                    c.operand(func);
+                                    for op in args {
                                         c.operand(op);
                                     }
                                 }
+                                TerminatorKind::SwitchInt { discr, .. } => c.operand(discr),
+                                TerminatorKind::Assert { cond, .. } => c.operand(cond),
+                                TerminatorKind::DropAndReplace { value, .. }
+                                | TerminatorKind::Yield { value, .. } => c.operand(value),
                                 _ => (),
-                            },
-                            StatementKind::InlineAsm(_) => c.result.unknown = true,
-                            _ => (),
+                            }
                         }
                     }
-                    if let Some(term) = &block.terminator {
-                        if let TerminatorKind::Drop { place, .. }
-                        | TerminatorKind::DropAndReplace { place, .. } = &term.kind
-                        {
-                            c.result.generic_unresolved |=
-                                !crate::collect_params(&mir.locals[place.local].ty.as_ref())
-                                    .is_empty();
-                        }
-                        match &term.kind {
-                            TerminatorKind::Call { func, args, .. } => {
-                                c.operand(func);
-                                for op in args {
-                                    c.operand(op);
-                                }
+                    for coroutine in c.coroutines.drain() {
+                        if seen_coroutines.insert(coroutine) {
+                            match db.mir_body_for_coroutine(coroutine) {
+                                Ok(body) => pending.push(body),
+                                Err(_) => c.result.unknown = true,
                             }
-                            TerminatorKind::SwitchInt { discr, .. } => c.operand(discr),
-                            TerminatorKind::Assert { cond, .. } => c.operand(cond),
-                            TerminatorKind::DropAndReplace { value, .. }
-                            | TerminatorKind::Yield { value, .. } => c.operand(value),
-                            _ => (),
                         }
                     }
                 }
@@ -484,6 +551,48 @@ fn module_def(item: ModuleDefId) -> Option<AttrDefId> {
     })
 }
 
+fn lexical_source(db: &dyn HirDatabase, item: AttrDefId) -> Option<hir_expand::ErasedAstId> {
+    let mut source = hir_def::twins::ast_id(db, item)?;
+    for _ in 0..64 {
+        let Some(call) = source.file_id.macro_file() else { return Some(source) };
+        let kind = &call.loc(db).kind;
+        source = hir_expand::ErasedAstId::new(kind.file_id(), kind.erased_ast_id());
+    }
+    None
+}
+
+fn macro_escapes(db: &dyn HirDatabase, normal: Crate, test: Crate, item: AttrDefId) -> bool {
+    let AttrDefId::MacroId(id) = item else { return false };
+    if AttrFlags::query(db, item).contains(AttrFlags::IS_MACRO_EXPORT) {
+        return true;
+    }
+    let Some(source) = lexical_source(db, item) else { return true };
+    let end = source.to_ptr(db).text_range().end();
+    let twins = twin_index(db, normal, test);
+    for (_, module) in scope_pairs(db, normal, test) {
+        let scope = module.def_map(db).module(db, module).scope(db);
+        if scope.macros().any(|(_, entry)| entry.def == id) {
+            return true;
+        }
+        if !scope.legacy_macros().any(|(_, macros)| macros.contains(&id)) {
+            continue;
+        }
+        for &common in twins.twins.keys() {
+            let owner = common.module(db);
+            if owner != module
+                && !matches!(common, AttrDefId::ModuleId(child) if child.containing_module(db) == Some(module))
+            {
+                continue;
+            }
+            let Some(common) = lexical_source(db, common) else { return true };
+            if common.file_id != source.file_id || common.to_ptr(db).text_range().start() >= end {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[salsa::tracked(returns(ref))]
 pub fn pair_safety(db: &dyn HirDatabase, normal: Crate, test: Crate) -> Vec<&'static str> {
     let mut veto = FxHashSet::default();
@@ -492,12 +601,11 @@ pub fn pair_safety(db: &dyn HirDatabase, normal: Crate, test: Crate) -> Vec<&'st
     let titems = crate_items(db, test);
     for (&def, &item) in &titems.definitions {
         if matches!(def.kind, hir_expand::MacroDefKind::Declarative(..))
-            && !nitems.definitions.values().any(|&n| twins.twins.get(&item) == Some(&n))
+            && item.module(db).krate(db) == test
+            && hir_def::twins::gated_off(db, item, normal.cfg_options(db))
+            && macro_escapes(db, normal, test, item)
         {
-            let reads = hir_def::twins::item_cfg_reads(db, item);
-            if reads.differs_from(normal.cfg_options(db)) {
-                veto.insert("cfg-test-macro-rules");
-            }
+            veto.insert("cfg-test-macro-rules");
         }
     }
     for (n, t) in scope_pairs(db, normal, test) {
@@ -617,8 +725,6 @@ pub fn pair_eligibility(
         let reason = if let Some(&t) = matched.get(&item) {
             if twins.cfg_differing_items.contains(&t) {
                 Some(Rejection::CfgDiffering)
-            } else if both && matches!(item, AttrDefId::StaticId(_)) {
-                Some(Rejection::StaticClosure)
             } else if twins.unknown_items.contains(&t) {
                 Some(Rejection::Unknown)
             } else if refs.generic_unresolved {
@@ -659,9 +765,7 @@ pub fn pair_eligibility(
             .copied()
             .filter(|reason| *reason == Rejection::CfgDiffering || twins.unknown_items.contains(&t))
             .or_else(|| {
-                if static_closure.contains(&node) {
-                    Some(Rejection::StaticClosure)
-                } else if let Some(reason) = own.get(&node).copied() {
+                if let Some(reason) = own.get(&node).copied() {
                     Some(reason)
                 } else if rejected.contains(&node) {
                     Some(Rejection::Transitive)
@@ -671,6 +775,8 @@ pub fn pair_eligibility(
             });
         if let Some(reason) = reason {
             result.rejected.insert(t, reason);
+        } else if static_closure.contains(&node) {
+            result.analysis_shared.insert(t);
         } else {
             result.candidates.insert(t);
         }
@@ -747,52 +853,4 @@ mod tests {
     fn empty_graph_has_no_rejections() {
         assert!(reverse_closure(&DiGraph::<(), ()>::new(), []).is_empty());
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TypeIdVeto {
-    None,
-    TypeId,
-    Unknown(AttrDefId),
-}
-
-pub fn type_id_preflight(
-    db: &dyn HirDatabase,
-    roots: &[AttrDefId],
-    normal: Crate,
-    test: Crate,
-) -> TypeIdVeto {
-    let eligible = pair_eligibility(db, normal, test, true);
-    if eligible.candidates.is_empty() {
-        return TypeIdVeto::None;
-    }
-    let mut seen = FxHashSet::default();
-    let mut pending: VecDeque<_> = roots.iter().copied().collect();
-    let mut roots_left = pending.len();
-    let mut unknown = None;
-    while let Some(item) = pending.pop_front() {
-        roots_left = roots_left.saturating_sub(1);
-        if !seen.insert(item) {
-            continue;
-        }
-        let refs = references(db, item);
-        let twins = twin_index(db, normal, test);
-        if refs.type_id_types.iter().any(|&adt| {
-            let item = adt.into();
-            eligible.candidates.contains(&item)
-                || twins.twins.iter().any(|(t, n)| *n == item && eligible.candidates.contains(t))
-        }) {
-            return TypeIdVeto::TypeId;
-        }
-        if refs.unknown || refs.generic_unresolved || refs.type_id_unknown {
-            unknown.get_or_insert(item);
-        }
-        if roots_left == 0
-            && let Some(item) = unknown
-        {
-            return TypeIdVeto::Unknown(item);
-        }
-        pending.extend(refs.items.iter().copied());
-    }
-    unknown.map_or(TypeIdVeto::None, TypeIdVeto::Unknown)
 }

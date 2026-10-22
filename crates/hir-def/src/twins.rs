@@ -32,7 +32,8 @@ use crate::{
     nameres::{DefMap, crate_def_map},
 };
 
-fn ast_id(db: &dyn SourceDatabase, item: AttrDefId) -> Option<ErasedAstId> {
+/// Source position used for twin matching and textual macro escape checks.
+pub fn ast_id(db: &dyn SourceDatabase, item: AttrDefId) -> Option<ErasedAstId> {
     Some(match item {
         AttrDefId::ModuleId(id) => id.def_map(db).module(db, id).origin.declaration()?.erase(),
         AttrDefId::FunctionId(id) => id.lookup(db).id.erase(),
@@ -102,6 +103,7 @@ pub(crate) fn observe_attrs(
                             | "export_name"
                             | "link_name"
                             | "track_caller"
+                            | "thread_local"
                             | "deprecated"
                             | "non_exhaustive"
                             | "automatically_derived"
@@ -622,7 +624,8 @@ impl CallMatcher<'_> {
     }
 }
 
-fn gated_off(db: &dyn SourceDatabase, item: AttrDefId, options: &CfgOptions) -> bool {
+/// Whether the item or an ancestor is disabled under these cfg options.
+pub fn gated_off(db: &dyn SourceDatabase, item: AttrDefId, options: &CfgOptions) -> bool {
     let disabled = |syntax: SyntaxNode| {
         syntax.ancestors().filter_map(ast::AnyHasAttrs::cast).any(|owner| {
             let mut test_attr = false;
@@ -1130,6 +1133,39 @@ fn nested() {}
         assert_eq!(index.function_bodies.test_only, 3);
         assert!(index.unmatched.is_empty());
         assert_eq!(index.twins.len(), 1);
+    }
+
+    #[test]
+    fn tls_attribute_is_known_but_cfg_attr_is_observed() {
+        let (db, normal, test) = pair(
+            r#"
+#[thread_local] static STATE: u8 = 0;
+#[cfg_attr(test, thread_local)] static SWITCH: u8 = 0;
+"#,
+        );
+        let index = twin_index(&db, normal, test);
+        assert_eq!(index.twins.len(), 2);
+        assert_eq!(index.unknown, 0);
+        assert_eq!(index.cfg_differing, 1);
+    }
+
+    #[test]
+    fn private_macro_definitions_have_ancestor_gates() {
+        let (db, normal, test) = pair(
+            r#"
+macro_rules! common { () => { () } }
+#[cfg(test)] mod tests {
+    macro_rules! private { () => { () } }
+}
+"#,
+        );
+        let definitions = &crate_items(&db, test).definitions;
+        assert_eq!(definitions.len(), 2);
+        let disabled = definitions
+            .values()
+            .filter(|&&item| gated_off(&db, item, normal.cfg_options(&db)))
+            .count();
+        assert_eq!(disabled, 1);
     }
 
     #[test]
