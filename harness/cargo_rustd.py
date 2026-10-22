@@ -1074,6 +1074,8 @@ fn integration() {
         _, status = side.cargo("status")
         workers = re.findall(r"worker: pid (\d+)", status.stdout)
         check("both checkouts share one worker", len(workers) == 1 and states == ["ready", "ready"], f"workers {workers}, states {states}")
+        for manifest in pathlib.Path(side.env["RUSTD_HOME"]).glob("spares/*/package/Cargo.toml"):
+            rewrite(str(manifest), 'version = "0.0.0"', 'version = "0.0.1"')
         for label in ("warm", "edited"):
             if label == "edited":
                 rewrite(os.path.join(ws, "src/lib.rs"), "40 + 2", "41 + 2")

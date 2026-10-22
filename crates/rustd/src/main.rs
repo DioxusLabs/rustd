@@ -4884,6 +4884,7 @@ impl Held {
         }
         self.checkouts.cargo_config = cargo_config.clone();
         self.checkouts.selection = selection.clone();
+        self.checkouts.inputs = inputs::Inputs::default();
         if let Err(why) = self.checkouts.add(projects, &mut self.db, &mut self.vfs) {
             eprintln!("spare: not used: {why:#}");
             return None;
