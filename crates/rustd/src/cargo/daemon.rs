@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Arc, Mutex, MutexGuard, PoisonError,
+        Arc, Condvar, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicUsize, Ordering::Relaxed},
     },
     time::{Duration, Instant, SystemTime},
@@ -128,12 +128,12 @@ pub(crate) struct WorkerStatus {
     pub(crate) checkouts: Vec<(PathBuf, String)>,
 }
 
-/// What a worker is loaded with. Two builds with the same one share a worker.
+/// The repository and build environment shared by a worker's roots.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct WorkerConfig {
     /// What the checkouts of one repository have in common: the directory of its `.git`.
     pub(crate) repository: PathBuf,
-    /// The directory of the package being built, from the root of the checkout.
+    /// The first package root loaded, from the root of the checkout.
     pub(crate) project: PathBuf,
     pub(crate) cfg_test: bool,
     /// Which build the worker stands in for, as the daemon's own plan of it has it.
@@ -144,8 +144,61 @@ pub(crate) struct WorkerConfig {
 
 impl WorkerConfig {
     pub(crate) fn id(&self) -> String {
-        let text = serde_json::to_vec(self).unwrap_or_default();
+        let text = serde_json::to_vec(&(&self.repository, &self.env)).unwrap_or_default();
         Sha256::digest(text).iter().take(16).map(|it| format!("{it:02x}")).collect()
+    }
+
+    fn same_root(&self, other: &Self) -> bool {
+        self.project == other.project
+            && self.cfg_test == other.cfg_test
+            && self.selection == other.selection
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> WorkerConfig {
+        WorkerConfig {
+            repository: PathBuf::from("/repo"),
+            project: PathBuf::from("a"),
+            cfg_test: false,
+            selection: crate::plan::Selection::default(),
+            env: BTreeMap::from([("RUSTFLAGS".to_owned(), "-Copt-level=2".to_owned())]),
+        }
+    }
+
+    #[test]
+    fn id_is_repository_and_build_environment() {
+        let original = config();
+        let mut another_root = original.clone();
+        another_root.project = PathBuf::from("b");
+        another_root.cfg_test = true;
+        another_root.selection.packages.push("b".to_owned());
+        assert_eq!(original.id(), another_root.id());
+
+        another_root.repository = PathBuf::from("/other-repo");
+        assert_ne!(original.id(), another_root.id());
+        another_root.repository = original.repository.clone();
+        another_root.env.insert("RUSTFLAGS".to_owned(), "-Copt-level=3".to_owned());
+        assert_ne!(original.id(), another_root.id());
+    }
+
+    #[test]
+    fn roots_match_only_with_the_same_project_test_mode_and_selection() {
+        let original = config();
+        let mut other = original.clone();
+        assert!(original.same_root(&other));
+
+        other.project = PathBuf::from("b");
+        assert!(!original.same_root(&other));
+        other = original.clone();
+        other.cfg_test = true;
+        assert!(!original.same_root(&other));
+        other = original.clone();
+        other.selection.packages.push("b".to_owned());
+        assert!(!original.same_root(&other));
     }
 }
 
@@ -219,8 +272,10 @@ impl Checkout {
         // Each with a comma after it: the program is of these crates and no others.
         let crates: String = plan.crates.iter().map(|it| named(it) + ",").collect();
         let mut line = format!(
-            "{verb}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{verb}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.project().display(),
+            self.config.cfg_test,
+            serde_json::to_string(&self.config.selection).unwrap_or_default(),
             crates,
             plan.object.display(),
             plan.patch.display(),
@@ -271,13 +326,19 @@ struct Worker {
     env: ide_db::base_db::Env,
     child: Mutex<Child>,
     checkouts: Mutex<FxHashMap<String, Loaded>>,
+    active: Mutex<usize>,
+    idle: Condvar,
     asked: Mutex<Instant>,
 }
 
 impl Worker {
     /// Starts a worker on the first program of `checkout`, with its files in `dir`.
     /// `spare` is a process that waits to be told a build, and is told this one.
-    fn start(checkout: &Checkout, dir: PathBuf, spare: Option<Spare>) -> anyhow::Result<Worker> {
+    fn start(
+        checkout: &Checkout,
+        dir: PathBuf,
+        spare: Option<(Spare, WorkerConfig)>,
+    ) -> anyhow::Result<Worker> {
         let first = checkout.programs.first().context("a checkout without programs")?;
         private_dir(&dir)?;
         let (socket, mut log) = (dir.join("sock"), dir.join("log"));
@@ -314,7 +375,9 @@ impl Worker {
             env.set(name, value);
         }
         env.set(ENDS_WITH_INPUT, "1");
-        let told = spare.and_then(|it| it.told(&args, &told_env, &checkout.root, false));
+        let told = spare.and_then(|(it, told_config)| {
+            it.told(&told_config, &args, &told_env, &checkout.root, false)
+        });
         let child = match told {
             Some(spare) => {
                 log = spare.log;
@@ -347,8 +410,59 @@ impl Worker {
             env,
             child: Mutex::new(child),
             checkouts: Mutex::new(FxHashMap::from_iter([(checkout.key.clone(), loading)])),
+            active: Mutex::new(0),
+            idle: Condvar::new(),
             asked: Mutex::new(Instant::now()),
         })
+    }
+
+    /// Promotes an ahead worker without changing the root it loaded.
+    fn start_ahead(mut ahead: AheadSpare, dir: PathBuf) -> anyhow::Result<Worker> {
+        if let Err(why) = private_dir(&dir) {
+            ahead.spare.stop();
+            return Err(why.into());
+        }
+        let (socket, spare) = (dir.join("sock"), ahead.spare);
+        let _ = std::fs::remove_file(&socket);
+        let mut args = ahead.ahead.config.args(&ahead.ahead.root, &ahead.ahead.crates);
+        args.extend(["--out".into(), "none".into(), "--socket".into(), socket.clone().into()]);
+        let told = spare
+            .told(&ahead.ahead.config, &args, &ahead.ahead.config.env, &ahead.ahead.root, false)
+            .context("the ahead worker ended before it could be promoted")?;
+        let mut env = crate::process::own();
+        for (name, value) in &ahead.ahead.config.env {
+            env.set(name, value);
+        }
+        env.set(ENDS_WITH_INPUT, "1");
+        Ok(Worker {
+            project: ahead.ahead.root.join(&ahead.ahead.config.project),
+            socket,
+            log: told.log,
+            env,
+            child: Mutex::new(told.child),
+            checkouts: Mutex::new(FxHashMap::default()),
+            active: Mutex::new(0),
+            idle: Condvar::new(),
+            asked: Mutex::new(Instant::now()),
+        })
+    }
+
+    fn activity(self: &Arc<Self>) -> WorkerActivity {
+        *lock(&self.active) += 1;
+        WorkerActivity { worker: self.clone() }
+    }
+
+    fn over_budget(&self) -> Option<(u64, u64)> {
+        let rss = crate::memory::resident_bytes(lock(&self.child).id())?;
+        let budget = crate::memory::worker_budget()?;
+        (rss > budget).then_some((rss, budget))
+    }
+
+    fn wait_idle(&self) {
+        let mut active = lock(&self.active);
+        while *active != 0 {
+            active = self.idle.wait(active).unwrap_or_else(PoisonError::into_inner);
+        }
     }
 
     /// Whether the process has ended, and how.
@@ -369,6 +483,7 @@ impl Worker {
     }
 
     fn stop(&self) {
+        self.wait_idle();
         let mut child = lock(&self.child);
         // One that has exited already has nothing to kill.
         let _ = child.kill();
@@ -490,9 +605,20 @@ impl Worker {
         }
     }
 
-    /// Whether it is loading a checkout.
-    fn loading(&self) -> bool {
-        lock(&self.checkouts).values().any(|it| matches!(it.warmth, Warmth::Loading(_)))
+    fn checkout_loading(&self, checkout: &Checkout) -> bool {
+        lock(&self.checkouts).get(&checkout.key).is_some_and(|it| {
+            it.generation == checkout.generation && matches!(it.warmth, Warmth::Loading(_))
+        })
+    }
+
+    fn warmth(&self, checkout: &Checkout) -> Warmth {
+        match lock(&self.checkouts).get(&checkout.key) {
+            Some(loaded) if loaded.generation == checkout.generation => loaded.warmth.clone(),
+            _ => Warmth::Failed(
+                "the daemon has not loaded this build of the workspace".to_owned(),
+                SystemTime::now(),
+            ),
+        }
     }
 
     fn status(&self) -> WorkerStatus {
@@ -509,12 +635,27 @@ impl Worker {
     }
 }
 
+struct WorkerActivity {
+    worker: Arc<Worker>,
+}
+
+impl Drop for WorkerActivity {
+    fn drop(&mut self) {
+        let mut active = lock(&self.worker.active);
+        *active -= 1;
+        if *active == 0 {
+            self.worker.idle.notify_all();
+        }
+    }
+}
+
 /// A worker started before a build asked for one. It has the library of the toolchain
 /// loaded and its names resolved, which the first build of a workspace then does not wait
 /// for, and reads the build it is the worker of from its standard input.
 struct Spare {
     child: Child,
     log: PathBuf,
+    told_config: Option<WorkerConfig>,
 }
 
 impl Spare {
@@ -532,7 +673,7 @@ impl Spare {
             private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)?;
         command.stdin(Stdio::piped()).stdout(output.try_clone()?).stderr(output);
         let child = command.spawn().context("starting a spare worker")?;
-        Ok(Spare { child, log })
+        Ok(Spare { child, log, told_config: None })
     }
 
     /// Tells it to be the worker `args` start for `checkout`. `None` when it can't be
@@ -541,11 +682,17 @@ impl Spare {
     /// is told them whole afterwards.
     fn told(
         mut self,
+        config: &WorkerConfig,
         args: &[OsString],
         env: &BTreeMap<String, String>,
         cwd: &Path,
         ahead: bool,
     ) -> Option<Spare> {
+        if self.told_config.as_ref().is_some_and(|old| !old.same_root(config)) {
+            eprintln!("spare: not used: it was already told another root");
+            self.stop();
+            return None;
+        }
         let told = || {
             let args: Option<Vec<String>> =
                 args.iter().map(|it| it.to_str().map(str::to_owned)).collect();
@@ -564,6 +711,7 @@ impl Spare {
             self.stop();
             return None;
         }
+        self.told_config = Some(config.clone());
         Some(self)
     }
 
@@ -584,6 +732,11 @@ impl Spare {
     }
 }
 
+struct AheadSpare {
+    ahead: Ahead,
+    spare: Spare,
+}
+
 /// The daemon: its version, its workers, and when it was last asked.
 struct Daemon {
     version: String,
@@ -593,7 +746,7 @@ struct Daemon {
     /// The worker the next workspace is loaded by. `RUSTD_SPARE=0` has none.
     spare: Mutex<Option<Spare>>,
     /// The workers told a build ahead of cargo's, by [`WorkerConfig::id`].
-    ahead: Mutex<FxHashMap<String, Spare>>,
+    ahead: Mutex<FxHashMap<String, AheadSpare>>,
     /// How many spare workers were started: each has a directory of its own.
     spares: AtomicUsize,
     asked: Mutex<Instant>,
@@ -726,7 +879,7 @@ impl Daemon {
             Request::Sync(checkout) => self.sync(&checkout, "sync"),
             Request::Lint(checkout) => self.sync(&checkout, "lint"),
             Request::Warm(checkout) => match self.warm(checkout) {
-                Ok(()) => Reply::Warming,
+                Ok(_activity) => Reply::Warming,
                 Err(why) => Reply::Cold { reason: format!("{why:#}") },
             },
             Request::Ahead(ahead) => {
@@ -734,19 +887,19 @@ impl Daemon {
                 Reply::Warming
             }
             Request::Said { id, line } => {
-                if let Some(spare) = lock(&self.ahead).get_mut(&id) {
-                    spare.said(line);
+                if let Some(ahead) = lock(&self.ahead).get_mut(&id) {
+                    ahead.spare.said(line);
                 }
                 Reply::Warming
             }
             Request::Forget(id) => {
-                if let Some(mut spare) = lock(&self.ahead).remove(&id) {
-                    spare.stop();
+                if let Some(mut ahead) = lock(&self.ahead).remove(&id) {
+                    ahead.spare.stop();
                 }
                 Reply::Warming
             }
             Request::Build(checkout) => match self.warm(checkout.clone()) {
-                Ok(()) => self.built(&checkout),
+                Ok(activity) => self.built(&checkout, activity),
                 Err(why) => Reply::Cold { reason: format!("{why:#}") },
             },
             Request::Results(object) => Reply::Results(lock(&self.results).get(&object).cloned()),
@@ -765,18 +918,18 @@ impl Daemon {
     }
 
     fn sync(&self, checkout: &Checkout, verb: &str) -> Reply {
-        let worker = lock(&self.workers).get(&checkout.config.id()).cloned();
-        let Some(worker) = worker else {
-            return Reply::Cold { reason: "the daemon has not loaded this workspace".to_owned() };
+        let (worker, _activity) = {
+            let workers = lock(&self.workers);
+            let Some(worker) = workers.get(&checkout.config.id()).cloned() else {
+                return Reply::Cold {
+                    reason: "the daemon has not loaded this workspace".to_owned(),
+                };
+            };
+            let activity = worker.activity();
+            (worker, activity)
         };
         *lock(&worker.asked) = Instant::now();
-        let warmth = match lock(&worker.checkouts).get(&checkout.key) {
-            Some(loaded) if loaded.generation == checkout.generation => loaded.warmth.clone(),
-            _ => Warmth::Failed(
-                "the daemon has not loaded this build of the workspace".to_owned(),
-                SystemTime::now(),
-            ),
-        };
+        let warmth = worker.warmth(checkout);
         match warmth {
             Warmth::Ready => worker.sync(checkout, verb),
             Warmth::Loading(since) => Reply::Cold {
@@ -792,26 +945,26 @@ impl Daemon {
     /// What the worker that loads `checkout` has to say of its programs once it has. Asked
     /// once the load is over: a load that ends between the two would leave a "still
     /// loading" for the answer.
-    fn built(&self, checkout: &Checkout) -> Reply {
-        while self.loads(checkout) {
+    fn built(&self, checkout: &Checkout, activity: WorkerActivity) -> Reply {
+        let worker = activity.worker.clone();
+        while worker.checkout_loading(checkout) {
             std::thread::sleep(POLL);
         }
-        self.sync(checkout, "sync")
+        *lock(&worker.asked) = Instant::now();
+        match worker.warmth(checkout) {
+            Warmth::Ready => worker.sync(checkout, "sync"),
+            Warmth::Loading(since) => Reply::Cold {
+                reason: format!(
+                    "the daemon is still loading the workspace ({:.0?} so far)",
+                    since.elapsed()
+                ),
+            },
+            Warmth::Failed(reason, _) => Reply::Cold { reason },
+        }
     }
 
-    /// Whether a worker is loading this build of `checkout`.
-    fn loads(&self, checkout: &Checkout) -> bool {
-        let worker = lock(&self.workers).get(&checkout.config.id()).cloned();
-        worker.is_some_and(|worker| {
-            lock(&worker.checkouts).get(&checkout.key).is_some_and(|it| {
-                it.generation == checkout.generation && matches!(it.warmth, Warmth::Loading(_))
-            })
-        })
-    }
-
-    /// Has a worker load `checkout`: the one of its configuration when that has not loaded
-    /// another build of the same checkout, and a new one otherwise.
-    fn warm(&self, checkout: Checkout) -> anyhow::Result<()> {
+    /// Has a worker load `checkout`, adding a root to a live worker when needed.
+    fn warm(&self, checkout: Checkout) -> anyhow::Result<WorkerActivity> {
         let id = checkout.config.id();
         let mut workers = lock(&self.workers);
         // What a worker could not load once it can't load again, until cargo builds anew or
@@ -835,39 +988,117 @@ impl Daemon {
         }
         let running = workers.get(&id).filter(|it| it.ended().is_none()).cloned();
         if let Some(worker) = &running {
-            let mut checkouts = lock(&worker.checkouts);
-            match checkouts.get(&checkout.key) {
-                Some(loaded) if loaded.generation == checkout.generation => return Ok(()),
+            let generation = lock(&worker.checkouts).get(&checkout.key).map(|it| it.generation);
+            match generation {
+                Some(generation) if generation == checkout.generation => {
+                    return Ok(worker.activity());
+                }
                 // What it linked against is not what cargo has now.
                 Some(_) => {}
                 None => {
-                    let loading = Loaded {
-                        generation: checkout.generation,
-                        root: checkout.root.clone(),
-                        warmth: Warmth::Loading(Instant::now()),
-                    };
-                    checkouts.insert(checkout.key.clone(), loading);
-                    let worker = worker.clone();
-                    std::thread::spawn(move || worker.warm(&checkout, false));
-                    return Ok(());
+                    if let Some((rss, budget)) = worker.over_budget() {
+                        eprintln!(
+                            "worker {id}: {rss} over budget {budget}; starting fresh for {}",
+                            checkout.project().display()
+                        );
+                        if let Some(old) = workers.remove(&id) {
+                            old.stop();
+                        }
+                    } else {
+                        let loading = Loaded {
+                            generation: checkout.generation,
+                            root: checkout.root.clone(),
+                            warmth: Warmth::Loading(Instant::now()),
+                        };
+                        lock(&worker.checkouts).insert(checkout.key.clone(), loading);
+                        let worker = worker.clone();
+                        let warm_activity = worker.activity();
+                        let request_activity = worker.activity();
+                        std::thread::spawn(move || {
+                            let _activity = warm_activity;
+                            worker.warm(&checkout, false);
+                        });
+                        return Ok(request_activity);
+                    }
                 }
             }
         }
         if let Some(old) = workers.remove(&id) {
             old.stop();
         }
+        let dir = self.home.join("workers").join(&id);
         let ahead = lock(&self.ahead).remove(&id);
-        let spare = ahead.or_else(|| lock(&self.spare).take());
-        let worker =
-            Arc::new(Worker::start(&checkout, self.home.join("workers").join(&id), spare)?);
+        let worker = match ahead {
+            Some(ahead) if !ahead.ahead.config.same_root(&checkout.config) => {
+                let ahead_config = ahead.ahead.config.clone();
+                let worker = Arc::new(Worker::start_ahead(ahead, dir.clone())?);
+                if let Some((rss, budget)) = worker.over_budget() {
+                    eprintln!(
+                        "worker {id}: {rss} over budget {budget}; starting fresh for {}",
+                        checkout.project().display()
+                    );
+                    let _ = worker.connected();
+                    worker.stop();
+                    Arc::new(Worker::start(
+                        &checkout,
+                        dir,
+                        lock(&self.spare).take().map(|it| (it, checkout.config.clone())),
+                    )?)
+                } else {
+                    eprintln!(
+                        "ahead worker {id}: keeping root {:?} (cfg_test={}, selection={:?}) for incoming {:?} (cfg_test={}, selection={:?})",
+                        ahead_config.project,
+                        ahead_config.cfg_test,
+                        ahead_config.selection,
+                        checkout.config.project,
+                        checkout.config.cfg_test,
+                        checkout.config.selection,
+                    );
+                    let loading = Loaded {
+                        generation: checkout.generation,
+                        root: checkout.root.clone(),
+                        warmth: Warmth::Loading(Instant::now()),
+                    };
+                    lock(&worker.checkouts).insert(checkout.key.clone(), loading);
+                    workers.insert(id.clone(), worker.clone());
+                    let warm_activity = worker.activity();
+                    let request_activity = worker.activity();
+                    std::thread::spawn(move || {
+                        let _activity = warm_activity;
+                        worker.warm(&checkout, false);
+                    });
+                    return Ok(request_activity);
+                }
+            }
+            Some(ahead) => {
+                Arc::new(Worker::start(&checkout, dir, Some((ahead.spare, ahead.ahead.config)))?)
+            }
+            None => {
+                // A plain spare starts this root, so an obsolete ahead for this id cannot
+                // be left waiting for cargo lines.
+                if let Some(mut ahead) = lock(&self.ahead).remove(&id) {
+                    ahead.spare.stop();
+                }
+                Arc::new(Worker::start(
+                    &checkout,
+                    dir,
+                    lock(&self.spare).take().map(|it| (it, checkout.config.clone())),
+                )?)
+            }
+        };
         eprintln!(
             "worker {id} of pid {} for {}",
             lock(&worker.child).id(),
             worker.project.display()
         );
         workers.insert(id, worker.clone());
-        std::thread::spawn(move || worker.warm(&checkout, true));
-        Ok(())
+        let warm_activity = worker.activity();
+        let request_activity = worker.activity();
+        std::thread::spawn(move || {
+            let _activity = warm_activity;
+            worker.warm(&checkout, true);
+        });
+        Ok(request_activity)
     }
 
     /// Stops the workers nobody has asked for the idle time, and the daemon when nobody has
@@ -876,13 +1107,13 @@ impl Daemon {
         loop {
             std::thread::sleep(self.idle.map_or(TICK, |idle| idle.min(TICK)));
             // The next spare starts when the worker that was one has loaded its workspace.
-            let loading = lock(&self.workers).values().any(|it| it.loading());
+            let loading = lock(&self.workers).values().any(|it| it.loads());
             if !loading && lock(&self.ahead).is_empty() {
                 self.spare();
             }
             let Some(idle) = self.idle else { continue };
             // Loading is what the last build asked for: the idle time starts after it.
-            for worker in lock(&self.workers).values().filter(|it| it.loading()) {
+            for worker in lock(&self.workers).values().filter(|it| it.loads()) {
                 *lock(&worker.asked) = Instant::now();
                 *lock(&self.asked) = Instant::now();
             }
@@ -907,13 +1138,27 @@ impl Daemon {
         if lock(&self.workers).contains_key(&id) {
             return;
         }
-        let Some(spare) = lock(&self.spare).take() else { return };
+        if lock(&self.ahead).contains_key(&id) {
+            return;
+        }
+        let Some(mut spare) = lock(&self.spare).take() else { return };
+        let dir = self.home.join("workers").join(&id);
+        if let Err(why) = private_dir(&dir) {
+            eprintln!("ahead worker directory: {why:#}");
+            spare.stop();
+            return;
+        }
+        let socket = dir.join("sock");
+        let _ = std::fs::remove_file(&socket);
         let mut args = ahead.config.args(&ahead.root, &ahead.crates);
-        args.extend(["--out".into(), "none".into()]);
-        if let Some(spare) = spare.told(&args, &ahead.config.env, &ahead.root, true)
-            && let Some(mut other) = lock(&self.ahead).insert(id, spare)
+        args.extend(["--out".into(), "none".into(), "--socket".into(), socket.into()]);
+        if let Some(spare) = spare.told(&ahead.config, &args, &ahead.config.env, &ahead.root, true)
         {
-            other.stop();
+            eprintln!(
+                "ahead worker {id}: project {:?} cfg_test={} selection={:?}",
+                ahead.config.project, ahead.config.cfg_test, ahead.config.selection
+            );
+            lock(&self.ahead).insert(id, AheadSpare { ahead, spare });
         }
     }
 
@@ -941,8 +1186,8 @@ impl Daemon {
         if let Some(spare) = lock(&self.spare).as_mut() {
             spare.stop();
         }
-        for spare in lock(&self.ahead).values_mut() {
-            spare.stop();
+        for ahead in lock(&self.ahead).values_mut() {
+            ahead.spare.stop();
         }
         for worker in lock(&self.workers).values() {
             worker.stop();

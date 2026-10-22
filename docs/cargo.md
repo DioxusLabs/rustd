@@ -225,11 +225,12 @@ started it. To change one, run `cargo rustd stop` first.
 |---|---|---|
 | `RUSTD_HOME` | the daemon's directory (also read by every client) | see above |
 | `RUSTD_IDLE_SECS` | seconds without a request before the daemon exits; 0 is never | 1800 |
-| `RUSTD_CACHE` | directory of the disk store; without it nothing is kept on disk | not set |
+| `RUSTD_WORKER_BUDGET` | worker RSS limit before a new root joins, in bytes or `G`-suffixed GiB; skipped where RSS is unavailable | half of physical RAM |
+| `RUSTD_CACHE` | directory of the disk store; `off` disables it | default cache directory |
 | `RUSTD_REMOTE` and the other store variables | see [cache.md](cache.md) | not set |
 
-The disk store is off unless `RUSTD_CACHE` is set. That is easy to miss: a daemon started by
-a shell without the variable keeps no store, whatever later shells have set.
+The disk store is on by default: `$XDG_CACHE_HOME/rustd/store`, else
+`~/.cache/rustd/store`. `RUSTD_CACHE=<dir>` moves it; `RUSTD_CACHE=off` disables it.
 
 ## Known problems
 

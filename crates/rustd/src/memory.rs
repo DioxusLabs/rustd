@@ -13,6 +13,8 @@ use std::{
 
 use ide_db::{RootDatabase, base_db::salsa};
 
+const GIB: u64 = 1024 * 1024 * 1024;
+
 /// The directory `RUSTD_MEMORY` names, when it is set.
 pub(crate) fn report_dir() -> Option<PathBuf> {
     std::env::var_os("RUSTD_MEMORY").map(PathBuf::from)
@@ -23,6 +25,35 @@ pub(crate) fn resident() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     let line = status.lines().find_map(|it| it.strip_prefix("VmRSS:"))?;
     Some(line.trim().trim_end_matches("kB").trim().parse::<u64>().ok()? / 1024)
+}
+
+/// Bytes of memory a worker has resident.
+pub(crate) fn resident_bytes(pid: u32) -> Option<u64> {
+    proc_bytes(&PathBuf::from(format!("/proc/{pid}/status")), "VmRSS:")
+}
+
+/// The limit before another root joins a worker, in bytes.
+pub(crate) fn worker_budget() -> Option<u64> {
+    std::env::var("RUSTD_WORKER_BUDGET")
+        .ok()
+        .and_then(|it| parse_budget(&it))
+        .or_else(|| proc_bytes(Path::new("/proc/meminfo"), "MemTotal:").map(|it| it / 2))
+}
+
+fn proc_bytes(path: &Path, key: &str) -> Option<u64> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let line = contents.lines().find_map(|it| it.strip_prefix(key))?;
+    let mut parts = line.split_whitespace();
+    let value = parts.next()?.parse::<u64>().ok()?;
+    (parts.next()? == "kB").then(|| value.checked_mul(1024)).flatten()
+}
+
+fn parse_budget(value: &str) -> Option<u64> {
+    if let Some(gibibytes) = value.strip_suffix('G') {
+        gibibytes.parse::<u64>().ok()?.checked_mul(GIB)
+    } else {
+        value.parse().ok()
+    }
 }
 
 /// Bytes allocated and not freed, when the allocator counts them.
@@ -96,4 +127,23 @@ fn write_heap_profile(path: &Path) -> anyhow::Result<()> {
 #[cfg(not(feature = "heap-profile"))]
 fn write_heap_profile(_: &Path) -> anyhow::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_worker_budget_bytes_and_gibibytes() {
+        assert_eq!(parse_budget("123"), Some(123));
+        assert_eq!(parse_budget("2G"), Some(2 * GIB));
+        assert_eq!(parse_budget("0"), Some(0));
+    }
+
+    #[test]
+    fn rejects_invalid_worker_budgets() {
+        assert_eq!(parse_budget(""), None);
+        assert_eq!(parse_budget("2GB"), None);
+        assert_eq!(parse_budget("18446744073709551615G"), None);
+    }
 }

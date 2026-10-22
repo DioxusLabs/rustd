@@ -622,7 +622,7 @@ impl Resolver<'_> {
             }
             return Some(path);
         }
-        let sema = hir::Semantics::new(self.db);
+        let sema = hir::Semantics::new_for(self.db, module.krate(self.db));
         let source = module.definition_source(self.db);
         let hir::ModuleSource::BlockExpr(block) = source.value else { return None };
         let range = block.syntax().text_range();
@@ -966,7 +966,7 @@ impl SymbolResolver for Resolver<'_> {
 
     fn declared_in(&self, adt: hir_def::AdtId) -> Option<(DefWithBodyId, u32)> {
         let adt = hir::Adt::from(adt);
-        let sema = hir::Semantics::new(self.db);
+        let sema = hir::Semantics::new_for(self.db, adt.module(self.db).krate(self.db));
         let source = sema.source(adt)?;
         sema.parse_or_expand(source.file_id);
         let mut around = sema.ancestors_with_macros(source.value.syntax().clone()).skip(1);
@@ -1027,10 +1027,10 @@ impl SymbolResolver for Resolver<'_> {
         let owner = DefWithBodyId::FunctionId(func);
         let (_, source_map) = Body::with_source_map(self.db, owner);
         let source = source_map.expr_syntax(closure.expr).ok()?;
-        let sema = hir::Semantics::new(self.db);
+        let module = ModuleDef::from(ModuleDefId::FunctionId(func)).module(self.db)?;
+        let sema = hir::Semantics::new_for(self.db, module.krate(self.db));
         let root = sema.parse_or_expand(source.file_id);
         let source = source.value.to_node(&root).left()?;
-        let module = ModuleDef::from(ModuleDefId::FunctionId(func)).module(self.db)?;
         let mut numbers = Vec::new();
         let mut reaches_owner = false;
         for node in sema.ancestors_with_macros(source.syntax().clone()) {
@@ -1130,7 +1130,7 @@ impl Resolver<'_> {
         let module = it.module(self.db);
         let name = it.name(self.db);
         // A static in a body is named after the items around it, which only the syntax knows.
-        let sema = hir::Semantics::new(self.db);
+        let sema = hir::Semantics::new_for(self.db, module.krate(self.db));
         let source = sema.source(it)?;
         let mut names = vec![name.as_str().to_owned()];
         let mut closures = Vec::new();
@@ -1189,11 +1189,12 @@ impl Resolver<'_> {
             ast::Static::cast(node.clone())
                 .is_some_and(|it| it.name().is_some_and(|it| it.text() == name.as_str()))
         };
-        let place = place_in_definition(&sema, source.value.syntax(), &named)?.into();
+        let place = place_in_definition(&sema, source.value.syntax(), &named);
+        let place = place?.into();
         let symbol = paths
             .get_nested(&path, &closures, place, &around)
-            .or_else(|| paths.get_at(&path, place, &around))?;
-        Some((symbol.to_owned(), owner))
+            .or_else(|| paths.get_at(&path, place, &around));
+        Some((symbol?.to_owned(), owner))
     }
 }
 
@@ -1927,18 +1928,24 @@ fn load(
     let mut checkouts = Checkouts {
         compared: Default::default(),
         roots: Vec::new(),
+        cfg_tests: Vec::new(),
+        selections: Vec::new(),
+        root_configs: Vec::new(),
         splits: Vec::new(),
         loaded: load_cargo::Loaded::default(),
         cargo_config: cargo_config.clone(),
         load_config,
-        selection,
         inputs: inputs::Inputs::default(),
         debug: Vec::new(),
         beside,
     };
     let mut db = RootDatabase::new(None);
     let mut vfs = vfs::Vfs::default();
-    checkouts.add(projects, &mut db, &mut vfs)?;
+    let roots: Vec<_> = projects
+        .iter()
+        .map(|project| (*project, cargo_config.set_test, selection.clone()))
+        .collect();
+    checkouts.add(&roots, &mut db, &mut vfs)?;
     Ok((db, vfs, checkouts))
 }
 
@@ -1952,6 +1959,9 @@ struct Checkouts {
     compared: Compared,
     /// The project a build names, and the root of the workspace it is in.
     roots: Vec<(PathBuf, PathBuf)>,
+    cfg_tests: Vec<bool>,
+    selections: Vec<plan::Selection>,
+    root_configs: Vec<CargoConfig>,
     /// For each of `roots`, what it shares with another when it is not loaded in full.
     splits: Vec<Option<Split>>,
     loaded: load_cargo::Loaded,
@@ -1959,8 +1969,6 @@ struct Checkouts {
     load_config: LoadCargoConfig,
     /// What the checkouts loaded in full were loaded from besides their source.
     inputs: inputs::Inputs,
-    /// Which build of each project is loaded.
-    selection: plan::Selection,
     /// For each of `roots`, what its plan says of the program as a whole.
     debug: Vec<plan::Whole>,
     /// Where cargo's own build says what the scripts and proc macros of the next checkout
@@ -1969,16 +1977,39 @@ struct Checkouts {
 }
 
 impl Checkouts {
-    fn root_of(&self, project: &Path) -> anyhow::Result<PathBuf> {
+    fn at(
+        &self,
+        project: &Path,
+        cfg_test: bool,
+        selection: &plan::Selection,
+    ) -> anyhow::Result<usize> {
         let project = dunce::canonicalize(project)?;
-        let root = self.roots.iter().find(|(it, _)| *it == project).map(|(_, root)| root.clone());
-        root.with_context(|| format!("{} is not a project the daemon loaded", project.display()))
+        self.roots
+            .iter()
+            .enumerate()
+            .find_map(|(at, (it, _))| {
+                (*it == project
+                    && self.cfg_tests[at] == cfg_test
+                    && self.selections[at] == *selection)
+                    .then_some(at)
+            })
+            .with_context(|| {
+                format!(
+                    "{} ({cfg_test}, {selection:?}) is not a project the daemon loaded",
+                    project.display()
+                )
+            })
     }
 
     /// The checkout of `project`: its root, what it shares and its crates.
-    fn parts(&self, project: &Path) -> anyhow::Result<Parts> {
-        let root = self.root_of(project)?;
-        let at = self.roots.iter().position(|(_, it)| *it == root).expect("it has a root");
+    fn parts(
+        &self,
+        project: &Path,
+        cfg_test: bool,
+        selection: &plan::Selection,
+    ) -> anyhow::Result<Parts> {
+        let at = self.at(project, cfg_test, selection)?;
+        let root = self.roots[at].1.clone();
         let base = self.splits[at].as_ref().map(|it| it.base.clone());
         let members = Arc::new(self.loaded.crates(at).iter().copied().collect());
         // An override for measuring one against the other.
@@ -1993,18 +2024,31 @@ impl Checkouts {
     }
 
     /// Whether the program of the checkout `project` is of is one rustc links from bitcode.
-    fn lto(&self, project: &Path) -> anyhow::Result<bool> {
-        let root = self.root_of(project)?;
-        Ok(self.roots.iter().zip(&self.debug).any(|((_, it), whole)| *it == root && whole.lto))
+    fn lto(
+        &self,
+        project: &Path,
+        cfg_test: bool,
+        selection: &plan::Selection,
+    ) -> anyhow::Result<bool> {
+        let at = self.at(project, cfg_test, selection)?;
+        Ok(self.debug[at].lto)
     }
 
     /// The loaded checkout that `project` is a checkout of the same repository as, and the
     /// root of its own. `None` when the two are not built alike.
-    fn alike(&self, project: &Path) -> Option<(usize, PathBuf)> {
+    fn alike(
+        &self,
+        project: &Path,
+        cfg_test: bool,
+        selection: &plan::Selection,
+    ) -> Option<(usize, PathBuf)> {
         let project = dunce::canonicalize(project).ok()?;
         // The path of a loaded file is UTF-8: one that is not is refused when it is loaded.
         project.to_str()?;
         (0..self.roots.len()).find_map(|at| {
+            if self.cfg_tests[at] != cfg_test || self.selections[at] != *selection {
+                return None;
+            }
             let (loaded, base) = &self.roots[at];
             if self.splits[at].is_some() {
                 return None;
@@ -2075,8 +2119,7 @@ impl Checkouts {
         let mut differences = Vec::new();
         for (at, split) in self.splits.iter().enumerate() {
             let Some(split) = split else { continue };
-            let base = self.roots.iter().position(|(_, it)| *it == split.base);
-            let base = base.context("a checkout shares with a loaded one")?;
+            let base = split.base_at;
             let own = self.differing(base, &self.roots[at].1);
             if own != split.own {
                 differences.push((at, base, own));
@@ -2097,7 +2140,7 @@ impl Checkouts {
             let over = self.roots[at].1.clone();
             eprintln!("split {}: its own are {own:?}", over.display());
             self.loaded.replace(at, self.split(base, &over, &own));
-            self.splits[at] = Some(Split { base: self.roots[base].1.clone(), own });
+            self.splits[at] = Some(Split { base_at: base, base: self.roots[base].1.clone(), own });
         }
         self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)
     }
@@ -2108,18 +2151,34 @@ impl Checkouts {
     fn view_of(
         &self,
         project: &Path,
+        cfg_test: bool,
+        selection: &plan::Selection,
         overlay: Overlay,
         quick: &dyn Fn(&Path, &Path) -> bool,
     ) -> Option<View> {
         let project = dunce::canonicalize(project).ok()?;
-        if let Some((_, root)) = self.roots.iter().find(|(it, _)| *it == project) {
+        if let Some(at) = self.roots.iter().enumerate().find_map(|(at, (it, _))| {
+            (*it == project && self.cfg_tests[at] == cfg_test && self.selections[at] == *selection)
+                .then_some(at)
+        }) {
+            let root = &self.roots[at].1;
             return Some(View { base: root.clone(), over: root.clone(), project });
         }
         if overlay == Overlay::Never {
             return None;
         }
         // One that shares packages with another has those where the other is.
-        let whole = self.roots.iter().zip(&self.splits).filter(|it| it.1.is_none()).map(|it| it.0);
+        let whole = self
+            .roots
+            .iter()
+            .zip(&self.splits)
+            .enumerate()
+            .filter(|(at, (_, split))| {
+                split.is_none()
+                    && self.cfg_tests[*at] == cfg_test
+                    && self.selections[*at] == *selection
+            })
+            .map(|(_, it)| it.0);
         whole.into_iter().find_map(|(loaded, base)| {
             let inside = loaded.strip_prefix(base).ok()?;
             let mut over = project.clone();
@@ -2136,8 +2195,13 @@ impl Checkouts {
     }
 
     /// The checkout that the one at `root` has packages of, when it has.
-    fn shares_with(&self, root: &Path) -> Option<&Path> {
-        let at = self.roots.iter().position(|it| it.1 == root)?;
+    fn shares_with(
+        &self,
+        project: &Path,
+        cfg_test: bool,
+        selection: &plan::Selection,
+    ) -> Option<&Path> {
+        let at = self.at(project, cfg_test, selection).ok()?;
         self.splits[at].as_ref().map(|it| &*it.base)
     }
 
@@ -2183,23 +2247,32 @@ impl Checkouts {
     /// Loads the checkouts of `projects` into `db`, next to those there are.
     fn add(
         &mut self,
-        projects: &[&Path],
+        projects: &[(&Path, bool, plan::Selection)],
         db: &mut RootDatabase,
         vfs: &mut vfs::Vfs,
     ) -> anyhow::Result<()> {
         let mut workspaces = Vec::new();
         let mut roots = Vec::new();
+        let (mut cfg_tests, mut selections, mut root_configs) =
+            (Vec::new(), Vec::new(), Vec::new());
         let (mut splits, mut debug) = (Vec::new(), Vec::new());
         // A checkout like a loaded one shares the packages they have alike, unless told not to.
         let share = std::env::var_os("RUSTD_SPLIT").is_none_or(|it| it != "0");
-        for project in projects {
-            if share && let Some((base, over)) = self.alike(project) {
+        for (project, cfg_test, selection) in projects {
+            if self.at(project, *cfg_test, selection).is_ok() {
+                continue;
+            }
+            let mut config = root_cargo_config(&self.cargo_config, *cfg_test, selection);
+            if share && let Some((base, over)) = self.alike(project, *cfg_test, selection) {
                 let own = self.differing(base, &over);
                 eprintln!("split {}: its own are {own:?}", over.display());
                 workspaces.push(self.split(base, &over, &own));
-                splits.push(Some(Split { base: self.roots[base].1.clone(), own }));
+                splits.push(Some(Split { base_at: base, base: self.roots[base].1.clone(), own }));
                 debug.push(self.debug[base]);
                 roots.push((dunce::canonicalize(project)?, over));
+                cfg_tests.push(*cfg_test);
+                selections.push(selection.clone());
+                root_configs.push(config);
                 continue;
             }
             splits.push(None);
@@ -2208,36 +2281,36 @@ impl Checkouts {
                 it.at = self.roots.len() + roots.len();
                 it
             });
-            let (workspace, told) = workspace_at(
-                project,
-                &self.cargo_config,
-                &self.load_config,
-                &self.selection,
-                beside,
-            )?;
+            let (workspace, told) =
+                workspace_at(project, &config, &self.load_config, selection, beside)?;
             debug.push(told);
             // The checkouts after the first run their build scripts where the first did. A
             // dependency is then told the same `OUT_DIR` in each, which it has to be to be one
             // crate for all.
             if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind
-                && !matches!(
-                    self.cargo_config.target_dir_config,
-                    TargetDirectoryConfig::Directory(_)
-                )
+                && !matches!(config.target_dir_config, TargetDirectoryConfig::Directory(_))
             {
                 let target: &paths::Utf8Path = cargo.target_directory().as_ref();
-                let scripts = self.cargo_config.target_dir_config.target_dir(Some(target));
-                self.cargo_config.target_dir_config = TargetDirectoryConfig::Directory(
+                let scripts = config.target_dir_config.target_dir(Some(target));
+                config.target_dir_config = TargetDirectoryConfig::Directory(
                     scripts.map_or_else(|| target.to_owned(), |it| it.into_owned()),
                 );
+                self.cargo_config.target_dir_config = config.target_dir_config.clone();
             }
             let root = PathBuf::from(workspace.workspace_root().to_string());
-            self.inputs.watch(&root, &workspace, &self.cargo_config);
-            roots.push((dunce::canonicalize(project)?, root));
+            let project = dunce::canonicalize(project)?;
+            self.inputs.watch(&project, &root, *cfg_test, selection, &workspace, &config);
+            roots.push((project, root));
+            cfg_tests.push(*cfg_test);
+            selections.push(selection.clone());
+            root_configs.push(config);
             workspaces.push(workspace);
         }
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
         self.roots.extend(roots);
+        self.cfg_tests.extend(cfg_tests);
+        self.selections.extend(selections);
+        self.root_configs.extend(root_configs);
         self.splits.extend(splits);
         self.debug.extend(debug);
         Ok(())
@@ -2248,28 +2321,39 @@ impl Checkouts {
     /// when its manifests, cargo's configuration or what its build scripts say changed, and
     /// when the build is of it and the process has other flags for rustc. One that shares
     /// packages with another is one when the build is of it and the two no longer build alike.
-    fn stale(&mut self, project: &Path, env: &ide_db::base_db::Env) -> anyhow::Result<Vec<usize>> {
+    fn stale(
+        &mut self,
+        project: &Path,
+        cfg_test: bool,
+        selection: &plan::Selection,
+        env: &ide_db::base_db::Env,
+    ) -> anyhow::Result<Vec<usize>> {
         let project = dunce::canonicalize(project).ok();
-        let asked = self.roots.iter().position(|(it, _)| Some(it) == project.as_ref());
+        let asked = self.roots.iter().enumerate().find_map(|(at, (it, _))| {
+            (Some(it) == project.as_ref()
+                && self.cfg_tests[at] == cfg_test
+                && self.selections[at] == *selection)
+                .then_some(at)
+        });
         // The checkout whose variables are those of the build: any, when it is not loaded.
         let built = match asked {
             Some(at) => Some(self.splits[at].as_ref().map_or(&self.roots[at].1, |it| &it.base)),
             None => None,
         };
-        let mut known: FxHashMap<&Path, bool> = FxHashMap::default();
         let mut stale = Vec::new();
-        for (at, (_, root)) in self.roots.iter().enumerate() {
+        for (at, (project, root)) in self.roots.iter().enumerate() {
             let changed = match &self.splits[at] {
                 Some(split) => asked == Some(at) && !self.builds_alike(&split.base, root),
-                None => match known.get(&**root) {
-                    Some(&changed) => changed,
-                    None => {
-                        let env = (asked.is_none() || built == Some(root)).then_some(env);
-                        let changed = self.inputs.stale(root, env)?;
-                        known.insert(root, changed);
-                        changed
-                    }
-                },
+                None => {
+                    let env = (asked.is_none() || built == Some(root)).then_some(env);
+                    self.inputs.stale(
+                        project,
+                        root,
+                        self.cfg_tests[at],
+                        &self.selections[at],
+                        env,
+                    )?
+                }
             };
             if changed {
                 stale.push(at);
@@ -2300,8 +2384,9 @@ impl Checkouts {
         pause_mid_reload();
         let mut failed = Ok(());
         for at in 0..self.roots.len() {
-            let Some(base) = self.splits[at].as_ref().map(|it| it.base.clone()) else { continue };
-            let Some(base) = stale.iter().copied().find(|&it| self.roots[it].1 == base) else {
+            let Some(base) =
+                self.splits[at].as_ref().map(|it| it.base_at).filter(|base| stale.contains(base))
+            else {
                 continue;
             };
             let over = self.roots[at].1.clone();
@@ -2316,7 +2401,7 @@ impl Checkouts {
             }
             let own = self.differing(base, &over);
             self.loaded.replace(at, self.split(base, &over, &own));
-            self.splits[at] = Some(Split { base: self.roots[base].1.clone(), own });
+            self.splits[at] = Some(Split { base_at: base, base: self.roots[base].1.clone(), own });
             self.debug[at] = self.debug[base];
         }
         self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
@@ -2331,10 +2416,16 @@ impl Checkouts {
         env: &ide_db::base_db::Env,
     ) -> anyhow::Result<(ProjectWorkspace, plan::Whole, CargoConfig)> {
         let (project, root) = &self.roots[at];
-        let mut config = self.cargo_config.clone();
-        config.extra_env.extend(self.inputs.variables(root, env));
+        let mut config = self.root_configs[at].clone();
+        config.extra_env.extend(self.inputs.variables(
+            project,
+            root,
+            self.cfg_tests[at],
+            &self.selections[at],
+            env,
+        ));
         let (workspace, debug) =
-            workspace_at(project, &config, &self.load_config, &self.selection, None)?;
+            workspace_at(project, &config, &self.load_config, &self.selections[at], None)?;
         Ok((workspace, debug, config))
     }
 
@@ -2347,9 +2438,17 @@ impl Checkouts {
         config: &CargoConfig,
     ) {
         let root = PathBuf::from(workspace.workspace_root().to_string());
-        self.inputs.watch(&root, &workspace, config);
+        self.inputs.watch(
+            &self.roots[at].0,
+            &root,
+            self.cfg_tests[at],
+            &self.selections[at],
+            &workspace,
+            config,
+        );
         self.loaded.replace(at, workspace);
         self.roots[at].1 = root;
+        self.root_configs[at] = config.clone();
         self.splits[at] = None;
         self.debug[at] = debug;
     }
@@ -2475,6 +2574,7 @@ fn tree_alike(dir: &Path, base: &Path, over: &Path) -> bool {
 /// same in both are the crates of the loaded one, and only the others are crates of its own.
 #[derive(Clone, PartialEq)]
 struct Split {
+    base_at: usize,
     /// The root of the loaded checkout.
     base: PathBuf,
     /// The directories of the packages it has other files in, as they are called in both.
@@ -2838,8 +2938,8 @@ impl Listed {
     /// Two builds that ask for a crate not listed yet both list it: neither waits for the other.
     fn of(&self, db: &RootDatabase, krate: Crate) -> std::sync::Arc<ListedCrate> {
         lock(&self.built).insert(krate);
-        if let Some(listed) = lock(&self.functions).get(&krate) {
-            return listed.clone();
+        if let Some(listed) = lock(&self.functions).get(&krate).cloned() {
+            return listed;
         }
         let listed = std::sync::Arc::new(ListedCrate::new(db, krate));
         lock(&self.functions).entry(krate).or_insert(listed).clone()
@@ -3627,8 +3727,7 @@ fn place(
 }
 
 /// The arguments to cargo that have it run the build scripts of the build `args` asks for.
-fn selected(args: &Args) -> Vec<String> {
-    let selection = &args.selection;
+fn selected(selection: &plan::Selection) -> Vec<String> {
     let mut selected = vec!["--profile".to_owned(), selection.profile.clone()];
     for package in &selection.packages {
         selected.extend(["--package".to_owned(), package.clone()]);
@@ -3642,7 +3741,7 @@ fn selected(args: &Args) -> Vec<String> {
     // Dev-dependencies are for tests: cargo runs the build scripts and the proc macros of
     // those only for a build that has them. Not `--all-targets`, which fails on a bench or an
     // example a published package lists and left out the file of, as `cargo test` does not.
-    if args.cfg_test || selection.dev_deps {
+    if selection.dev_deps {
         selected.push("--tests".to_owned());
     }
     selected
@@ -4018,6 +4117,8 @@ impl Request {
 struct Target {
     /// The checkout it is a program of. `None` is the one the daemon was started in.
     project: Option<PathBuf>,
+    cfg_test: Option<bool>,
+    selection: Option<plan::Selection>,
     krate: String,
     /// The other crates of the workspace that are in it, when the client says: the names
     /// after the first in `--crate a,b,c`. Otherwise the ones the daemon was started with.
@@ -4033,15 +4134,41 @@ struct Target {
 }
 
 impl Target {
+    fn with_defaults(&mut self, args: &Args) {
+        self.cfg_test.get_or_insert(args.cfg_test);
+        self.selection.get_or_insert_with(|| args.selection.clone());
+        if let Some(selection) = &mut self.selection {
+            selection.dev_deps |= self.cfg_test.unwrap_or(args.cfg_test);
+        }
+    }
+
     fn is(&self, args: &Args) -> bool {
-        self.krate == args.krate && self.out == args.out
+        self.krate == args.krate
+            && self.out == args.out
+            && self.cfg_test.is_none_or(|it| it == args.cfg_test)
+            && self.selection.as_ref().is_none_or(|it| it == &args.selection)
     }
 
     /// The daemon's arguments, were it started for this program.
     fn args(self, daemon: &Args, checkouts: &Checkouts) -> anyhow::Result<Args> {
-        let Target { project, krate, batch, out, patch, link_cmd, splice, symbol_files } = self;
+        let Target {
+            project,
+            cfg_test,
+            selection,
+            krate,
+            batch,
+            out,
+            patch,
+            link_cmd,
+            splice,
+            symbol_files,
+        } = self;
         let project = project.unwrap_or_else(|| daemon.project.clone());
-        let Parts { root: checkout, base, members, debug } = checkouts.parts(&project)?;
+        let cfg_test = cfg_test.unwrap_or(daemon.cfg_test);
+        let mut selection = selection.unwrap_or_else(|| daemon.selection.clone());
+        selection.dev_deps |= cfg_test;
+        let Parts { root: checkout, base, members, debug } =
+            checkouts.parts(&project, cfg_test, &selection)?;
         let symbol_files =
             if symbol_files.is_empty() { daemon.symbol_files.clone() } else { symbol_files };
         let batch = batch.unwrap_or_else(|| {
@@ -4062,6 +4189,8 @@ impl Target {
             link_cmd,
             splice,
             symbol_files,
+            cfg_test,
+            selection,
             ..daemon.clone()
         })
     }
@@ -4089,6 +4218,8 @@ impl Target {
                 let (krate, batch) = Target::crates(&krate);
                 Ok(Some(Target {
                     project,
+                    cfg_test: None,
+                    selection: None,
                     krate,
                     batch,
                     out,
@@ -4113,13 +4244,32 @@ impl Target {
 
     /// The fields after the request's name on its line, each after a tab. Empty is absent.
     fn parse(fields: &[&str]) -> Option<Target> {
-        let &[project, krate, out, patch, link_cmd, splice, ref symbol_files @ ..] = fields else {
+        let &[
+            project,
+            cfg_test,
+            selection,
+            krate,
+            out,
+            patch,
+            link_cmd,
+            splice,
+            ref symbol_files @ ..,
+        ] = fields
+        else {
             return None;
         };
         let given = |it: &str| (!it.is_empty()).then(|| it.to_owned());
+        let cfg_test = given(cfg_test).and_then(|it| it.parse().ok());
+        let mut selection: Option<plan::Selection> =
+            given(selection).and_then(|it| serde_json::from_str(&it).ok());
+        if let Some(selection) = &mut selection {
+            selection.dev_deps |= cfg_test.unwrap_or(false);
+        }
         let (krate, batch) = Target::crates(krate);
         Some(Target {
             project: given(project).map(PathBuf::from),
+            cfg_test,
+            selection,
             krate,
             batch,
             out: PathBuf::from(out),
@@ -4148,8 +4298,13 @@ impl Target {
             None => self.krate.clone(),
         };
         let mut fields = format!(
-            "\t{}\t{}\t{}\t{}\t{}\t{}",
+            "\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.project.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
+            self.cfg_test.map(|it| it.to_string()).unwrap_or_default(),
+            self.selection
+                .as_ref()
+                .and_then(|it| serde_json::to_string(it).ok())
+                .unwrap_or_default(),
             crates,
             self.out.display(),
             self.patch.as_ref().map(|it| it.display().to_string()).unwrap_or_default(),
@@ -4515,13 +4670,42 @@ fn ask(request: Request, socket: &Path, target: Option<Target>) -> anyhow::Resul
 /// watches its files.
 fn join(
     project: &Path,
+    cfg_test: bool,
+    selection: &plan::Selection,
     checkouts: &mut Checkouts,
     db: &mut RootDatabase,
     tree: &mut tree::Tree,
     files: &mut Vec<WatchedFile>,
 ) -> anyhow::Result<()> {
-    checkouts.add(&[project], db, tree.vfs())?;
+    let before = Crate::all(db).len();
+    checkouts.add(&[(project, cfg_test, selection.clone())], db, tree.vfs())?;
     watch_loaded(db, tree, files);
+    eprintln!(
+        "join: {} cfg_test={cfg_test} selection={selection:?}: crates {before} -> {}",
+        project.display(),
+        Crate::all(db).len()
+    );
+    if std::env::var_os("RUSTD_STATS").is_some() {
+        let crates = Crate::all(db);
+        eprintln!("crate graph snapshot: {}", crates.len());
+        for hir_crate in crates {
+            let krate: ide_db::base_db::Crate = hir_crate.into();
+            let data = krate.data(db);
+            let dependencies =
+                data.dependencies.iter().map(|it| format!("{:?}", it.crate_id)).collect::<Vec<_>>();
+            eprintln!(
+                "crate graph: {}",
+                serde_json::json!({
+                    "id": format!("{krate:?}"),
+                    "name": krate.extra_data(db).display_name.as_ref().map(|it| it.to_string()),
+                    "origin": format!("{:?}", data.origin),
+                    "root": crate_root_file(db, hir_crate).map(|it| it.display().to_string()),
+                    "cfg": format!("{:?}", krate.cfg_options(db)),
+                    "dependencies": dependencies,
+                })
+            );
+        }
+    }
     Ok(())
 }
 
@@ -4757,7 +4941,7 @@ fn cargo_config(args: &Args) -> CargoConfig {
         },
         // The build scripts say what the build asked for says, not what `cargo check` of the
         // workspace does.
-        extra_args: selected(&args),
+        extra_args: selected(&args.selection),
         only_manifest_package: true,
         executables: executables_of(&args.symbol_files),
         target_dir_config: match args.own_target {
@@ -4766,6 +4950,26 @@ fn cargo_config(args: &Args) -> CargoConfig {
         },
         ..Default::default()
     }
+}
+
+fn root_cargo_config(
+    base: &CargoConfig,
+    cfg_test: bool,
+    selection: &plan::Selection,
+) -> CargoConfig {
+    let mut config = base.clone();
+    config.target = selection.target.clone();
+    config.set_test = cfg_test;
+    config.all_targets = cfg_test || selection.dev_deps;
+    config.features = match selection.all_features {
+        true => CargoFeatures::All,
+        false => CargoFeatures::Selected {
+            features: selection.features.clone(),
+            no_default_features: selection.no_default_features,
+        },
+    };
+    config.extra_args = selected(selection);
+    config
 }
 
 /// How a workspace is loaded, whichever it is.
@@ -4841,8 +5045,15 @@ impl Held {
             return None;
         }
         self.checkouts.cargo_config = cargo_config.clone();
-        self.checkouts.selection = selection.clone();
-        if let Err(why) = self.checkouts.add(projects, &mut self.db, &mut self.vfs) {
+        let roots: Vec<_> = projects
+            .iter()
+            .map(|project| {
+                let mut selection = selection.clone();
+                selection.dev_deps |= cargo_config.set_test;
+                (*project, cargo_config.set_test, selection)
+            })
+            .collect();
+        if let Err(why) = self.checkouts.add(&roots, &mut self.db, &mut self.vfs) {
             eprintln!("spare: not used: {why:#}");
             return None;
         }
@@ -5136,7 +5347,8 @@ fn follow_cargo(
             }
             seen.1
         };
-        let Parts { root, base, members, debug } = checkouts.parts(&args.project)?;
+        let Parts { root, base, members, debug } =
+            checkouts.parts(&args.project, args.cfg_test, &args.selection)?;
         let mut names = args.crates().filter(|it| ready.contains(&root.join(it.as_str()))).cloned();
         if let Some(krate) = names.next() {
             let of_ready = Args {
@@ -5303,7 +5515,8 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
         None => eprintln!("store: the toolchain of the library cannot be told from another"),
     }
     let built = follow_cargo(&mut db, &mut vfs, &mut checkouts, &args, &listed)?;
-    let Parts { root, base, members, debug } = checkouts.parts(&args.project)?;
+    let Parts { root, base, members, debug } =
+        checkouts.parts(&args.project, args.cfg_test, &args.selection)?;
     (args.checkout, args.base, args.members, args.debug) = (root, base, members, debug);
     // The names are resolved before cargo says which program it built: those of the crates
     // it built are, and not of every crate of the workspace.
@@ -5333,7 +5546,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
     let mut tree = tree::Tree::new(&db, vfs, &sources);
 
     let start = Instant::now();
-    if checkouts.lto(&args.project)? {
+    if checkouts.lto(&args.project, args.cfg_test, &args.selection)? {
         linked_from_libraries(&db, &args)?;
     }
     let mut resolved = resolve_crates(&db, &args)?;
@@ -5347,7 +5560,8 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
     // What the other checkouts don't share with this one, before a request waits for it.
     for also in &args.also {
         let start = Instant::now();
-        let Parts { root: checkout, base, members, debug } = checkouts.parts(also)?;
+        let Parts { root: checkout, base, members, debug } =
+            checkouts.parts(also, args.cfg_test, &args.selection)?;
         let of_it = Args { checkout, base, members, debug, ..args.clone() };
         let resolved = resolve_crates(&db, &of_it)?;
         eprintln!("resolve {}: {resolved} crates in {:.1?}", also.display(), start.elapsed());
@@ -5391,7 +5605,8 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
         };
         let links = |file: &PathBuf| args.symbol_files.contains(file);
         anyhow::ensure!(
-            library.is_some_and(|it| !it.is_empty() && it.iter().all(links)),
+            args.out == Path::new("none")
+                || library.is_some_and(|it| !it.is_empty() && it.iter().all(links)),
             "cargo built with another toolchain than the one that was loaded"
         );
         known.patching = args.patch.is_some();
@@ -5424,27 +5639,35 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
         known.touch(&db, None);
         listed.touch(&db, None);
     }
-    let mut cold = build(&db, &table, &args, &mut known, &listed)?;
+    let mut cold = if args.symbol_files.is_empty() {
+        None
+    } else {
+        Some(build(&db, &table, &args, &mut known, &listed)?)
+    };
     // An `include!` in a body is first seen when the body is compiled.
     if WatchedFile::include_sources(&mut files, &mut tree, &mut db) {
         known.touch(&db, None);
-        cold = build(&db, &table, &args, &mut known, &listed)?;
+        if let Some(cold) = &mut cold {
+            *cold = build(&db, &table, &args, &mut known, &listed)?;
+        }
     }
-    if let Some(unfit) = &cold.unfit {
+    if let Some(cold) = &cold {
+        if let Some(unfit) = &cold.unfit {
+            report(&cold);
+            bail!("{unfit}");
+        }
+        eprint!("cold: ");
         report(&cold);
-        bail!("{unfit}");
+        memory::report(&mut db, "build")?;
+        report_stats(&known.stats);
+        link(
+            args.link_cmd.as_deref(),
+            args.splice.as_deref(),
+            args.patch.as_deref(),
+            &args.out,
+            false,
+        )?;
     }
-    eprint!("cold: ");
-    report(&cold);
-    memory::report(&mut db, "build")?;
-    report_stats(&known.stats);
-    link(
-        args.link_cmd.as_deref(),
-        args.splice.as_deref(),
-        args.patch.as_deref(),
-        &args.out,
-        false,
-    )?;
     // What this build added goes to the other machines while the daemon waits for edits; a
     // build that is not a daemon's has nothing to wait for but this.
     match shared {
@@ -5586,6 +5809,10 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                     let Some((request, target, stream)) = builds.waiting.pop_front() else {
                         break;
                     };
+                    let mut target = target;
+                    if let Some(target) = &mut target {
+                        target.with_defaults(&programs[0].args);
+                    }
                     // The build before it brought the database up to date with the files.
                     if request == Request::Lint {
                         let linted = lint_of(&db, target, &programs[0].args, &checkouts, &files);
@@ -5596,13 +5823,23 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                         continue;
                     }
                     let asked = target.clone();
-                    let mut target = target;
                     // A checkout that is not what it was loaded from is loaded again before
                     // anything is built of it. The builds under way and the ones already
                     // taken for this turn are of the checkout as it was.
                     let project = target.as_ref().and_then(|it| it.project.as_ref());
                     let project = project.unwrap_or(&programs[0].args.project);
-                    match checkouts.stale(project, &stream.env) {
+                    let (cfg_test, selection) = target.as_ref().map_or_else(
+                        || (programs[0].args.cfg_test, programs[0].args.selection.clone()),
+                        |it| {
+                            (
+                                it.cfg_test.unwrap_or(programs[0].args.cfg_test),
+                                it.selection
+                                    .clone()
+                                    .unwrap_or_else(|| programs[0].args.selection.clone()),
+                            )
+                        },
+                    );
+                    match checkouts.stale(project, cfg_test, &selection, &stream.env) {
                         Ok(stale) if stale.is_empty() => {}
                         Ok(_) if !clients.is_empty() => {
                             later.push((request, asked, stream));
@@ -5636,7 +5873,11 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                             );
                             let mut started = Ok(());
                             for program in &mut programs {
-                                let parts = checkouts.parts(&program.args.project)?;
+                                let parts = checkouts.parts(
+                                    &program.args.project,
+                                    program.args.cfg_test,
+                                    &program.args.selection,
+                                )?;
                                 let linked = target
                                     .as_ref()
                                     .filter(|it| it.is(&program.args))
@@ -5696,7 +5937,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                             let quick = |base: &Path, over: &Path| {
                                 !pending && built.contains(&base) && !given_up.contains(over)
                             };
-                            checkouts.view_of(project, overlay, &quick)
+                            checkouts.view_of(project, cfg_test, &selection, overlay, &quick)
                         }
                         None => {
                             let base = programs[0].args.checkout.clone();
@@ -5719,7 +5960,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                     // another reads that one as it is.
                     let shares = view
                         .as_ref()
-                        .and_then(|it| checkouts.shares_with(&it.base))
+                        .and_then(|it| checkouts.shares_with(&it.project, cfg_test, &selection))
                         .map(Path::to_owned);
                     if let Some(view) = &view
                         && (looked.get(&view.base).is_some_and(|over| *over != view.over)
@@ -5781,8 +6022,15 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                         Some(project) if view.is_none() => {
                             builds.settle(&mut db, &mut programs)?;
                             let start = Instant::now();
-                            let joined =
-                                join(project, &mut checkouts, &mut db, &mut tree, &mut files);
+                            let joined = join(
+                                project,
+                                cfg_test,
+                                &selection,
+                                &mut checkouts,
+                                &mut db,
+                                &mut tree,
+                                &mut files,
+                            );
                             eprintln!("join {}: {:.1?}", project.display(), start.elapsed());
                             joined
                         }
@@ -5791,11 +6039,9 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                     if let Some(view) = view {
                         looked.insert(view.base, view.over);
                     }
-                    let shares = target
-                        .project
-                        .as_ref()
-                        .and_then(|it| checkouts.parts(it).ok())
-                        .and_then(|it| checkouts.shares_with(&it.root).map(Path::to_owned));
+                    let shares = target.project.as_ref().and_then(|project| {
+                        checkouts.shares_with(project, cfg_test, &selection).map(Path::to_owned)
+                    });
                     if let Some(base) = shares {
                         // Whoever else reads it in this build reads it so.
                         if looked.get(&base).is_some_and(|over| *over != base) {
@@ -5826,6 +6072,10 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                         });
                     match loaded {
                         Ok((args, table)) => {
+                            let _ = resolve_crates(&db, &args);
+                            while WatchedFile::include_sources(&mut files, &mut tree, &mut db) {
+                                let _ = resolve_crates(&db, &args);
+                            }
                             // Never built: every file is as good as edited, but those were
                             // checked when the programs before it were built.
                             let unbuilt = Unbuilt {
@@ -5877,7 +6127,11 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                     checkouts.share(&mut db, tree.vfs(), differences)?;
                     watch_loaded(&mut db, &mut tree, &mut files);
                     for program in &mut programs {
-                        let Parts { base, members, .. } = checkouts.parts(&program.args.project)?;
+                        let Parts { base, members, .. } = checkouts.parts(
+                            &program.args.project,
+                            program.args.cfg_test,
+                            &program.args.selection,
+                        )?;
                         program.moved |= program.args.members != members;
                         (program.args.base, program.args.members) = (base, members);
                         program.unbuilt.stale = true;
