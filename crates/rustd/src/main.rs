@@ -109,8 +109,7 @@ struct Args {
     deny: Option<PathBuf>,
     /// Directory that gets one object per compiled function, for testing each in isolation.
     isolate: Option<PathBuf>,
-    /// Build the workspace's crates as `cargo test` does, with `cfg(test)`.
-    cfg_test: bool,
+    /// This program is the `cfg(test)` build of its crate.
     unit_test: bool,
     /// Run build scripts and build proc macros in a directory of rustd's own under the
     /// target directory, so that nothing here waits for a cargo that is building there.
@@ -132,6 +131,7 @@ struct Args {
     base: Option<PathBuf>,
     /// The crates of `checkout`. One that is the same in another checkout is of both.
     members: Arc<FxHashSet<ide_db::base_db::Crate>>,
+    /// Root files of member libs/bins, whose tested copies a normal program leaves out.
     unit_roots: Arc<FxHashSet<PathBuf>>,
 }
 
@@ -269,7 +269,6 @@ impl Args {
             report,
             deny,
             isolate,
-            cfg_test,
             unit_test: cfg_test,
             own_target,
             selection: plan::Selection {
@@ -3668,7 +3667,7 @@ fn selected(args: &Args) -> Vec<String> {
     // Dev-dependencies are for tests: cargo runs the build scripts and the proc macros of
     // those only for a build that has them. Not `--all-targets`, which fails on a bench or an
     // example a published package lists and left out the file of, as `cargo test` does not.
-    if args.cfg_test || selection.dev_deps {
+    if selection.dev_deps {
         selected.push("--tests".to_owned());
     }
     selected
@@ -3979,7 +3978,6 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             report: Some(report.join(format!("{krate}.tsv"))),
             deny: None,
             isolate: None,
-            cfg_test: args.cfg_test,
             unit_test: args.unit_test,
             own_target: args.own_target,
             selection: args.selection.clone(),
@@ -4791,7 +4789,7 @@ fn cargo_config(args: &Args) -> CargoConfig {
         extra_env_for_commands_only: true,
         sysroot: Some(sysroot),
         target: args.selection.target.clone(),
-        set_test: args.cfg_test || args.selection.dev_deps,
+        set_test: args.selection.dev_deps,
         features: match args.selection.all_features {
             true => CargoFeatures::All,
             false => CargoFeatures::Selected {
