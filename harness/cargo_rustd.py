@@ -1162,7 +1162,7 @@ def workspace_workers(work, check):
         and row["name"] == "serde"
         and row["root"].endswith("/src/lib.rs")
     ]
-    serde_rc_features = {"feature=rc" in row["cfg"] for row in serde_crates}
+    serde_rc_features = {'"feature=rc"' in row["cfg"] for row in serde_crates}
     common = (
         reachable(test_a) & reachable(test_b)
         if test_a is not None and test_b is not None
