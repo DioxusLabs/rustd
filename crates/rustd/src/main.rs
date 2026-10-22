@@ -2653,7 +2653,7 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
         }
     }
     resolve_all(db, &crates);
-    dump_twins(db, args);
+    hir::attach_db(db, || dump_twins(db, args));
     Ok(crates.len())
 }
 
@@ -2661,11 +2661,17 @@ fn dump_twins(db: &RootDatabase, args: &Args) {
     if std::env::var_os("RUSTD_CFG_TWINS").is_none() {
         return;
     }
-    let roots: FxHashSet<_> = args
+    let program_roots: Vec<_> = args
         .crates()
         .flat_map(|name| crates_named(db, name, args).unwrap_or_default())
-        .map(|krate| ide_db::base_db::Crate::from(krate).root_file_id(db))
+        .map(ide_db::base_db::Crate::from)
         .collect();
+    let present: FxHashSet<_> = program_roots
+        .iter()
+        .copied()
+        .chain(program_roots.iter().flat_map(|&krate| krate.transitive_deps(db)))
+        .collect();
+    let roots: FxHashSet<_> = program_roots.iter().map(|krate| krate.root_file_id(db)).collect();
     for &test in args
         .members
         .iter()
@@ -2695,6 +2701,102 @@ fn dump_twins(db: &RootDatabase, args: &Args) {
             index.function_bodies.test_only,
             index.function_bodies.unmatched,
             index.function_bodies.unknown
+        );
+        let start = Instant::now();
+        let both = present.contains(&normal) && present.contains(&test);
+        let eligibility = hir_ty::sharing::pair_eligibility(db, normal, test, both);
+        let bodies = |items: &FxHashSet<hir_def::AttrDefId>| {
+            items.intersection(&index.function_items).count()
+        };
+        let rejected = |reason| {
+            eligibility
+                .rejected
+                .iter()
+                .filter(|(id, why)| **why == reason && index.function_items.contains(id))
+                .count()
+        };
+        let veto = if eligibility.pair_veto.is_empty() {
+            "none".to_owned()
+        } else {
+            eligibility.pair_veto.join(",")
+        };
+        let enabled = eligibility.pair_veto.is_empty();
+        eprintln!(
+            "cfg eligibility: {name}: eligible items {}, bodies {}; candidates items {}, bodies {}; rejected bodies: cfg-differing {}, transitive {}, static-closure {}, generic-unresolved {}, unknown {}; statics {}, test-only statics {}; pair veto: {veto}; both copies {both}; analysis {:.3}s, RSS {} MB",
+            if enabled { eligibility.candidates.len() } else { 0 },
+            if enabled { bodies(&eligibility.candidates) } else { 0 },
+            eligibility.candidates.len(),
+            bodies(&eligibility.candidates),
+            rejected(hir_ty::sharing::Rejection::CfgDiffering),
+            rejected(hir_ty::sharing::Rejection::Transitive),
+            rejected(hir_ty::sharing::Rejection::StaticClosure),
+            rejected(hir_ty::sharing::Rejection::GenericUnresolved),
+            rejected(hir_ty::sharing::Rejection::Unknown),
+            eligibility.statics,
+            eligibility.test_only_statics,
+            start.elapsed().as_secs_f64(),
+            memory::resident().unwrap_or(0),
+        );
+        if std::env::var("RUSTD_CFG_TWINS").is_ok_and(|value| value == "items") {
+            for &item in &index.function_items {
+                if !index.twins.contains_key(&item) {
+                    continue;
+                }
+                let hir_def::AttrDefId::FunctionId(id) = item else { continue };
+                let outcome = eligibility.rejected.get(&item).map_or("eligible", |why| match why {
+                    hir_ty::sharing::Rejection::CfgDiffering => "cfg-differing",
+                    hir_ty::sharing::Rejection::Transitive => "transitive",
+                    hir_ty::sharing::Rejection::StaticClosure => "static-closure",
+                    hir_ty::sharing::Rejection::GenericUnresolved => "generic-unresolved",
+                    hir_ty::sharing::Rejection::Unknown => "unknown",
+                });
+                eprintln!(
+                    "cfg body: {name}::{}: {outcome}",
+                    hir::Function::from(id).name(db).as_str()
+                );
+            }
+        }
+        let preflight_start = Instant::now();
+        let mut preflight_roots: Vec<_> = program_roots
+            .iter()
+            .flat_map(|&krate| hir_def::twins::crate_items(db, krate).items.iter())
+            .filter_map(|&item| {
+                let hir_def::AttrDefId::FunctionId(id) = item else { return None };
+                let func = hir::Function::from(id);
+                (func.is_test(db) || func.is_bench(db) || func.name(db).as_str() == "main")
+                    .then_some(item)
+            })
+            .collect();
+        preflight_roots.extend(program_roots.iter().flat_map(|&krate| {
+            hir_def::twins::crate_items(db, krate)
+                .items
+                .iter()
+                .copied()
+                .filter(|item| matches!(item, hir_def::AttrDefId::StaticId(_)))
+        }));
+        let type_id = if both {
+            hir_ty::sharing::type_id_preflight(db, &preflight_roots, normal, test)
+        } else {
+            hir_ty::sharing::TypeIdVeto::None
+        };
+        eprintln!(
+            "cfg TypeId: {name}: program {}, both copies {both}, {}; analysis {:.3}s, RSS {} MB",
+            args.out.display(),
+            match type_id {
+                hir_ty::sharing::TypeIdVeto::None => "no program veto".to_owned(),
+                hir_ty::sharing::TypeIdVeto::TypeId => "would veto program: TypeId/Any".to_owned(),
+                hir_ty::sharing::TypeIdVeto::Unknown(item) => {
+                    let name = match item {
+                        hir_def::AttrDefId::FunctionId(id) => {
+                            hir::Function::from(id).name(db).as_str().to_owned()
+                        }
+                        _ => format!("{item:?}"),
+                    };
+                    format!("would veto program: unknown at {name}")
+                }
+            },
+            preflight_start.elapsed().as_secs_f64(),
+            memory::resident().unwrap_or(0),
         );
     }
 }
@@ -3070,7 +3172,7 @@ fn build(
     listed: &Listed,
 ) -> anyhow::Result<Build> {
     let start = Instant::now();
-    dump_twins(db, args);
+    hir::attach_db(db, || dump_twins(db, args));
     let contents = &content::Contents::default();
     let (root, base) = (args.checkout.clone(), args.base.clone());
     let debug = args.debug;

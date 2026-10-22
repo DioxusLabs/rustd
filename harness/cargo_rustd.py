@@ -1082,7 +1082,7 @@ fn integration() {
     for file, text in files.items():
         os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
         open(os.path.join(ws, file), "w").write(text)
-    side = Side(ws, dict(base_env(os.path.join(work, "home-test-graph")), RUSTD_CFG_TWINS="1"), True)
+    side = Side(ws, dict(base_env(os.path.join(work, "home-test-graph")), RUSTD_CFG_TWINS="items"), True)
     checks = []
 
     def check(name, held, detail):
@@ -1114,6 +1114,54 @@ fn integration() {
         body_counts = [tuple(map(int, match)) for path in logs.glob("**/log") for match in re.findall(
             r"cfg twins: test_graph: [^\n]+; function bodies: twins (\d+), cfg-differing (\d+), test-only (\d+), unmatched (\d+), unknown (\d+)", path.read_text(errors="replace"))]
         check("generated and format bodies have known twins", len(body_counts) >= 2 and all(count == (13, 3, 1, 0, 0) for count in body_counts), str(body_counts))
+        text = "\n".join(path.read_text(errors="replace") for path in logs.glob("**/log"))
+        check("unrelated body is eligible", "cfg body: test_graph::value: eligible" in text, "value")
+        check("paired cfg constants reject their caller transitively", "cfg body: test_graph::configured: transitive" in text, "configured")
+        check("static reverse closure is rejected", "cfg body: test_graph::own: static-closure" in text, "Shape::own")
+        eligibility = re.findall(r"cfg eligibility: test_graph: [^\n]+pair veto: ([^;]+);", text)
+        check("the main pair has no safety veto", eligibility and all(reason == "none" for reason in eligibility), str(eligibility))
+        check("unknown TypeId reachability vetoes conservatively", "both copies true, would veto program: unknown" in text, "unknown program veto")
+
+        source = os.path.join(ws, "src/lib.rs")
+        original = pathlib.Path(source).read_text()
+        integration = pathlib.Path(ws, "tests/integration.rs")
+        integration_source = integration.read_text()
+        before = {path: len(path.read_text(errors="replace")) for path in logs.glob("**/log")}
+        positive = original.split("#[cfg(test)]\nmod tests")[0] + '''#[cfg(test)]
+mod tests {
+    #[test] fn unit() { super::generated(); let _ = probe::tested(); }
+}
+'''
+        pathlib.Path(source).write_text(positive)
+        integration.write_text("#[test] fn integration() { test_graph::generated(); }\n")
+        _, ran = side.cargo("test")
+        fresh = "\n".join(path.read_text(errors="replace")[before.get(path, 0):] for path in logs.glob("**/log"))
+        check("positive program has no veto", ran.returncode == 0 and "both copies true, no program veto" in fresh, f"exit {ran.returncode}, expected no program veto with both copies")
+        integration.write_text(integration_source)
+        variants = [
+            ("generic dispatch", "\npub fn unresolved<T: Value>(value: &T) -> u32 { value.get() }\n", "cfg body: test_graph::unresolved: generic-unresolved"),
+            ("TLS", '''\nthread_local! { static TLS: core::cell::Cell<u32> = const { core::cell::Cell::new(3) }; }
+pub fn tls_value() -> u32 { TLS.with(|value| value.get()) }
+#[test] fn tls_probe() { assert_eq!(tls_value(), 3); }
+''', "cfg body: test_graph::tls_value: static-closure"),
+            ("TypeId", "\n#[test] fn identity_probe() { let _ = std::any::TypeId::of::<Shape>(); }\n", "would veto program: TypeId/Any"),
+            ("common trait impl", "\n#[cfg(test)] impl core::fmt::Display for Shape { fn fmt(&self, _: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { Ok(()) } }\n", "pair veto: test-only-trait-impl"),
+            ("test-only trait exception", "\n#[cfg(test)] trait Only {}\n#[cfg(test)] impl Only for Shape {}\n", "pair veto: none"),
+            ("blanket impl", "\n#[cfg(test)] trait Only {}\n#[cfg(test)] impl<T> Only for T {}\n", "pair veto: test-only-blanket-impl"),
+            ("prelude shadowing", "\n#[cfg(test)] pub struct Option;\n", "pair veto: namespace-shadowing"),
+            ("block scope shadowing", "\npub fn scoped() { #[cfg(test)] struct Option; }\n", "pair veto: namespace-shadowing"),
+            ("value namespace shadowing", "\n#[cfg(test)] fn Some() {}\n", "pair veto: namespace-shadowing"),
+            ("macro namespace shadowing", "\n#[cfg(test)] use std::stringify as vec;\n", "pair veto: namespace-shadowing"),
+            ("inherent method collision", "\n#[cfg(not(test))] impl Shape { fn collision() {} }\n#[cfg(test)] impl Shape { fn collision() {} }\n", "pair veto: colliding-inherent-method"),
+            ("test macro", "\n#[cfg(test)] macro_rules! only_test { () => { () } }\n", "pair veto: cfg-test-macro-rules"),
+            ("drop closure", "\npub struct Dropped;\nimpl Drop for Dropped { fn drop(&mut self) { let _ = STATE; } }\npub fn dropped() { let _ = Dropped; }\n", "cfg body: test_graph::dropped: static-closure"),
+        ]
+        for label, addition, expected in variants:
+            before = {path: len(path.read_text(errors="replace")) for path in logs.glob("**/log")}
+            pathlib.Path(source).write_text(original + addition)
+            _, ran = side.cargo("test")
+            fresh = "\n".join(path.read_text(errors="replace")[before.get(path, 0):] for path in logs.glob("**/log"))
+            check(f"{label} diagnostics", ran.returncode == 0 and expected in fresh, f"exit {ran.returncode}, expected {expected}")
     finally:
         side.cargo("stop")
     return checks
