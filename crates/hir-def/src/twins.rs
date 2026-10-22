@@ -152,11 +152,17 @@ pub fn item_cfg_reads(db: &dyn SourceDatabase, item: AttrDefId) -> CfgReads {
         module = id.containing_module(db);
     }
     // Bodies and nested items have their own observations.
+    let body = body(item)
+        .and_then(|_| syntax.children().find_map(ast::Expr::cast))
+        .map(|expr| expr.syntax().clone());
     let mut walk = syntax.preorder();
     while let Some(event) = walk.next() {
         if let syntax::WalkEvent::Enter(child) = event {
-            if child != syntax
-                && (ast::Item::can_cast(child.kind()) || ast::BlockExpr::can_cast(child.kind()))
+            if ast::MacroCall::can_cast(child.kind()) {
+                reads.unknown = true;
+                walk.skip_subtree();
+            } else if child != syntax
+                && (ast::Item::can_cast(child.kind()) || body.as_ref() == Some(&child))
             {
                 walk.skip_subtree();
             } else if child != syntax
@@ -461,12 +467,14 @@ fn unresolved() { missing!(); }
 #[cfg()] fn malformed() {}
 fn malformed_body() { #[cfg()] let _ = 0; }
 fn opaque_body() { #[magic] let _ = 0; }
+type Opaque = signature!();
+type Sized = [u8; { cfg!(test) as usize }];
 "#,
         );
         let index = twin_index(&db, normal, test);
         assert!(!index.unmatched.is_empty());
         assert_eq!(index.cfg_differing, 0);
-        assert_eq!(index.unknown, 4);
+        assert_eq!(index.unknown, 6);
         assert!(index.twins.iter().all(|(t, n)| !ast_id(&db, *t).unwrap().file_id.is_macro()
             && !ast_id(&db, *n).unwrap().file_id.is_macro()));
     }
