@@ -1622,7 +1622,7 @@ pub fn total() -> u64 {{ {total} }}
                 held = "patch reports: 0 of 20" in fresh
                 checks.append((name, held, fresh[-700:]))
                 print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
-                for query, limit in [("reach_topology", 0), ("reach_root_code", 1)] + ([("pair_eligibility", 0), ("decision_serial", 0)] if mode == "on" else []):
+                for query, limit in [("reach_topology", 0), ("reach_component_print", 2), ("reach_root_code", 1)] + ([("twin_index", 0), ("pair_safety", 0), ("pair_eligibility", 0), ("decision_serial", 0)] if mode == "on" else []):
                     name = f"cfg sharing: {mode} {prime}-prime {query} executions <= {limit}"
                     count_ran = sum(map(int, re.findall(rf"\b{query}=(\d+)", fresh)))
                     held = ("queries:" in fresh and re.search(rf"\b{query}=\d+", primed) is not None

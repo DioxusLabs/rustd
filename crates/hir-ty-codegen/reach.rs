@@ -89,6 +89,38 @@ struct Component {
     below: Vec<Component>,
 }
 
+/// A deduplicated reach set, chunked independently of call edges.
+#[salsa::interned(debug, unsafe(no_lifetime), revisions = usize::MAX)]
+struct PrintTree {
+    #[returns(ref)]
+    members: Vec<Component>,
+    #[returns(ref)]
+    children: Vec<PrintTree>,
+}
+
+fn print_tree(db: &dyn HirDatabase, roots: &[Component]) -> PrintTree {
+    let mut seen = FxHashSet::default();
+    let mut pending = roots.to_vec();
+    while let Some(component) = pending.pop() {
+        if seen.insert(component) {
+            pending.extend(component.below(db));
+        }
+    }
+    let mut members: Vec<_> = seen.into_iter().collect();
+    members.sort_by_key(print_of);
+    let mut trees: Vec<_> = members
+        .chunks(32)
+        .map(|members| PrintTree::new(db, members.to_vec(), Vec::new()))
+        .collect();
+    while trees.len() > 1 {
+        trees = trees
+            .chunks(32)
+            .map(|children| PrintTree::new(db, Vec::new(), children.to_vec()))
+            .collect();
+    }
+    trees.pop().unwrap_or_else(|| PrintTree::new(db, Vec::new(), Vec::new()))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct Edges {
     targets: Vec<Node>,
@@ -415,15 +447,29 @@ fn reach_component_print(
     if let Some(own) = &mut own {
         own.sort_unstable();
     }
-    let mut below: Option<Vec<u128>> = component
-        .below(db)
-        .iter()
-        .map(|&component| reach_component_print(db, component, sharing.clone(), edited.clone()))
-        .collect();
-    if let Some(below) = &mut below {
-        below.sort_unstable();
+    own.map(|it| print_of(&it))
+}
+
+#[salsa::tracked(returns(copy))]
+fn reach_tree_print(
+    db: &dyn HirDatabase,
+    tree: PrintTree,
+    sharing: super::Sharing,
+    edited: Arc<[Crate]>,
+) -> Option<u128> {
+    let mut sum = 0u128;
+    for &component in tree.members(db) {
+        sum = sum.wrapping_add(reach_component_print(
+            db,
+            component,
+            sharing.clone(),
+            edited.clone(),
+        )?);
     }
-    own.zip(below).map(|it| print_of(&it))
+    for &child in tree.children(db) {
+        sum = sum.wrapping_add(reach_tree_print(db, child, sharing.clone(), edited.clone())?);
+    }
+    Some(sum)
 }
 
 #[salsa::tracked(returns(ref))]
@@ -432,22 +478,20 @@ fn reach_ambient_components(db: &dyn HirDatabase, input: ReachInput) -> Vec<Comp
     topology.ambient.iter().map(|&id| topology.components[topology.of[id]]).collect()
 }
 
+#[salsa::tracked(returns(copy))]
+fn reach_ambient_tree(db: &dyn HirDatabase, input: ReachInput) -> PrintTree {
+    print_tree(db, reach_ambient_components(db, input))
+}
+
 #[salsa::tracked(returns(ref))]
 fn reach_ambient(db: &dyn HirDatabase, input: ReachInput) -> Option<Vec<u128>> {
-    let mut prints: Vec<_> = reach_ambient_components(db, input)
-        .iter()
-        .map(|&component| {
-            reach_component_print(
-                db,
-                component,
-                input.data(db).sharing.clone(),
-                input.data(db).edited.clone(),
-            )
-        })
-        .collect();
-    prints.sort_unstable();
-    prints.dedup();
-    prints.into_iter().collect()
+    reach_tree_print(
+        db,
+        reach_ambient_tree(db, input),
+        input.data(db).sharing.clone(),
+        input.data(db).edited.clone(),
+    )
+    .map(|print| vec![print])
 }
 
 #[salsa::tracked(returns(copy))]
@@ -457,10 +501,15 @@ fn reach_root_component(db: &dyn HirDatabase, input: ReachInput, test: usize) ->
 }
 
 #[salsa::tracked(returns(copy))]
+fn reach_root_tree(db: &dyn HirDatabase, input: ReachInput, test: usize) -> PrintTree {
+    print_tree(db, &[reach_root_component(db, input, test)])
+}
+
+#[salsa::tracked(returns(copy))]
 fn reach_root_code(db: &dyn HirDatabase, input: ReachInput, test: usize) -> Option<u128> {
-    reach_component_print(
+    reach_tree_print(
         db,
-        reach_root_component(db, input, test),
+        reach_root_tree(db, input, test),
         input.data(db).sharing.clone(),
         input.data(db).edited.clone(),
     )
