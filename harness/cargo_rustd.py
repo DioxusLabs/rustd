@@ -1267,6 +1267,9 @@ pub fn async_closure_value() -> u32 {
     }
 }
 pub fn hidden_size() -> usize { graph_sharing::hidden_size() }
+pub fn shadowed() -> usize { graph_sharing::shadowed() }
+pub fn named() -> &'static str { graph_sharing::named() }
+pub fn module_size() -> usize { graph_sharing::cfg_names::size() }
 ''',
         "src/main.rs": 'fn main() { println!("{}", graph_sharing::shared()); }\n',
         "src/lib.rs": '''use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1353,7 +1356,30 @@ pub fn changed() -> impl Iterator<Item = u8> {
 }
 pub fn count() -> usize { changed().count() }
 pub fn hidden_size() -> usize { std::mem::size_of_val(&changed()) }
+pub fn shadowed() -> usize {
+    #[cfg(test)] #[allow(dead_code)] struct String;
+    std::mem::size_of::<String>()
+}
+pub fn named() -> &'static str {
+    #[cfg(test)] fn name() -> &'static str { "test" }
+    #[cfg(not(test))] fn name() -> &'static str { "normal" }
+    name()
+}
+pub mod cfg_names {
+    #[cfg(not(test))] use std::collections::HashMap;
+    #[cfg(test)] use std::collections::BTreeMap as HashMap;
+    pub fn size() -> usize { std::mem::size_of::<HashMap<u8, u8>>() }
+}
 #[cfg(test)] mod tests {
+    #[test] fn cfg_scope_resolution() {
+        assert_eq!(super::shadowed(), 0);
+        assert_eq!(super::named(), "test");
+        assert_ne!(probe::shadowed(), 0);
+        assert_eq!(probe::named(), "normal");
+        assert_eq!(super::cfg_names::size(), std::mem::size_of::<std::collections::BTreeMap<u8, u8>>());
+        assert_eq!(probe::module_size(), std::mem::size_of::<std::collections::HashMap<u8, u8>>());
+        assert_ne!(super::cfg_names::size(), probe::module_size());
+    }
     struct Only;
     impl super::Calc for Only { fn calc(&self) -> u32 { 11 } }
     #[test] fn s3c_identity() {
@@ -1456,8 +1482,13 @@ pub fn hidden_size() -> usize { std::mem::size_of_val(&changed()) }
         check("cold runtime", cold.returncode == 0, cold.stderr[-300:])
         wait_warm(side, ws)
         _, warm = side.cargo("test")
+        check("cfg scope runtime probes", all(result.returncode == 0 and "test tests::cfg_scope_resolution ... ok" in result.stdout for result in (cold, warm)), warm.stdout[-1200:])
         check("both copies, statics and opaque layout", warm.returncode == 0 and how_built(warm.stderr) == "daemon" and "tests::both_copies" in warm.stdout and "test normal_copy" in warm.stdout, warm.stderr[-300:])
         text = log()
+        if side.env.get("RUSTD_CFG_SHARING") == "local":
+            for body in ("shadowed", "named", "size"):
+                check(f"{body} keeps per-copy analysis", f"cfg body: graph_sharing::{body}: cfg-differing" in text, body)
+            check("scope gates leave unrelated body shared", "cfg body: graph_sharing::shared: analysis-shared" in text, "shared")
         shared = re.findall(r"cfg codegen body: shared: T compiled (\d+), redirected (\d+)", text)
         check("shared function has no T compilation", bool(shared) and all(t == "0" and n == "1" for t, n in shared), str(shared))
         check("opaque callers stay analysis-shared", "cfg body: graph_sharing::count: analysis-shared" in text and "cfg body: graph_sharing::hidden_size: analysis-shared" in text, "count, hidden_size")
