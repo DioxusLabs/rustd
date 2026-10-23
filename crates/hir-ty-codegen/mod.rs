@@ -681,6 +681,8 @@ impl CodegenUnit {
             stale: _,
             frozen: _,
             used_by_rustc: _,
+            reach: _,
+            policy: _,
         } = known;
         let mut own_statics = OwnStatics::new(
             db,
@@ -1131,6 +1133,8 @@ pub struct Rejections {
     base: Option<patch::Base>,
     frozen: patch::Frozen,
     stale: Vec<Stale>,
+    reach: reach::Cache,
+    policy: sharing::Cache,
     /// How many functions had been compiled when the last build finished.
     counted: usize,
     pub stats: BuildStats,
@@ -1157,6 +1161,7 @@ impl Rejections {
     /// Makes the next build a full one. A patch looks at everything the last build compiled,
     /// and what an edit took away can only be looked at where a panic can be caught.
     pub fn forget_base(&mut self) {
+        self.reach.clear();
         self.base = None;
     }
 
@@ -1169,6 +1174,8 @@ impl Rejections {
     /// Notes that a file changed: one of `crates`, or with `None` one we can't place. Every
     /// change since the last build has to be noted before [`Rejections::stale`] looks.
     pub fn touch(&mut self, db: &dyn HirDatabase, crates: Option<&[Crate]>) {
+        self.reach.clear();
+        self.policy.clear();
         match crates {
             Some(crates) => {
                 self.frozen.edit(crates.iter().flat_map(|it| it.transitive_rev_deps(db)))
@@ -1194,11 +1201,34 @@ impl Rejections {
     /// the program sees into: not `const` or `async`, not returning `impl Trait`, declaring no
     /// items, and not handed to a macro.
     pub fn touch_bodies(&mut self, db: &dyn HirDatabase, file: base_db::FileId) {
+        self.reach.touch(file);
+        self.policy.touch(file);
         self.frozen.edit_bodies(file);
         if let Some(base) = &mut self.base {
             base.touch_bodies(db, file);
         }
         self.forget();
+    }
+
+    pub fn reached(
+        &mut self,
+        db: &dyn HirDatabase,
+        sharing: Sharing,
+        edited: FxHashSet<Crate>,
+        tests: &[FunctionId],
+        always: &[FunctionId],
+        kept: &[StaticId],
+    ) -> (Vec<Reached>, Option<u128>, Vec<String>) {
+        self.reach.reached(db, sharing, edited, tests, always, kept)
+    }
+
+    pub fn sharing(&mut self, db: &dyn HirDatabase, sharing: Sharing) -> Sharing {
+        let sharing = self.policy.sharing(db, sharing);
+        if self.base.as_ref().is_some_and(|base| !base.shares_with(&sharing)) {
+            eprintln!("patch discard: cfg sharing decisions changed");
+            self.forget_base();
+        }
+        sharing
     }
 
     /// A function the last build left to rustc that is not what rustc compiled, and why it was

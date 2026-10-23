@@ -52,7 +52,7 @@ impl Node {
     }
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Graph {
     sharing: super::Sharing,
     ids: FxHashMap<Node, usize>,
@@ -127,7 +127,7 @@ fn print_subtree(db: &dyn HirDatabase, members: &[(u128, Component)], bits: u32)
     PrintTree::new(db, Vec::new(), children)
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Edges {
     targets: Vec<Node>,
     written: bool,
@@ -372,7 +372,7 @@ impl Bits {
 /// others. `always` and `kept` are what runs or is found without any code naming it: every
 /// test is taken to reach them. With it, the print of what all of them reach, and the first
 /// things reached that did not compile.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Topology {
     graph: Graph,
     components: Vec<Component>,
@@ -550,6 +550,269 @@ pub fn reached(
     reach_program(db, input).clone()
 }
 
+type Answer = (Vec<Reached>, Option<u128>, Vec<String>);
+
+#[derive(Default, Clone)]
+pub(super) struct Cache {
+    state: Option<Arc<Snapshot>>,
+    changed: FxHashSet<base_db::FileId>,
+}
+
+#[derive(Clone)]
+struct Snapshot {
+    input: ReachInput,
+    topology: Arc<Topology>,
+    files: Arc<FxHashMap<base_db::FileId, Vec<usize>>>,
+    bodies: Arc<FxHashMap<base_db::FileId, Vec<(FunctionId, crate::sharing::BodyItems)>>>,
+    nested: Arc<FxHashSet<base_db::FileId>>,
+    unplaced: Arc<Vec<usize>>,
+    edges: Arc<Vec<Edges>>,
+    own: Vec<Option<u128>>,
+    components: Vec<Option<u128>>,
+    roots: Arc<Vec<Bits>>,
+    ambient: Arc<FxHashSet<usize>>,
+    code: Vec<Option<u128>>,
+    ambient_code: Option<u128>,
+    answer: Answer,
+}
+
+impl Cache {
+    pub(super) fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(super) fn touch(&mut self, file: base_db::FileId) {
+        self.changed.insert(file);
+    }
+
+    pub(super) fn reached(
+        &mut self,
+        db: &dyn HirDatabase,
+        sharing: super::Sharing,
+        mut edited: FxHashSet<Crate>,
+        tests: &[FunctionId],
+        always: &[FunctionId],
+        kept: &[StaticId],
+    ) -> Answer {
+        sharing.edited_crates(&mut edited);
+        let mut edited: Vec<_> = edited.into_iter().collect();
+        edited.sort_by_key(print_of);
+        let input = ReachInput::new(
+            db,
+            Arc::new(Input {
+                sharing,
+                edited: edited.into(),
+                tests: tests.to_vec(),
+                always: always.to_vec(),
+                kept: kept.to_vec(),
+            }),
+        );
+        let changed = std::mem::take(&mut self.changed);
+        if let Some(state) = &mut self.state
+            && state.input == input
+            && Arc::make_mut(state).update(db, &changed)
+        {
+            if std::env::var_os("RUSTD_VERIFY_FASTPATH").is_some_and(|it| it == "1") {
+                assert_eq!(&state.answer, reach_program(db, input), "reach fast path");
+            }
+            if std::env::var_os("RUSTD_STATS").is_some() {
+                eprintln!("reach fast path: unchanged edges");
+            }
+            return state.answer.clone();
+        }
+        if std::env::var_os("RUSTD_STATS").is_some() {
+            eprintln!("reach full path");
+        }
+        let answer = reach_program(db, input).clone();
+        self.state = Some(Arc::new(Snapshot::new(db, input, answer.clone())));
+        answer
+    }
+}
+
+impl Snapshot {
+    fn new(db: &dyn HirDatabase, input: ReachInput, answer: Answer) -> Self {
+        let data = input.data(db);
+        let topology = Arc::new(reach_topology(db, input).clone());
+        let mut files: FxHashMap<_, Vec<usize>> = FxHashMap::default();
+        let mut functions: FxHashSet<FunctionId> = FxHashSet::default();
+        let mut nested = FxHashSet::default();
+        let mut unplaced = Vec::new();
+        let mut edges = Vec::new();
+        let mut own = Vec::new();
+        for (id, node) in topology.graph.nodes.iter().enumerate() {
+            let local = match node {
+                Node::Root(func) => func.module(db).block(db).is_some(),
+                Node::Instance(instance, _) => super::home::written_in(db, instance)
+                    .is_some_and(|func| func.module(db).block(db).is_some()),
+                Node::Static(statik) => statik.module(db).block(db).is_some(),
+            };
+            if local {
+                match node {
+                    Node::Root(func) => {
+                        nested.insert(super::home::body_file(db, (*func).into()));
+                    }
+                    Node::Instance(instance, _) => {
+                        if let Some(func) = super::home::written_in(db, instance) {
+                            nested.insert(super::home::body_file(db, func.into()));
+                        }
+                    }
+                    Node::Static(statik) => {
+                        nested.insert(super::home::body_file(db, (*statik).into()));
+                    }
+                }
+            }
+            if let Some(func) = match node {
+                Node::Root(func) => Some(*func),
+                Node::Instance(instance, _) => super::home::written_in(db, instance),
+                Node::Static(_) => None,
+            } {
+                functions.insert(func);
+            }
+            let homes = match node {
+                Node::Root(id) => Some(vec![super::home::body_file(db, (*id).into())]),
+                Node::Static(id) => Some(vec![super::home::body_file(db, (*id).into())]),
+                Node::Instance(instance, _) => super::home::body_files(db, instance).map(Vec::from),
+            };
+            match homes {
+                Some(homes) => {
+                    for file in homes {
+                        files.entry(file).or_default().push(id);
+                    }
+                }
+                None => unplaced.push(id),
+            }
+            edges.push(
+                reach_edges(db, node.clone(), data.sharing.clone(), data.edited.clone()).clone(),
+            );
+            own.push(reach_own(db, node.clone(), data.sharing.clone(), data.edited.clone()));
+        }
+        let ids: FxHashMap<_, _> =
+            topology.components.iter().copied().enumerate().map(|(i, c)| (c, i)).collect();
+        let mut roots = vec![Bits::default(); topology.components.len()];
+        for (root, &node) in topology.tests.iter().enumerate() {
+            roots[topology.of[node]].insert(root);
+        }
+        let mut ambient: FxHashSet<_> =
+            topology.ambient.iter().map(|&node| topology.of[node]).collect();
+        for (id, component) in topology.components.iter().enumerate().rev() {
+            let here = roots[id].clone();
+            for below in component.below(db) {
+                let below = ids[below];
+                roots[below].union(&here);
+                if ambient.contains(&id) {
+                    ambient.insert(below);
+                }
+            }
+        }
+        let components = topology
+            .components
+            .iter()
+            .map(|&c| reach_component_print(db, c, data.sharing.clone(), data.edited.clone()))
+            .collect();
+        let code = (0..data.tests.len()).map(|id| reach_root_code(db, input, id)).collect();
+        let ambient_code = reach_ambient(db, input).as_ref().map(|it| it[0]);
+        let mut bodies: FxHashMap<_, Vec<_>> = FxHashMap::default();
+        for func in functions {
+            if hir_def::signatures::FunctionSignature::of(db, func).has_body() {
+                bodies
+                    .entry(super::home::body_file(db, func.into()))
+                    .or_default()
+                    .push((func, crate::sharing::body_item_inventory(db, func).clone()));
+            }
+        }
+        Self {
+            input,
+            topology,
+            files: Arc::new(files),
+            bodies: Arc::new(bodies),
+            nested: Arc::new(nested),
+            unplaced: Arc::new(unplaced),
+            edges: Arc::new(edges),
+            own,
+            components,
+            roots: Arc::new(roots),
+            ambient: Arc::new(ambient),
+            code,
+            ambient_code,
+            answer,
+        }
+    }
+
+    fn update(&mut self, db: &dyn HirDatabase, files: &FxHashSet<base_db::FileId>) -> bool {
+        let data = self.input.data(db);
+        let mut candidates = FxHashSet::default();
+        for file in files {
+            if self.nested.contains(file) {
+                return false;
+            }
+            if self
+                .bodies
+                .get(file)
+                .into_iter()
+                .flatten()
+                .any(|(func, items)| crate::sharing::body_item_inventory(db, *func) != items)
+            {
+                return false;
+            }
+            candidates.extend(self.files.get(file).into_iter().flatten().copied());
+        }
+        if !files.is_empty() {
+            candidates.extend(self.unplaced.iter().copied());
+        }
+        let mut changed = FxHashSet::default();
+        for id in candidates {
+            let node = &self.topology.graph.nodes[id];
+            if reach_edges(db, node.clone(), data.sharing.clone(), data.edited.clone())
+                != &self.edges[id]
+            {
+                return false;
+            }
+            let own = reach_own(db, node.clone(), data.sharing.clone(), data.edited.clone());
+            if own != self.own[id] {
+                self.own[id] = own;
+                changed.insert(self.topology.of[id]);
+            }
+        }
+        if changed.is_empty() {
+            return true;
+        }
+        for id in changed {
+            let mut own: Option<Vec<_>> = self.topology.components[id]
+                .members(db)
+                .iter()
+                .map(|node| self.own[self.topology.graph.ids[node]])
+                .collect();
+            if let Some(own) = &mut own {
+                own.sort_unstable();
+            }
+            let new = own.map(|own| print_of(&own));
+            let old = std::mem::replace(&mut self.components[id], new);
+            if old == new {
+                continue;
+            }
+            let (Some(old), Some(new)) = (old, new) else {
+                return false;
+            };
+            for root in self.roots[id].iter() {
+                self.code[root] =
+                    self.code[root].map(|code| code.wrapping_sub(old).wrapping_add(new));
+            }
+            if self.ambient.contains(&id) {
+                self.ambient_code =
+                    self.ambient_code.map(|code| code.wrapping_sub(old).wrapping_add(new));
+            }
+        }
+        let ambient = self.ambient_code.map(|code| vec![code]);
+        let alone = self
+            .code
+            .iter()
+            .map(|code| code.zip(ambient.as_ref()).map(|it| print_of(&it)))
+            .collect();
+        self.answer = finish(&self.topology, alone, ambient.as_ref().map(print_of));
+        true
+    }
+}
+
 #[salsa::tracked(returns(ref))]
 fn reach_program(
     db: &dyn HirDatabase,
@@ -558,6 +821,10 @@ fn reach_program(
     let topology = reach_topology(db, input);
     let alone: Vec<_> =
         (0..input.data(db).tests.len()).map(|id| reach_root_print(db, input, id)).collect();
+    finish(topology, alone, reach_ambient(db, input).as_ref().map(print_of))
+}
+
+fn finish(topology: &Topology, alone: Vec<Option<u128>>, ambient: Option<u128>) -> Answer {
     let group = &topology.groups;
     // What one test of a group leaves in a static is what another finds: each has the
     // result it has for the code of all of them.
@@ -576,5 +843,5 @@ fn reach_program(
             Reached { print: alone.zip(all).map(|it| print_of(&it)), group }
         })
         .collect();
-    (reached, reach_ambient(db, input).as_ref().map(print_of), topology.graph.unknown.clone())
+    (reached, ambient, topology.graph.unknown.clone())
 }

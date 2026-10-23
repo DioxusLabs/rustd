@@ -1,8 +1,13 @@
 use base_db::Crate;
-use hir_def::{AttrDefId, CallableDefId, DefWithBodyId, FunctionId, HasModule};
+use hir_def::{AttrDefId, CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup};
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     TypeFoldable, TypeFolder, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitor,
     inherent::{IntoKind, Ty as _},
+};
+use std::{
+    hash::{Hash, Hasher},
+    sync::Arc,
 };
 
 use crate::{
@@ -41,11 +46,199 @@ fn decision_serial(db: &dyn HirDatabase, normal: Crate, test: Crate, both: bool)
 pub struct Sharing {
     pairs: Vec<(Crate, Crate, bool)>,
     enabled: bool,
+    snapshot: Option<Arc<Policy>>,
+}
+
+#[derive(Debug, Clone)]
+struct PairPolicy {
+    key: (Crate, Crate, bool, u128),
+    twins: hir_def::twins::TwinIndex,
+    reverse: FxHashMap<AttrDefId, AttrDefId>,
+    eligibility: crate::sharing::Eligibility,
+}
+
+#[derive(Debug, Clone)]
+struct Policy(Vec<PairPolicy>);
+
+impl PartialEq for Policy {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.iter().map(|it| it.key).eq(other.0.iter().map(|it| it.key))
+    }
+}
+impl Eq for Policy {}
+impl Hash for Policy {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.len().hash(state);
+        for pair in &self.0 {
+            pair.key.hash(state);
+        }
+    }
+}
+
+#[derive(Default, Clone)]
+pub(super) struct Cache {
+    input: Option<Sharing>,
+    shared: Option<Sharing>,
+    files: FxHashMap<base_db::FileId, FileFacts>,
+    changed: FxHashSet<base_db::FileId>,
+}
+
+#[derive(Default, Clone)]
+struct FileFacts {
+    nested: bool,
+    trees: Vec<(Crate, hir_expand::HirFileId, Option<Arc<hir_def::item_tree::ItemTree>>)>,
+    bodies: Vec<(FunctionId, bool, crate::sharing::BodySharingFacts)>,
+}
+
+impl Cache {
+    pub(super) fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(super) fn touch(&mut self, file: base_db::FileId) {
+        self.changed.insert(file);
+    }
+
+    pub(super) fn sharing(&mut self, db: &dyn HirDatabase, input: Sharing) -> Sharing {
+        let changed = std::mem::take(&mut self.changed);
+        let same = self.input.as_ref() == Some(&input)
+            && changed.iter().all(|file| {
+                self.files.get(file).is_some_and(|facts| {
+                    !facts.nested
+                        && facts.trees.iter().all(|(krate, file, tree)| {
+                            &hir_def::item_tree::file_item_tree_snapshot(db, *file, *krate) == tree
+                        })
+                        && facts.bodies.iter().all(|(func, normal, facts)| {
+                            crate::sharing::body_sharing_facts(db, *func, *normal) == facts
+                        })
+                })
+            });
+        if same && let Some(shared) = &self.shared {
+            if std::env::var_os("RUSTD_VERIFY_FASTPATH").is_some_and(|it| it == "1") {
+                let full = input.clone().capture(db);
+                for (cached, full) in shared
+                    .snapshot
+                    .iter()
+                    .flat_map(|it| &it.0)
+                    .zip(full.snapshot.iter().flat_map(|it| &it.0))
+                {
+                    assert_eq!(cached.twins, full.twins, "sharing twins fast path");
+                    assert_eq!(
+                        cached.eligibility, full.eligibility,
+                        "sharing eligibility fast path"
+                    );
+                }
+                assert_eq!(
+                    shared.decisions(db),
+                    full.decisions(db),
+                    "sharing fingerprint fast path"
+                );
+            }
+            if !input.is_empty() && std::env::var_os("RUSTD_STATS").is_some() {
+                eprintln!("sharing fast path: unchanged facts");
+            }
+            return shared.clone();
+        }
+        if !input.is_empty() && std::env::var_os("RUSTD_STATS").is_some() {
+            eprintln!("sharing full path");
+        }
+        let shared = input.clone().capture(db);
+        self.files.clear();
+        if !input.is_empty() {
+            let mut crates = FxHashMap::default();
+            for &(normal, test, _) in &input.pairs {
+                crates.insert(normal, true);
+                crates.entry(test).or_insert(false);
+            }
+            for (krate, normal) in crates {
+                for &item in &hir_def::twins::crate_items(db, krate).items {
+                    let AttrDefId::FunctionId(func) = item else { continue };
+                    if !hir_def::signatures::FunctionSignature::of(db, func).has_body() {
+                        continue;
+                    }
+                    let source = func.lookup(db).id.file_id;
+                    let file = super::home::body_file(db, func.into());
+                    let facts = self.files.entry(file).or_default();
+                    facts.nested |= func.module(db).block(db).is_some();
+                    if !facts.trees.iter().any(|&(k, f, _)| k == krate && f == source) {
+                        facts.trees.push((
+                            krate,
+                            source,
+                            hir_def::item_tree::file_item_tree_snapshot(db, source, krate),
+                        ));
+                    }
+                    facts.bodies.push((
+                        func,
+                        normal,
+                        crate::sharing::body_sharing_facts(db, func, normal).clone(),
+                    ));
+                }
+            }
+        }
+        self.input = Some(input);
+        self.shared = Some(shared.clone());
+        shared
+    }
 }
 
 impl Sharing {
+    fn capture(mut self, db: &dyn HirDatabase) -> Self {
+        if !self.is_empty() {
+            self.snapshot = Some(Arc::new(Policy(
+                self.pairs
+                    .iter()
+                    .map(|&(n, t, both)| PairPolicy {
+                        key: (n, t, both, decision_serial(db, n, t, both)),
+                        twins: hir_def::twins::twin_index(db, n, t).clone(),
+                        reverse: reverse_twins(db, n, t).clone(),
+                        eligibility: crate::sharing::pair_eligibility(db, n, t, both).clone(),
+                    })
+                    .collect(),
+            )));
+        }
+        self
+    }
+
+    fn policy(&self, normal: Crate, test: Crate) -> Option<&PairPolicy> {
+        self.snapshot.as_ref()?.0.iter().find(|it| (it.key.0, it.key.1) == (normal, test))
+    }
+
+    fn twins<'a>(
+        &'a self,
+        db: &'a dyn HirDatabase,
+        normal: Crate,
+        test: Crate,
+    ) -> &'a hir_def::twins::TwinIndex {
+        self.policy(normal, test)
+            .map(|it| &it.twins)
+            .unwrap_or_else(|| hir_def::twins::twin_index(db, normal, test))
+    }
+
+    fn reverse<'a>(
+        &'a self,
+        db: &'a dyn HirDatabase,
+        normal: Crate,
+        test: Crate,
+    ) -> &'a FxHashMap<AttrDefId, AttrDefId> {
+        self.policy(normal, test)
+            .map(|it| &it.reverse)
+            .unwrap_or_else(|| reverse_twins(db, normal, test))
+    }
+
+    fn eligibility<'a>(
+        &'a self,
+        db: &'a dyn HirDatabase,
+        normal: Crate,
+        test: Crate,
+        both: bool,
+    ) -> &'a crate::sharing::Eligibility {
+        self.policy(normal, test)
+            .map(|it| &it.eligibility)
+            .unwrap_or_else(|| crate::sharing::pair_eligibility(db, normal, test, both))
+    }
+
     pub(super) fn prewarm(&self, db: &dyn HirDatabase) {
-        if self.is_empty() {
+        if self.is_empty() || self.snapshot.is_some() {
             return;
         }
         let tally = super::backend::Tally::global();
@@ -61,11 +254,14 @@ impl Sharing {
         if self.is_empty() {
             return Vec::new();
         }
+        if let Some(snapshot) = &self.snapshot {
+            return snapshot.0.iter().map(|it| it.key.3).collect();
+        }
         self.pairs.iter().map(|&(n, t, both)| decision_serial(db, n, t, both)).collect()
     }
 
     pub fn new(pairs: Vec<(Crate, Crate, bool)>) -> Self {
-        Self { pairs, enabled: true }
+        Self { pairs, enabled: true, snapshot: None }
     }
 
     pub fn disabled(mut self) -> Self {
@@ -104,13 +300,9 @@ impl Sharing {
             if item.module(db).krate(db) != test {
                 continue;
             }
-            let eligibility = crate::sharing::pair_eligibility(db, normal, test, both);
+            let eligibility = self.eligibility(db, normal, test, both);
             if eligibility.pair_veto.is_empty() && eligibility.candidates.contains(&item) {
-                return hir_def::twins::twin_index(db, normal, test)
-                    .twins
-                    .get(&item)
-                    .copied()
-                    .unwrap_or(item);
+                return self.twins(db, normal, test).twins.get(&item).copied().unwrap_or(item);
             }
         }
         item
@@ -119,9 +311,7 @@ impl Sharing {
     pub(super) fn analysis_shared(&self, db: &dyn HirDatabase, func: FunctionId) -> bool {
         self.pairs.iter().any(|&(n, t, both)| {
             func.krate(db) == t
-                && crate::sharing::pair_eligibility(db, n, t, both)
-                    .analysis_shared
-                    .contains(&func.into())
+                && self.eligibility(db, n, t, both).analysis_shared.contains(&func.into())
         })
     }
 
@@ -135,9 +325,9 @@ impl Sharing {
         }
         for &(normal, test, both) in &self.pairs {
             if func.krate(db) == test
-                && crate::sharing::pair_eligibility(db, normal, test, both).pair_veto.is_empty()
+                && self.eligibility(db, normal, test, both).pair_veto.is_empty()
                 && let Some(&AttrDefId::FunctionId(source)) =
-                    hir_def::twins::twin_index(db, normal, test).twins.get(&func.into())
+                    self.twins(db, normal, test).twins.get(&func.into())
             {
                 return Some(source);
             }
@@ -193,7 +383,7 @@ impl Sharing {
         let normal = source.krate(db);
         for &(n, t, _) in &self.pairs {
             if n == normal && item.module(db).krate(db) == n {
-                return reverse_twins(db, n, t).get(&item).copied().unwrap_or(item);
+                return self.reverse(db, n, t).get(&item).copied().unwrap_or(item);
             }
         }
         item
@@ -328,7 +518,7 @@ impl Sharing {
     fn link_item(&self, db: &dyn HirDatabase, item: AttrDefId) -> AttrDefId {
         for &(normal, test, both) in &self.pairs {
             if !both && item.module(db).krate(db) == normal {
-                if let Some(&t) = reverse_twins(db, normal, test).get(&item) {
+                if let Some(&t) = self.reverse(db, normal, test).get(&item) {
                     return t;
                 }
             }
@@ -411,10 +601,7 @@ impl Sharing {
         for &(normal, test, both) in &self.pairs {
             if !both && id.krate(db) == normal {
                 if let Some((&AttrDefId::StaticId(t), _)) =
-                    hir_def::twins::twin_index(db, normal, test)
-                        .twins
-                        .iter()
-                        .find(|(_, n)| **n == id.into())
+                    self.twins(db, normal, test).twins.iter().find(|(_, n)| **n == id.into())
                 {
                     return t;
                 }
@@ -439,7 +626,7 @@ impl Sharing {
         for &(normal, test, both) in &self.pairs {
             if !both && func.krate(db) == normal {
                 if let Some(&AttrDefId::FunctionId(t)) =
-                    reverse_twins(db, normal, test).get(&func.into())
+                    self.reverse(db, normal, test).get(&func.into())
                 {
                     return t;
                 }
@@ -466,7 +653,7 @@ impl<'db> Canonical<'_, 'db> {
         if let Some(normal) = self.analysis {
             for &(n, t, _) in &self.sharing.pairs {
                 if n == normal && item.module(self.db).krate(self.db) == n {
-                    return reverse_twins(self.db, n, t).get(&item).copied().unwrap_or(item);
+                    return self.sharing.reverse(self.db, n, t).get(&item).copied().unwrap_or(item);
                 }
             }
             return item;
@@ -700,7 +887,7 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Unified<'_, 'db> {
                 if !both {
                     continue;
                 }
-                let twins = hir_def::twins::twin_index(self.db, normal, test);
+                let twins = self.sharing.twins(self.db, normal, test);
                 self.found |= twins
                     .twins
                     .iter()

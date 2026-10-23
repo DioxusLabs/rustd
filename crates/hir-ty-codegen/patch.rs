@@ -699,6 +699,10 @@ impl Base {
         self.decisions != self.sharing.decisions(db)
     }
 
+    pub(super) fn shares_with(&self, sharing: &super::Sharing) -> bool {
+        (self.sharing.is_empty() && sharing.is_empty()) || &self.sharing == sharing
+    }
+
     /// Notes that a file changed: one of `crates`, or with `None` one we can't place.
     pub(super) fn touch(&mut self, db: &dyn HirDatabase, crates: Option<&[Crate]>) {
         let Some(crates) = crates else {

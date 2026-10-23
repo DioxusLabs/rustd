@@ -1598,7 +1598,7 @@ pub fn total() -> u64 {{ {total} }}
         store = os.path.join(work, "store-sharing-incremental-" + mode)
         for prime in ("cold", "retained"):
             env = dict(base_env(os.path.join(work, f"hi-{mode}-{prime[0]}")), RUSTD_CACHE=store,
-                       RUSTD_STATS="1", RUSTD_TRACE="1", RUSTD_CFG_SHARING="1" if mode == "on" else "0")
+                       RUSTD_STATS="1", RUSTD_TRACE="1", RUSTD_VERIFY_FASTPATH="1", RUSTD_CFG_SHARING="1" if mode == "on" else "0")
             side = Side(ws, env, True)
             def logs():
                 return {path: path.read_text(errors="replace") for path in pathlib.Path(env["RUSTD_HOME"]).glob("**/log")}
@@ -1607,7 +1607,7 @@ pub fn total() -> u64 {{ {total} }}
                 wait_warm(side, ws)
                 before = logs()
                 primed = "\n".join(before.values())
-                pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "let enabled = x != 0;\n    enabled"))
+                pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "let enabled = x != 2;\n    enabled"))
                 _, edited = side.cargo("test", "--lib")
                 fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
                 count = sum(map(int, re.findall(r"backend: (?:cranelift|llvm) compiled (\d+) functions,", fresh)))
@@ -1619,6 +1619,11 @@ pub fn total() -> u64 {{ {total} }}
                 detail = f"{count} backend functions; {fresh[-700:]}"
                 checks.append((name, held, detail))
                 print(f"  {'ok ' if held else 'NOT'} {name}  {detail}", flush=True)
+                name = f"cfg sharing: {mode} {prime}-prime body edit takes verified fast paths"
+                held = ("reach fast path: unchanged edges" in fresh and "reach full path" not in fresh
+                        and (mode == "off" or ("sharing fast path: unchanged facts" in fresh and "sharing full path" not in fresh)))
+                checks.append((name, held, fresh[-700:]))
+                print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
                 name = f"cfg sharing: {mode} {prime}-prime edit keeps unchanged report shims"
                 held = "patch reports: 0 of 20" in fresh
                 checks.append((name, held, fresh[-700:]))
@@ -1630,6 +1635,15 @@ pub fn total() -> u64 {{ {total} }}
                             and count_ran <= limit)
                     checks.append((name, held, f"executed {count_ran}"))
                     print(f"  {'ok ' if held else 'NOT'} {name}: {count_ran}", flush=True)
+                for case, text in [("code-only edit", feature.replace("x != 0", "x != 3")), ("restored code", feature)]:
+                    before = logs()
+                    pathlib.Path(ws, "src/features.rs").write_text(text)
+                    _, result = side.cargo("test", "--lib")
+                    fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                    name = f"cfg sharing: {mode} {prime}-prime {case} verifies reach prints"
+                    held = result.returncode == 0 and "reach fast path: unchanged edges" in fresh
+                    checks.append((name, held, fresh[-700:]))
+                    print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
                 before = logs()
                 pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "identity(x) != 0"))
                 _, edge_edit = side.cargo("test", "--lib")
@@ -1637,11 +1651,19 @@ pub fn total() -> u64 {{ {total} }}
                 name = f"cfg sharing: {mode} {prime}-prime edge edit leaves unrelated roots cached"
                 topology_ran = sum(map(int, re.findall(r"\breach_topology=(\d+)", fresh)))
                 roots_ran = sum(map(int, re.findall(r"\breach_root_code=(\d+)", fresh)))
-                held = edge_edit.returncode == 0 and topology_ran == 1 and roots_ran == 1
+                held = edge_edit.returncode == 0 and topology_ran == 1 and roots_ran == 1 and "reach full path" in fresh
                 detail = f"topology {topology_ran}, roots {roots_ran}"
                 checks.append((name, held, detail))
                 print(f"  {'ok ' if held else 'NOT'} {name}: {detail}", flush=True)
                 if mode == "on":
+                    before = logs()
+                    pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "let _ = cfg!(test); identity(x) != 0"))
+                    _, cfg_edit = side.cargo("test", "--lib")
+                    fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                    name = f"cfg sharing: {prime}-prime body cfg fact invalidates policy"
+                    held = cfg_edit.returncode == 0 and "sharing full path" in fresh
+                    checks.append((name, held, fresh[-700:]))
+                    print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
                     before = logs()
                     pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "const _: u64 = 0; x != 0"))
                     _, inventory_edit = side.cargo("test", "--lib")
@@ -1653,6 +1675,15 @@ pub fn total() -> u64 {{ {total} }}
                     detail = f"impl inventory {impls_ran}, ADT impl facts {applicable_ran}"
                     checks.append((name, held, detail))
                     print(f"  {'ok ' if held else 'NOT'} {name}: {detail}", flush=True)
+                for case, text in [("added static", feature.replace("x != 0", "static ON: u64 = 1; x != 0 && ON == 1")), ("removed static", feature)]:
+                    before = logs()
+                    pathlib.Path(ws, "src/features.rs").write_text(text)
+                    _, result = side.cargo("test", "--lib")
+                    fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                    name = f"cfg sharing: {mode} {prime}-prime {case} rebuilds reach"
+                    held = result.returncode == 0 and "reach full path" in fresh
+                    checks.append((name, held, fresh[-700:]))
+                    print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
                 if mode == "on" and prime == "cold":
                     source = files["src/lib.rs"]
                     cases = [

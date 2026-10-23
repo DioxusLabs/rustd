@@ -3241,7 +3241,7 @@ fn build(
     // The program's `main` is called by one rustc wrote, when rustc built the crate.
     let own = |main: &FunctionId| resolver.own_crate_id(hir_def::HasModule::krate(main, db));
     let roots = Roots {
-        sharing: program_sharing(db, args),
+        sharing: hir::attach_db(db, || known.sharing(db, program_sharing(db, args))),
         entries: &entries,
         on_demand: &on_demand,
         start: main.filter(|it| own(it).is_some()),
@@ -3327,7 +3327,7 @@ fn build(
     let mut harness_unfit = None;
     if let Some(harness) = harness {
         // What each test can run, for the client to run only the ones an edit can change.
-        Reached::of(db, listed, args).write(&args.out)?;
+        Reached::of(db, listed, args, known).write(&args.out)?;
         reached = start.elapsed() - written;
         let text = hir::attach_db(db, || match programs_own.first() {
             Some(&krate) if doctest => {
@@ -7032,7 +7032,7 @@ impl Tests {
     /// What each test of the program can run, as lines for the client that decides which
     /// of them to run: `test <print> <group> <name>`. A print of `-` is of code that is
     /// not all known.
-    fn reached(db: &RootDatabase, listed: &Listed, args: &Args) -> String {
+    fn reached(db: &RootDatabase, listed: &Listed, args: &Args, known: &mut Rejections) -> String {
         use std::fmt::Write as _;
         let (mut always, mut kept) = (Vec::new(), Vec::new());
         let mut edited = FxHashSet::default();
@@ -7047,14 +7047,8 @@ impl Tests {
         }
         let tests = Tests::named(db, listed, args);
         let roots: Vec<FunctionId> = tests.iter().map(|it| it.0).collect();
-        let (reached, _, unknown) = hir_ty::mir::codegen::reached(
-            db,
-            program_sharing(db, args),
-            edited,
-            &roots,
-            &always,
-            &kept,
-        );
+        let sharing = known.sharing(db, program_sharing(db, args));
+        let (reached, _, unknown) = known.reached(db, sharing, edited, &roots, &always, &kept);
         if !unknown.is_empty() {
             eprintln!("reached: not known: {}", unknown.join("; "));
         }
@@ -7106,8 +7100,8 @@ fn trace_queries(db: &RootDatabase) {
 struct Reached(String);
 
 impl Reached {
-    fn of(db: &RootDatabase, listed: &Listed, args: &Args) -> Reached {
-        Reached(hir::attach_db(db, || Tests::reached(db, listed, args)))
+    fn of(db: &RootDatabase, listed: &Listed, args: &Args, known: &mut Rejections) -> Reached {
+        Reached(hir::attach_db(db, || Tests::reached(db, listed, args, known)))
     }
 
     fn path(object: &Path, suffix: &str) -> PathBuf {
