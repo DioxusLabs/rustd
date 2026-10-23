@@ -400,6 +400,160 @@ fn collect(db: &dyn SourceDatabase, map: &DefMap, items: &mut CrateItems) {
 }
 
 #[salsa::tracked(returns(ref))]
+pub fn declaration_items(db: &dyn SourceDatabase, krate: Crate) -> CrateItems {
+    let mut items = CrateItems::default();
+    collect(db, crate_def_map(db, krate), &mut items);
+    items
+}
+
+#[salsa::tracked(returns(ref))]
+fn declarations_by_source(
+    db: &dyn SourceDatabase,
+    module: crate::ModuleId,
+) -> FxHashMap<SourceKey, Vec<AttrDefId>> {
+    let mut result = FxHashMap::default();
+    let mut items = FxHashSet::default();
+    scope_items(db, module.def_map(db).module(db, module).scope(db), &mut items);
+    for &item in &items {
+        if let Some(key) = source_key(db, item) {
+            result.entry(key).or_insert_with(Vec::new).push(item);
+        }
+    }
+    result
+}
+
+#[salsa::tracked(returns(ref))]
+fn declaration_definitions(
+    db: &dyn SourceDatabase,
+    normal: Crate,
+    test: Crate,
+) -> FxHashMap<MacroDefId, AttrDefId> {
+    declaration_items(db, normal)
+        .definitions
+        .iter()
+        .chain(&declaration_items(db, test).definitions)
+        .map(|(&k, &v)| (k, v))
+        .collect()
+}
+
+#[salsa::tracked(returns(copy))]
+pub fn declaration_twin(
+    db: &dyn SourceDatabase,
+    normal: Crate,
+    test: Crate,
+    item: AttrDefId,
+) -> Option<AttrDefId> {
+    if normal == test || normal.root_file_id(db) != test.root_file_id(db) {
+        return None;
+    }
+    let module = item.module(db);
+    let target = declaration_scope_pairs(db, normal, test)
+        .iter()
+        .find_map(|&(n, t)| (t == module).then_some(n))?;
+    let candidates = declarations_by_source(db, target).get(&source_key(db, item)?)?;
+    let &[twin] = candidates.as_slice() else { return None };
+    let mut matcher = CallMatcher {
+        db,
+        normal,
+        test,
+        definitions: declaration_definitions(db, normal, test),
+        calls: FxHashMap::default(),
+        active: FxHashSet::default(),
+        pending: Vec::new(),
+    };
+    (item_kind(db, twin).is_some()
+        && item_kind(db, twin) == item_kind(db, item)
+        && matcher.origins(twin, item))
+    .then_some(twin)
+}
+
+#[salsa::tracked(returns(ref))]
+pub fn declaration_twins(db: &dyn SourceDatabase, normal: Crate, test: Crate) -> TwinIndex {
+    let mut result = TwinIndex::default();
+    for &item in &declaration_items(db, test).items {
+        let is_body = usize::from(function_body(db, item));
+        if is_body != 0 {
+            result.function_items.insert(item);
+        }
+        if item_gated_off(db, item, normal) {
+            result.test_only.insert(item);
+            result.function_bodies.test_only += is_body;
+        } else if let Some(twin) = declaration_twin(db, normal, test, item) {
+            result.twins.insert(item, twin);
+            result.function_bodies.twins += is_body;
+            let (n, t) = (declaration_reads(db, twin), declaration_reads(db, item));
+            if n.differs_from(test.cfg_options(db)) || t.differs_from(normal.cfg_options(db)) {
+                result.cfg_differing_items.insert(item);
+                result.cfg_differing += 1;
+                result.function_bodies.cfg_differing += is_body;
+            }
+            if n.unknown || t.unknown {
+                result.unknown_items.insert(item);
+                result.unknown += 1;
+                result.function_bodies.unknown += is_body;
+            }
+        } else {
+            result.unmatched.insert(item);
+            result.function_bodies.unmatched += is_body;
+        }
+    }
+    result.normal_only = declaration_items(db, normal).items.len() - result.twins.len();
+    result
+}
+
+#[salsa::tracked(returns(ref))]
+pub fn local_item_twin(
+    db: &dyn SourceDatabase,
+    normal: Crate,
+    test: Crate,
+    item: AttrDefId,
+) -> ItemTwin {
+    let mut result = ItemTwin {
+        twin: declaration_twin(db, normal, test, item),
+        is_body: usize::from(function_body(db, item)),
+        test_only: item_gated_off(db, item, normal),
+        ..ItemTwin::default()
+    };
+    let Some(twin) = result.twin else { return result };
+    let (mut n, mut t) = (origin_reads(db, twin), origin_reads(db, item));
+    let mut macros_known = true;
+    if let (Some(no), Some(to)) = (body(twin), body(item)) {
+        let (ni, ti) = (body_inventory(db, no), body_inventory(db, to));
+        let (nc, tc) = (&ni.body_calls[&no], &ti.body_calls[&to]);
+        let mut definitions = declaration_definitions(db, normal, test).clone();
+        definitions.extend(ni.definitions.iter().chain(&ti.definitions).map(|(&k, &v)| (k, v)));
+        let mut matcher = CallMatcher {
+            db,
+            normal,
+            test,
+            definitions: &definitions,
+            calls: FxHashMap::default(),
+            active: FxHashSet::default(),
+            pending: Vec::new(),
+        };
+        let mut keyed = FxHashMap::default();
+        for &call in nc {
+            if let Some(key) = call_key(db, call, 0) {
+                keyed.entry(key).or_insert_with(Vec::new).push(call);
+            }
+            n.merge(&expansion_input_reads(db, call));
+        }
+        macros_known &= nc.len() == tc.len();
+        for &call in tc {
+            t.merge(&expansion_input_reads(db, call));
+            macros_known &= call_key(db, call, 0)
+                .and_then(|key| keyed.get(&key))
+                .filter(|calls| calls.len() == 1)
+                .is_some_and(|calls| matcher.call(calls[0], call));
+        }
+    }
+    result.differs =
+        usize::from(n.differs_from(test.cfg_options(db)) || t.differs_from(normal.cfg_options(db)));
+    result.unknown = usize::from(n.unknown || t.unknown || !macros_known);
+    result
+}
+
+#[salsa::tracked(returns(ref))]
 pub fn crate_items(db: &dyn SourceDatabase, krate: Crate) -> CrateItems {
     let mut items = CrateItems::default();
     collect(db, crate_def_map(db, krate), &mut items);
@@ -455,6 +609,26 @@ pub fn scope_pairs(
     normal: Crate,
     test: Crate,
 ) -> Vec<(crate::ModuleId, crate::ModuleId)> {
+    scope_pairs_for(db, normal, test, false)
+}
+
+#[salsa::tracked(returns(clone))]
+pub fn declaration_scope_pairs(
+    db: &dyn SourceDatabase,
+    normal: Crate,
+    test: Crate,
+) -> Vec<(crate::ModuleId, crate::ModuleId)> {
+    scope_pairs_for(db, normal, test, true)
+}
+
+fn scope_pairs_for(
+    db: &dyn SourceDatabase,
+    normal: Crate,
+    test: Crate,
+    declarations: bool,
+) -> Vec<(crate::ModuleId, crate::ModuleId)> {
+    let inventory =
+        |krate| if declarations { declaration_items(db, krate) } else { crate_items(db, krate) };
     let key = |module: crate::ModuleId| {
         let mut keys = Vec::new();
         if let Some(block) = module.block(db) {
@@ -470,12 +644,12 @@ pub fn scope_pairs(
         Some(keys)
     };
     let mut normals = FxHashMap::default();
-    for &module in &crate_items(db, normal).scopes {
+    for &module in &inventory(normal).scopes {
         if let Some(key) = key(module) {
             normals.entry(key).or_insert_with(Vec::new).push(module);
         }
     }
-    crate_items(db, test)
+    inventory(test)
         .scopes
         .iter()
         .filter_map(|&module| {
@@ -744,6 +918,18 @@ fn origin_reads(db: &dyn SourceDatabase, item: AttrDefId) -> CfgReads {
     reads
 }
 
+#[salsa::tracked(returns(clone))]
+pub fn declaration_reads(db: &dyn SourceDatabase, item: AttrDefId) -> CfgReads {
+    let mut reads = item_cfg_reads(db, item).clone();
+    let mut file = ast_id(db, item).map(|id| id.file_id);
+    for _ in 0..64 {
+        let Some(call) = file.and_then(|file| file.macro_file()) else { break };
+        reads.merge(&expansion_input_reads(db, call));
+        file = Some(call.loc(db).kind.file_id());
+    }
+    reads
+}
+
 fn function_body(db: &dyn SourceDatabase, item: AttrDefId) -> bool {
     matches!(item, AttrDefId::FunctionId(id) if FunctionSignature::of(db, id).has_body())
 }
@@ -777,12 +963,12 @@ fn items_by_source(db: &dyn SourceDatabase, normal: Crate) -> FxHashMap<SourceKe
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-struct ItemTwin {
-    twin: Option<AttrDefId>,
+pub struct ItemTwin {
+    pub twin: Option<AttrDefId>,
     is_body: usize,
     test_only: bool,
-    differs: usize,
-    unknown: usize,
+    pub differs: usize,
+    pub unknown: usize,
 }
 
 #[salsa::tracked(returns(ref))]
@@ -981,6 +1167,44 @@ fn shared() {}
         assert!(index.unmatched.is_empty());
         assert_eq!(index.normal_only, 1);
         assert_eq!(index.unknown, 0);
+    }
+
+    #[test]
+    fn local_twins_do_not_inventory_other_bodies() {
+        let (mut db, normal, test) = pair("fn edited() {} fn untouched() {}\n");
+        let functions: Vec<_> = declaration_items(&db, test)
+            .items
+            .iter()
+            .copied()
+            .filter(|item| matches!(item, AttrDefId::FunctionId(_)))
+            .collect();
+        let events = db.log_executed(|| {
+            for &item in &functions {
+                assert!(local_item_twin(&db, normal, test, item).twin.is_some());
+            }
+        });
+        assert!(!events.iter().any(|name| name == "crate_items" || name == "twin_index"));
+        let structural = declaration_twins(&db, normal, test).clone();
+        let file = normal.root_file_id(&db).file_id(&db);
+        db.set_file_text(file, "fn edited() { untouched(); } fn untouched() {}\n");
+        assert_eq!(*declaration_twins(&db, normal, test), structural);
+        let untouched = functions.iter().copied().find(|&item| {
+            matches!(item, AttrDefId::FunctionId(id) if FunctionSignature::of(&db, id).name.as_str() == "untouched")
+        }).unwrap();
+        let events = db.log_executed(|| {
+            assert!(local_item_twin(&db, normal, test, untouched).twin.is_some());
+        });
+        assert!(!events.iter().any(|name| name == "local_item_twin"));
+    }
+
+    #[test]
+    fn local_twins_handle_empty_and_missing_declarations() {
+        let (db, normal, test) = pair("");
+        assert!(declaration_twins(&db, normal, test).twins.is_empty());
+        let (db, normal, test) = pair("#[cfg(test)] fn only_test() {}\n");
+        for &item in &declaration_items(&db, test).items {
+            assert!(local_item_twin(&db, normal, test, item).twin.is_none());
+        }
     }
 
     #[test]

@@ -11,6 +11,9 @@
 //! retain possible overlaps without proving where-clauses.
 //! Textual macro escape follows `define_macro` and module visitation in
 //! `rustc_resolve/src/build_reduced_graph.rs` at the same rustc tag.
+//! Local reuse preserves definition identity, as do rustc's `typeck` and `mir_built`
+//! queries in `compiler/rustc_middle/src/query/mod.rs` at that tag; only analysis
+//! results are remapped. Declaration matching is independent of body inventories.
 
 use std::{
     collections::VecDeque,
@@ -1008,15 +1011,30 @@ fn lexical_source(db: &dyn HirDatabase, item: AttrDefId) -> Option<hir_expand::E
     None
 }
 
-fn macro_escapes(db: &dyn HirDatabase, normal: Crate, test: Crate, item: AttrDefId) -> bool {
+fn macro_escapes(
+    db: &dyn HirDatabase,
+    normal: Crate,
+    test: Crate,
+    item: AttrDefId,
+    local: bool,
+) -> bool {
     let AttrDefId::MacroId(id) = item else { return false };
     if AttrFlags::query(db, item).contains(AttrFlags::IS_MACRO_EXPORT) {
         return true;
     }
     let Some(source) = lexical_source(db, item) else { return true };
     let end = source.to_ptr(db).text_range().end();
-    let twins = twin_index(db, normal, test);
-    for (_, module) in scope_pairs(db, normal, test) {
+    let twins: Vec<_> = if local {
+        hir_def::twins::declaration_items(db, test)
+            .items
+            .iter()
+            .copied()
+            .filter(|&item| hir_def::twins::declaration_twin(db, normal, test, item).is_some())
+            .collect()
+    } else {
+        twin_index(db, normal, test).twins.keys().copied().collect()
+    };
+    for (_, module) in safety_scopes(db, normal, test, local) {
         let scope = module.def_map(db).module(db, module).scope(db);
         if scope.macros().any(|(_, entry)| entry.def == id) {
             return true;
@@ -1024,7 +1042,7 @@ fn macro_escapes(db: &dyn HirDatabase, normal: Crate, test: Crate, item: AttrDef
         if !scope.legacy_macros().any(|(_, macros)| macros.contains(&id)) {
             continue;
         }
-        for &common in twins.twins.keys() {
+        for &common in &twins {
             let owner = common.module(db);
             if owner != module
                 && !matches!(common, AttrDefId::ModuleId(child) if child.containing_module(db) == Some(module))
@@ -1042,22 +1060,67 @@ fn macro_escapes(db: &dyn HirDatabase, normal: Crate, test: Crate, item: AttrDef
 
 #[salsa::tracked(returns(ref))]
 pub fn pair_safety(db: &dyn HirDatabase, normal: Crate, test: Crate) -> Vec<&'static str> {
+    pair_safety_mode(db, normal, test, false)
+}
+
+#[salsa::tracked(returns(ref))]
+pub fn local_pair_safety(db: &dyn HirDatabase, normal: Crate, test: Crate) -> Vec<&'static str> {
+    pair_safety_mode(db, normal, test, true)
+}
+
+fn safety_scopes(
+    db: &dyn HirDatabase,
+    normal: Crate,
+    test: Crate,
+    local: bool,
+) -> Vec<(hir_def::ModuleId, hir_def::ModuleId)> {
+    if local {
+        hir_def::twins::declaration_scope_pairs(db, normal, test)
+    } else {
+        scope_pairs(db, normal, test)
+    }
+}
+
+fn safety_items(db: &dyn HirDatabase, krate: Crate, local: bool) -> &hir_def::twins::CrateItems {
+    if local { hir_def::twins::declaration_items(db, krate) } else { crate_items(db, krate) }
+}
+
+fn safety_twin(
+    db: &dyn HirDatabase,
+    normal: Crate,
+    test: Crate,
+    item: AttrDefId,
+    local: bool,
+) -> Option<AttrDefId> {
+    if local {
+        hir_def::twins::declaration_twin(db, normal, test, item)
+    } else {
+        twin_index(db, normal, test).twins.get(&item).copied()
+    }
+}
+
+fn pair_safety_mode(
+    db: &dyn HirDatabase,
+    normal: Crate,
+    test: Crate,
+    local: bool,
+) -> Vec<&'static str> {
     let mut veto = FxHashSet::default();
-    let titems = crate_items(db, test);
+    let titems = safety_items(db, test, local);
     for (&def, &item) in &titems.definitions {
         if matches!(def.kind, hir_expand::MacroDefKind::Declarative(..))
             && item.module(db).krate(db) == test
-            && test_macro_escapes(db, normal, test, item)
+            && test_macro_escapes(db, normal, test, item, local)
         {
             veto.insert("cfg-test-macro-rules");
         }
     }
-    for (n, t) in scope_pairs(db, normal, test) {
-        if namespace_shadowed(db, normal, test, n, t) {
+    for (n, t) in safety_scopes(db, normal, test, local) {
+        if namespace_shadowed(db, normal, test, n, t, local) {
             veto.insert("namespace-shadowing");
         }
     }
-    veto.extend(impl_safety(db, normal, test));
+    veto.extend(impl_safety(db, normal, test, local));
     let mut veto: Vec<_> = veto.into_iter().collect();
     veto.sort_unstable();
     veto
@@ -1070,8 +1133,8 @@ fn namespace_shadowed(
     test: Crate,
     n: hir_def::ModuleId,
     t: hir_def::ModuleId,
+    local: bool,
 ) -> bool {
-    let twins = twin_index(db, normal, test);
     let ns = n.def_map(db).module(db, n).scope(db);
     let ts = t.def_map(db).module(db, t).scope(db);
     for (name, entry) in ts.entries() {
@@ -1098,7 +1161,8 @@ fn namespace_shadowed(
             ),
         ] {
             if let (Some(target), None, Some(found)) = (target, prior, found) {
-                let mapped = module_def(target).and_then(|id| twins.twins.get(&id).copied());
+                let mapped =
+                    module_def(target).and_then(|id| safety_twin(db, normal, test, id, local));
                 if target != found && (mapped.is_none() || mapped != module_def(found)) {
                     return true;
                 }
@@ -1109,15 +1173,26 @@ fn namespace_shadowed(
 }
 
 #[salsa::tracked(returns(clone))]
-fn impl_safety(db: &dyn HirDatabase, normal: Crate, test: Crate) -> Vec<&'static str> {
+fn impl_safety(db: &dyn HirDatabase, normal: Crate, test: Crate, local: bool) -> Vec<&'static str> {
     let mut veto = FxHashSet::default();
-    let twins = twin_index(db, normal, test);
-    let nitems = crate_items(db, normal);
-    let titems = crate_items(db, test);
+    let nitems = safety_items(db, normal, local);
+    let titems = safety_items(db, test, local);
     for &item in &titems.items {
         let AttrDefId::ImplId(id) = item else { continue };
-        if twins.twins.contains_key(&item) {
-            if twins.cfg_differing_items.contains(&item) || twins.unknown_items.contains(&item) {
+        if safety_twin(db, normal, test, item, local).is_some() {
+            let bad = if local {
+                let reads = hir_def::twins::declaration_reads(db, item);
+                reads.unknown
+                    || reads.differs_from(normal.cfg_options(db))
+                    || safety_twin(db, normal, test, item, local).is_some_and(|normal_item| {
+                        let reads = hir_def::twins::declaration_reads(db, normal_item);
+                        reads.unknown || reads.differs_from(test.cfg_options(db))
+                    })
+            } else {
+                let twins = twin_index(db, normal, test);
+                twins.cfg_differing_items.contains(&item) || twins.unknown_items.contains(&item)
+            };
+            if bad {
                 veto.insert("impl-cfg-unknown");
             }
             continue;
@@ -1127,13 +1202,20 @@ fn impl_safety(db: &dyn HirDatabase, normal: Crate, test: Crate) -> Vec<&'static
             TyKind::Adt(adt, _) => Some(adt.def_id()),
             _ => None,
         };
-        let only_self = self_adt.is_some_and(|adt| twins.test_only.contains(&adt.into()));
+        let only_self = self_adt
+            .is_some_and(|adt| hir_def::twins::gated_off(db, adt.into(), normal.cfg_options(db)));
         if ImplSignature::of(db, id).target_trait.is_some() && db.impl_trait(id).is_none() {
             veto.insert("impl-trait-unknown");
         } else if let Some(tr) = db.impl_trait(id) {
             if !crate::collect_params(&self_ty).is_empty() {
                 veto.insert("test-only-blanket-impl");
-            } else if !only_self && !twins.test_only.contains(&tr.skip_binder().def_id.0.into()) {
+            } else if !only_self
+                && !hir_def::twins::gated_off(
+                    db,
+                    tr.skip_binder().def_id.0.into(),
+                    normal.cfg_options(db),
+                )
+            {
                 veto.insert("test-only-trait-impl");
             }
         } else if !only_self {
@@ -1153,7 +1235,8 @@ fn impl_safety(db: &dyn HirDatabase, normal: Crate, test: Crate) -> Vec<&'static
                 let nself = db.impl_self_ty(n).skip_binder();
                 let same = match (nself.kind(), self_adt) {
                     (TyKind::Adt(adt, _), Some(tadt)) => {
-                        twins.twins.get(&tadt.into()) == Some(&adt.def_id().into())
+                        safety_twin(db, normal, test, tadt.into(), local)
+                            == Some(adt.def_id().into())
                     }
                     (_, None) => nself == self_ty,
                     _ => false,
@@ -1170,9 +1253,15 @@ fn impl_safety(db: &dyn HirDatabase, normal: Crate, test: Crate) -> Vec<&'static
 }
 
 #[salsa::tracked(returns(copy))]
-fn test_macro_escapes(db: &dyn HirDatabase, normal: Crate, test: Crate, item: AttrDefId) -> bool {
+fn test_macro_escapes(
+    db: &dyn HirDatabase,
+    normal: Crate,
+    test: Crate,
+    item: AttrDefId,
+    local: bool,
+) -> bool {
     hir_def::twins::gated_off(db, item, normal.cfg_options(db))
-        && macro_escapes(db, normal, test, item)
+        && macro_escapes(db, normal, test, item, local)
 }
 
 #[salsa::tracked(returns(ref))]
@@ -1190,12 +1279,56 @@ fn generic_twins(
 
 #[salsa::tracked]
 fn same_signature(db: &dyn HirDatabase, normal: Crate, n: AttrDefId, t: AttrDefId) -> bool {
+    *same_signature_mode(db, normal, n, t, false)
+}
+
+#[salsa::tracked]
+fn same_signature_mode(
+    db: &dyn HirDatabase,
+    normal: Crate,
+    n: AttrDefId,
+    t: AttrDefId,
+    local: bool,
+) -> bool {
     let test = t.module(db).krate(db);
-    let twins = &twin_index(db, normal, test).twins;
+    let twins = (!local).then(|| &twin_index(db, normal, test).twins);
     struct MapTypes<'a, 'db> {
         interner: DbInterner<'db>,
-        twins: &'a FxHashMap<AttrDefId, AttrDefId>,
-        generics: &'a FxHashMap<GenericDefId, GenericDefId>,
+        twins: Option<&'a FxHashMap<AttrDefId, AttrDefId>>,
+        generics: Option<&'a FxHashMap<GenericDefId, GenericDefId>>,
+        normal: Crate,
+        test: Crate,
+    }
+    impl MapTypes<'_, '_> {
+        fn item(&self, item: AttrDefId) -> Option<AttrDefId> {
+            if item.module(self.interner.db()).krate(self.interner.db()) != self.test {
+                return None;
+            }
+            match self.twins {
+                Some(twins) => twins.get(&item).copied(),
+                None => hir_def::twins::declaration_twin(
+                    self.interner.db(),
+                    self.normal,
+                    self.test,
+                    item,
+                ),
+            }
+        }
+        fn parent(&self, parent: GenericDefId) -> Option<GenericDefId> {
+            if let Some(generics) = self.generics {
+                return generics.get(&parent).copied();
+            }
+            let item = match parent {
+                GenericDefId::AdtId(id) => id.into(),
+                GenericDefId::ConstId(id) => id.into(),
+                GenericDefId::FunctionId(id) => id.into(),
+                GenericDefId::ImplId(id) => id.into(),
+                GenericDefId::StaticId(id) => id.into(),
+                GenericDefId::TraitId(id) => id.into(),
+                GenericDefId::TypeAliasId(id) => id.into(),
+            };
+            generic(self.item(item)?)
+        }
     }
     impl<'db> TypeFolder<DbInterner<'db>> for MapTypes<'_, 'db> {
         fn cx(&self) -> DbInterner<'db> {
@@ -1208,7 +1341,7 @@ fn same_signature(db: &dyn HirDatabase, normal: Crate, n: AttrDefId, t: AttrDefI
             use crate::next_solver::{BoundRegionKind, Region, RegionKind};
             match region.kind() {
                 RegionKind::ReEarlyParam(mut param) => {
-                    if let Some(&parent) = self.generics.get(&param.id.parent) {
+                    if let Some(parent) = self.parent(param.id.parent) {
                         param.id.parent = parent;
                     }
                     Region::new_early_param(self.interner, param)
@@ -1224,7 +1357,7 @@ fn same_signature(db: &dyn HirDatabase, normal: Crate, n: AttrDefId, t: AttrDefI
         }
         fn fold_const(&mut self, value: Const<'db>) -> Const<'db> {
             if let ConstKind::Param(mut p) = value.kind()
-                && let Some(&parent) = self.generics.get(&p.id.parent())
+                && let Some(parent) = self.parent(p.id.parent())
             {
                 p.id = hir_def::ConstParamId::from_unchecked(hir_def::TypeOrConstParamId {
                     parent,
@@ -1236,7 +1369,7 @@ fn same_signature(db: &dyn HirDatabase, normal: Crate, n: AttrDefId, t: AttrDefI
         }
         fn fold_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
             if let TyKind::Param(p) = ty.kind()
-                && let Some(&parent) = self.generics.get(&p.id.parent())
+                && let Some(parent) = self.parent(p.id.parent())
             {
                 let id = hir_def::TypeParamId::from_unchecked(hir_def::TypeOrConstParamId {
                     parent,
@@ -1249,17 +1382,17 @@ fn same_signature(db: &dyn HirDatabase, normal: Crate, n: AttrDefId, t: AttrDefI
             {
                 let loc = match def_id.0.loc(self.interner.db()) {
                     crate::ImplTraitId::ReturnTypeImplTrait(f, idx) => {
-                        self.twins.get(&f.into()).and_then(|id| match id {
+                        self.item(f.into()).and_then(|id| match id {
                             AttrDefId::FunctionId(f) => {
-                                Some(crate::ImplTraitId::ReturnTypeImplTrait(*f, idx))
+                                Some(crate::ImplTraitId::ReturnTypeImplTrait(f, idx))
                             }
                             _ => None,
                         })
                     }
                     crate::ImplTraitId::TypeAliasImplTrait(a, idx) => {
-                        self.twins.get(&a.into()).and_then(|id| match id {
+                        self.item(a.into()).and_then(|id| match id {
                             AttrDefId::TypeAliasId(a) => {
-                                Some(crate::ImplTraitId::TypeAliasImplTrait(*a, idx))
+                                Some(crate::ImplTraitId::TypeAliasImplTrait(a, idx))
                             }
                             _ => None,
                         })
@@ -1274,16 +1407,16 @@ fn same_signature(db: &dyn HirDatabase, normal: Crate, n: AttrDefId, t: AttrDefI
                 }
             }
             if let TyKind::Adt(adt, args) = ty.kind()
-                && let Some(AttrDefId::AdtId(n)) = self.twins.get(&adt.def_id().into())
+                && let Some(AttrDefId::AdtId(n)) = self.item(adt.def_id().into())
             {
-                return Ty::new_adt(self.interner, *n, args.fold_with(self));
+                return Ty::new_adt(self.interner, n, args.fold_with(self));
             }
             ty.super_fold_with(self)
         }
     }
     let interner = DbInterner::new_with(db, normal);
-    let generics = generic_twins(db, normal, test);
-    let mut mapper = MapTypes { interner, twins, generics };
+    let generics = (!local).then(|| generic_twins(db, normal, test));
+    let mut mapper = MapTypes { interner, twins, generics, normal, test };
     match (n, t) {
         (AttrDefId::FunctionId(n), AttrDefId::FunctionId(t)) => {
             let reads = hir_def::twins::item_cfg_reads(db, n.into());
@@ -1328,8 +1461,8 @@ fn same_signature(db: &dyn HirDatabase, normal: Crate, n: AttrDefId, t: AttrDefI
                     (Some(n), Some(t)) => {
                         let n = n.skip_binder();
                         let t = t.skip_binder();
-                        let id = match twins.get(&t.def_id.0.into()) {
-                            Some(AttrDefId::TraitId(id)) => *id,
+                        let id = match mapper.item(t.def_id.0.into()) {
+                            Some(AttrDefId::TraitId(id)) => id,
                             _ => t.def_id.0,
                         };
                         n == TraitRef::new_from_args(
@@ -1531,33 +1664,86 @@ fn local_facts(
     test: Crate,
     item: AttrDefId,
 ) -> Result<ReferenceFacts, LocalRejection> {
-    let facts = eligibility_facts(db, normal, test, item);
-    if let Some(reason) = local_own_reason(facts.reason) {
-        return Err(reason);
-    }
-    if facts.twin.is_none() {
+    let twin = local_time(2, || hir_def::twins::declaration_twin(db, test, normal, item))
+        .ok_or(LocalRejection::MissingTwin)?;
+    let facts = hir_def::twins::local_item_twin(db, normal, test, twin);
+    if facts.twin != Some(item) {
         return Err(LocalRejection::MissingTwin);
     }
-    if !facts.compatible {
+    let per_copy = matches!(item, AttrDefId::StaticId(_));
+    let reason = if !per_copy && facts.differs != 0 {
+        Some(Rejection::CfgDiffering)
+    } else if !per_copy && facts.unknown != 0 {
+        Some(Rejection::Unknown)
+    } else {
+        None
+    };
+    if let Some(reason) = local_own_reason(reason) {
+        return Err(reason);
+    }
+    if !same_signature_mode(db, normal, item, twin, true) {
         return Err(LocalRejection::Signature);
     }
-    if facts.impl_mismatch {
+    if local_impl_mismatch(db, normal, test, item) {
         return Err(LocalRejection::ImplMismatch);
     }
-    for referenced in local_references(db, facts.references) {
+    let refs = references(db, item, !matches!(item, AttrDefId::StaticId(_)));
+    if refs.unknown && !refs.generic_unresolved {
+        return Err(LocalRejection::Unknown);
+    }
+    let refs = ReferenceFacts::new(
+        db,
+        sorted_items(&refs.items),
+        sorted_items(&refs.type_items),
+        sorted_items(&refs.signature_types),
+        sorted_items(&refs.baked_items),
+    );
+    for referenced in local_references(db, refs) {
         if referenced.module(db).krate(db) != normal {
             continue;
         }
-        let twin = local_time(2, || normal_twins(db, normal, test).get(&referenced).copied())
+        let twin = local_time(2, || hir_def::twins::declaration_twin(db, test, normal, referenced))
             .ok_or(LocalRejection::MissingTwin)?;
-        if !same_signature(db, normal, referenced, twin) {
+        if !same_signature_mode(db, normal, referenced, twin, true) {
             return Err(LocalRejection::Signature);
         }
-        if eligibility_facts(db, normal, test, referenced).impl_mismatch {
+        if local_impl_mismatch(db, normal, test, referenced) {
             return Err(LocalRejection::ImplMismatch);
         }
     }
-    Ok(facts.references)
+    Ok(refs)
+}
+
+#[salsa::tracked(returns(copy))]
+fn local_impl_mismatch(db: &dyn HirDatabase, normal: Crate, test: Crate, item: AttrDefId) -> bool {
+    let AttrDefId::AdtId(adt) = item else { return false };
+    let Some(AttrDefId::AdtId(test_adt)) = hir_def::twins::declaration_twin(db, test, normal, item)
+    else {
+        return true;
+    };
+    let normals = applicable_adt_impls(db, adt);
+    let tests = applicable_adt_impls(db, test_adt);
+    normals.len() != tests.len()
+        || tests.iter().any(|&test_impl| {
+            let Some(AttrDefId::ImplId(normal_impl)) =
+                hir_def::twins::declaration_twin(db, normal, test, test_impl.into())
+            else {
+                return true;
+            };
+            let normal_items: FxHashSet<_> = normal_impl
+                .impl_items(db)
+                .items
+                .iter()
+                .map(|(_, id)| AttrDefId::from(*id))
+                .collect();
+            let test_items = test_impl.impl_items(db);
+            !normals.contains(&normal_impl)
+                || test_items.items.len() != normal_items.len()
+                || test_items.items.iter().any(|(_, id)| {
+                    hir_def::twins::declaration_twin(db, normal, test, AttrDefId::from(*id))
+                        .is_none_or(|id| !normal_items.contains(&id))
+                })
+        })
 }
 
 #[salsa::tracked(returns(copy), cycle_result = local_value_cycle)]
@@ -1587,11 +1773,12 @@ pub fn local_analysis(
     function: FunctionId,
 ) -> Option<LocalRejection> {
     local_time(0, || {
-        if !local_time(1, || pair_safety(db, normal, test).is_empty()) {
+        if !local_time(1, || local_pair_safety(db, normal, test).is_empty()) {
             return Some(LocalRejection::PairSafety);
         }
-        let source =
-            local_time(2, || twin_index(db, normal, test).twins.get(&function.into()).copied());
+        let source = local_time(2, || {
+            hir_def::twins::local_item_twin(db, normal, test, function.into()).twin
+        });
         let Some(source) = source else { return Some(LocalRejection::MissingTwin) };
         let refs = match local_facts(db, normal, test, source) {
             Ok(refs) => refs,
