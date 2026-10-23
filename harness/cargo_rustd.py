@@ -1139,6 +1139,30 @@ mod tests {
         check("positive program defers TypeId", ran.returncode == 0 and "both copies true; TypeId: deferred to codegen" in fresh, f"exit {ran.returncode}, expected deferred TypeId with both copies")
         integration.write_text(integration_source)
         variants = [
+            ("concrete impl precision", """
+#[derive(Debug, Clone)]
+pub struct Changed { #[cfg(test)] extra: u32 }
+pub fn unrelated_debug() -> String { format!("{:?}", Derived.clone()) }
+""", "cfg body: test_graph::unrelated_debug: fully-shared"),
+            ("default derive helper", """
+#[derive(Default)]
+pub enum DefaultChoice { #[default] First, Second }
+pub fn default_choice() -> DefaultChoice { DefaultChoice::default() }
+""", "cfg body: test_graph::default_choice: fully-shared"),
+            ("per-copy initializer", """
+pub static PER_COPY: u32 = if cfg!(test) { 9 } else { 7 };
+pub fn per_copy_value() -> u32 { PER_COPY }
+""", "cfg body: test_graph::per_copy_value: analysis-shared"),
+            ("static absent counterpart", """
+#[cfg(not(test))] pub static ABSENT: u32 = 7;
+#[cfg(test)] pub static ABSENT: u32 = 9;
+pub fn absent_static() -> u32 { ABSENT }
+""", "cfg body: test_graph::absent_static: transitive"),
+            ("per-copy type changes", """
+pub struct StaticShape { #[cfg(test)] extra: u32 }
+pub static STATIC_SHAPE: StaticShape = StaticShape { #[cfg(test)] extra: 1 };
+pub fn changed_static_type() -> &'static StaticShape { &STATIC_SHAPE }
+""", "cfg body: test_graph::changed_static_type: transitive"),
             ("generic dispatch", "\npub fn unresolved<T: Value>(value: &T) -> u32 { value.get() }\n", "cfg body: test_graph::unresolved: fully-shared"),
             ("dyn dispatch", "\npub fn dynamic(value: &dyn Value) -> u32 { value.get() }\n", "cfg body: test_graph::dynamic: fully-shared"),
             ("generic impl edges", "\npub struct Other;\nimpl Value for Other { fn get(&self) -> u32 { STATE } }\npub fn dispatch_all<T: Value>(value: &T) -> u32 { value.get() }\n", "cfg body: test_graph::dispatch_all: analysis-shared"),
