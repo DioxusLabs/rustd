@@ -12,7 +12,7 @@
 //! Textual macro escape follows `define_macro` and module visitation in
 //! `rustc_resolve/src/build_reduced_graph.rs` at the same rustc tag.
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, hash::Hash};
 
 use base_db::Crate;
 use hir_def::{
@@ -86,6 +86,25 @@ pub struct BodySharingFacts {
 }
 
 impl BodySharingFacts {
+    pub(crate) fn same_structure(&self, new: &Self) -> bool {
+        self.cfg == new.cfg && self.items == new.items
+    }
+
+    pub(crate) fn policy_projection(&self, db: &dyn HirDatabase, crates: &[Crate]) -> Self {
+        let mut projected = self.clone();
+        if let Some(refs) = &mut projected.references {
+            for items in [
+                &mut refs.items,
+                &mut refs.type_items,
+                &mut refs.signature_types,
+                &mut refs.baked_items,
+            ] {
+                items.retain(|item| crates.contains(&item.module(db).krate(db)));
+            }
+        }
+        projected
+    }
+
     pub fn changed_fields(&self, new: &Self) -> Vec<(&'static str, String, String)> {
         let mut changed = Vec::new();
         macro_rules! field {
@@ -1347,7 +1366,7 @@ fn baked_expressions(store: &ExpressionStore) -> FxHashSet<ExprId> {
     roots.expressions
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ItemFacts {
     twin: Option<AttrDefId>,
     references: ReferenceFacts,
@@ -1597,6 +1616,239 @@ pub fn pair_eligibility(
     result
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct EligibilityState {
+    facts: FxHashMap<AttrDefId, ItemFacts>,
+    graph: FxHashMap<AttrDefId, FxHashSet<AttrDefId>>,
+    layout: FxHashMap<AttrDefId, FxHashSet<AttrDefId>>,
+    reverse: FxHashMap<AttrDefId, FxHashSet<AttrDefId>>,
+    rejected: FxHashSet<AttrDefId>,
+    layout_bad: FxHashSet<AttrDefId>,
+    static_closure: FxHashSet<AttrDefId>,
+    result: Eligibility,
+}
+
+impl EligibilityState {
+    pub(crate) fn new(db: &dyn HirDatabase, normal: Crate, test: Crate, both: bool) -> Self {
+        let mut state = Self {
+            facts: eligibility_items(db, normal)
+                .iter()
+                .map(|&item| (item, eligibility_facts(db, normal, test, item).clone()))
+                .collect(),
+            result: Eligibility {
+                pair_veto: pair_safety(db, normal, test).clone(),
+                test_only_statics: test_only_statics(db, normal, test),
+                ..Eligibility::default()
+            },
+            ..Self::default()
+        };
+        let items: FxHashSet<_> = state.facts.keys().copied().collect();
+        state.result.statics =
+            items.iter().filter(|id| matches!(id, AttrDefId::StaticId(_))).count();
+        for &item in &items {
+            state.connect(db, item);
+        }
+        state.recompute(db, normal, both, &items);
+        state
+    }
+
+    fn dependencies(&self, db: &dyn HirDatabase, item: AttrDefId) -> FxHashSet<AttrDefId> {
+        let facts = &self.facts[&item];
+        let refs = facts.references;
+        refs.items(db)
+            .iter()
+            .chain(refs.type_items(db))
+            .chain(refs.signature_types(db))
+            .chain(refs.baked_items(db))
+            .chain(&facts.impls)
+            .filter(|id| self.facts.contains_key(id))
+            .copied()
+            .collect()
+    }
+
+    fn connect(&mut self, db: &dyn HirDatabase, item: AttrDefId) {
+        let facts = &self.facts[&item];
+        let refs = facts.references;
+        self.graph.insert(
+            item,
+            refs.items(db)
+                .iter()
+                .chain(&facts.impls)
+                .filter(|id| self.facts.contains_key(id))
+                .copied()
+                .collect(),
+        );
+        let layout = match item {
+            AttrDefId::EnumVariantId(_) => refs.items(db),
+            AttrDefId::FunctionId(_) => refs.signature_types(db),
+            _ => refs.type_items(db),
+        };
+        self.layout.insert(
+            item,
+            layout.iter().filter(|id| self.facts.contains_key(id)).copied().collect(),
+        );
+        for target in self.dependencies(db, item) {
+            self.reverse.entry(target).or_default().insert(item);
+        }
+    }
+
+    fn affected(&self, seeds: impl IntoIterator<Item = AttrDefId>) -> FxHashSet<AttrDefId> {
+        let mut affected: FxHashSet<_> = seeds.into_iter().collect();
+        let mut pending: Vec<_> = affected.iter().copied().collect();
+        while let Some(item) = pending.pop() {
+            for &caller in self.reverse.get(&item).into_iter().flatten() {
+                if affected.insert(caller) {
+                    pending.push(caller);
+                }
+            }
+        }
+        affected
+    }
+
+    pub(crate) fn update(
+        &mut self,
+        db: &dyn HirDatabase,
+        normal: Crate,
+        test: Crate,
+        both: bool,
+        changed: &[FunctionId],
+    ) -> Option<usize> {
+        if changed.iter().any(|&func| !self.facts.contains_key(&func.into())) {
+            return None;
+        }
+        let affected = self.affected(changed.iter().map(|&func| func.into()));
+        for &func in changed {
+            let item = func.into();
+            for target in self.dependencies(db, item) {
+                self.reverse.get_mut(&target).unwrap().remove(&item);
+            }
+            self.facts.insert(item, eligibility_facts(db, normal, test, item).clone());
+            self.connect(db, item);
+        }
+        let affected = self.affected(affected);
+        self.recompute(db, normal, both, &affected);
+        Some(affected.len())
+    }
+
+    pub(crate) fn result(&self) -> &Eligibility {
+        &self.result
+    }
+
+    fn own(&self, db: &dyn HirDatabase, normal: Crate, item: AttrDefId) -> Option<Rejection> {
+        let facts = &self.facts[&item];
+        facts.reason.or_else(|| {
+            facts
+                .references
+                .items(db)
+                .iter()
+                .any(|target| {
+                    target.module(db).krate(db) == normal && !self.facts.contains_key(target)
+                })
+                .then_some(Rejection::Transitive)
+        })
+    }
+
+    fn closure(
+        &self,
+        graph: &FxHashMap<AttrDefId, FxHashSet<AttrDefId>>,
+        previous: &FxHashSet<AttrDefId>,
+        affected: &FxHashSet<AttrDefId>,
+        seed: impl Fn(AttrDefId) -> bool,
+    ) -> FxHashSet<AttrDefId> {
+        refreshed_closure(graph, &self.reverse, previous, affected, seed)
+    }
+
+    fn recompute(
+        &mut self,
+        db: &dyn HirDatabase,
+        normal: Crate,
+        both: bool,
+        affected: &FxHashSet<AttrDefId>,
+    ) {
+        self.rejected = self.closure(&self.graph, &self.rejected, affected, |item| {
+            self.own(db, normal, item).is_some() || self.facts[&item].impl_mismatch
+        });
+        self.layout_bad = self.closure(&self.layout, &self.layout_bad, affected, |item| {
+            !self.facts[&item].compatible
+                || match item {
+                    AttrDefId::ConstId(_) => self.rejected.contains(&item),
+                    AttrDefId::EnumVariantId(_) => {
+                        self.own(db, normal, item).is_some()
+                            || self.facts[&item].references.items(db).iter().any(|target| {
+                                matches!(target, AttrDefId::ConstId(_) | AttrDefId::FunctionId(_))
+                                    && self.rejected.contains(target)
+                            })
+                    }
+                    AttrDefId::AdtId(_) | AttrDefId::TypeAliasId(_) => {
+                        self.own(db, normal, item).is_some()
+                    }
+                    _ => false,
+                }
+        });
+        self.static_closure = self.closure(&self.graph, &self.static_closure, affected, |item| {
+            both && matches!(item, AttrDefId::StaticId(_))
+        });
+        for &item in affected {
+            let facts = &self.facts[&item];
+            let Some(twin) = facts.twin else { continue };
+            let refs = facts.references;
+            let reason = self.own(db, normal, item).or_else(|| {
+                (self.rejected.contains(&item)
+                    && (refs.items(db).iter().any(|target| {
+                        target.module(db).krate(db) == normal
+                            && (!self.facts.get(target).is_some_and(|facts| facts.compatible)
+                                || (refs.type_items(db).contains(target)
+                                    || !matches!(
+                                        target,
+                                        AttrDefId::ConstId(_) | AttrDefId::EnumVariantId(_)
+                                    ))
+                                    && (!self.facts.contains_key(target)
+                                        || self.layout_bad.contains(target)))
+                    }) || refs.baked_items(db).iter().any(|target| {
+                        target.module(db).krate(db) == normal
+                            && (!self.facts.contains_key(target) || self.rejected.contains(target))
+                    })))
+                .then_some(Rejection::Transitive)
+            });
+            self.result.candidates.remove(&twin);
+            self.result.analysis_shared.remove(&twin);
+            self.result.rejected.remove(&twin);
+            if let Some(reason) = reason {
+                self.result.rejected.insert(twin, reason);
+            } else if self.rejected.contains(&item) || self.static_closure.contains(&item) {
+                self.result.analysis_shared.insert(twin);
+            } else {
+                self.result.candidates.insert(twin);
+            }
+        }
+    }
+}
+
+fn refreshed_closure<N: Copy + Eq + Hash>(
+    graph: &FxHashMap<N, FxHashSet<N>>,
+    reverse: &FxHashMap<N, FxHashSet<N>>,
+    previous: &FxHashSet<N>,
+    affected: &FxHashSet<N>,
+    seed: impl Fn(N) -> bool,
+) -> FxHashSet<N> {
+    let mut bad: FxHashSet<_> = previous.difference(affected).copied().collect();
+    let mut pending = Vec::new();
+    for &item in affected {
+        if seed(item) || graph[&item].iter().any(|target| bad.contains(target)) {
+            bad.insert(item);
+            pending.push(item);
+        }
+    }
+    while let Some(item) = pending.pop() {
+        for &caller in reverse.get(&item).into_iter().flatten() {
+            if affected.contains(&caller) && graph[&caller].contains(&item) && bad.insert(caller) {
+                pending.push(caller);
+            }
+        }
+    }
+    bad
+}
+
 fn reverse_closure<N>(
     graph: &DiGraph<N, ()>,
     seeds: impl IntoIterator<Item = petgraph::graph::NodeIndex>,
@@ -1632,6 +1884,44 @@ fn reverse_closure<N>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refreshed_region_rejects_and_unrejects_cycles_with_boundary_dependencies() {
+        let mut graph: FxHashMap<_, FxHashSet<_>> =
+            [(0, vec![1]), (1, vec![2]), (2, vec![1, 3]), (3, vec![]), (4, vec![])]
+                .into_iter()
+                .map(|(item, deps)| (item, deps.into_iter().collect()))
+                .collect();
+        let mut reverse: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
+        for (&item, deps) in &graph {
+            for &dep in deps {
+                reverse.entry(dep).or_default().insert(item);
+            }
+        }
+        let all = graph.keys().copied().collect();
+        let rejected = refreshed_closure(&graph, &reverse, &FxHashSet::default(), &all, |n| n == 3);
+        assert_eq!(rejected, FxHashSet::from_iter([0, 1, 2, 3]));
+        let affected = FxHashSet::from_iter([0, 1, 2]);
+        assert_eq!(refreshed_closure(&graph, &reverse, &rejected, &affected, |_| false), rejected);
+        graph.get_mut(&2).unwrap().remove(&3);
+        let restored = refreshed_closure(&graph, &reverse, &rejected, &affected, |_| false);
+        assert_eq!(restored, FxHashSet::from_iter([3]));
+        assert_eq!(refreshed_closure(&graph, &reverse, &restored, &affected, |n| n == 2), rejected);
+    }
+
+    #[test]
+    fn empty_refreshed_region_is_unchanged() {
+        assert!(
+            refreshed_closure::<u32>(
+                &FxHashMap::default(),
+                &FxHashMap::default(),
+                &FxHashSet::default(),
+                &FxHashSet::default(),
+                |_| false
+            )
+            .is_empty()
+        );
+    }
 
     #[test]
     fn recursive_candidates_survive_without_an_ineligible_dependency() {
