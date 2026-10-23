@@ -1567,16 +1567,16 @@ def test_graph_sharing_incremental(work):
         ws = os.path.realpath(os.path.join(work, "sharing-incremental-" + mode))
         functions = "\n".join(f"pub fn f{i}<T: Copy>(x: T) -> (T, u64) {{ (x, if enabled(1) {{ {i} }} else {{ 0 }}) }}" for i in range(400))
         total = "+".join(f"f{i}(1u64).1" for i in range(400))
-        feature = "pub fn enabled(x: u64) -> bool { x != 0 }\nfn identity(x: u64) -> u64 { x }\npub struct Flag;\nimpl Flag { pub fn check(x: u64) -> bool { enabled(x) } }\npub fn dependency_value() -> u64 { named_dependency::value() }\npub fn schema_value() -> u64 { schema_probe::value() }\n" + functions + "\n"
+        feature = "pub fn enabled(x: u64) -> bool { x != 0 }\nfn identity(x: u64) -> u64 { x }\npub struct Flag;\nimpl Flag { pub fn check(x: u64) -> bool { enabled(x) } }\npub fn dependency_value() -> u64 { named_dependency::value() }\npub fn schema_value() -> u64 { schema_probe::value() }\npub fn policy_value() -> u64 { policy_cycle(0) }\nfn policy_cycle(x: u8) -> u64 { if x == 0 { 7 } else { policy_value() } }\n" + functions + "\n"
         reports = "\n".join(f'#[test] fn report{i}() -> Result<(), &\'static str> {{ Ok(()) }}' for i in range(20))
         files = {
             "Cargo.toml": '[package]\nname="sharing_incremental"\nversion="0.1.0"\nedition="2021"\n[workspace]\nmembers=["probe", "named_dependency", "schema"]\n[dependencies]\nnamed_dependency={path="named_dependency"}\nschema_probe={path="schema"}\n[dev-dependencies]\nprobe={path="probe"}\n',
             "schema/Cargo.toml": '[package]\nname="schema_probe"\nversion="0.1.0"\nedition="2021"\n[dev-dependencies]\nsharing_incremental={path=".."}\n',
             "schema/src/lib.rs": 'pub fn value() -> u64 { 7 }\n#[cfg(test)] mod tests { #[test] fn dependency() { assert_eq!(sharing_incremental::schema_value(), 7); } }\n',
             "named_dependency/Cargo.toml": '[package]\nname="named_dependency"\nversion="0.1.0"\nedition="2021"\n',
-            "named_dependency/src/lib.rs": 'pub fn value() -> u64 { 7 }\n',
+            "named_dependency/src/lib.rs": 'pub fn value() -> u64 { 7 }\npub static VALUE: u64 = 7;\n',
             "probe/Cargo.toml": '[package]\nname="probe"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nsharing_incremental={path=".."}\n',
-            "probe/src/lib.rs": 'pub fn total() -> u64 { sharing_incremental::total() }\npub fn different() -> u64 { sharing_incremental::different() }\n',
+            "probe/src/lib.rs": 'pub fn total() -> u64 { sharing_incremental::total() }\npub fn different() -> u64 { sharing_incremental::different() }\npub fn policy_value() -> u64 { sharing_incremental::policy_value() }\n',
             "src/features.rs": feature,
             "src/lib.rs": f'''mod features;
 pub use features::*;
@@ -1594,6 +1594,13 @@ pub fn total() -> u64 {{ {total} }}
         assert_eq!(super::total(), probe::total());
         assert_eq!(super::different(), 1);
         assert_eq!(probe::different(), 2);
+    }}
+    #[test] fn policy_values() {{
+        let local = super::policy_value();
+        let normal = probe::policy_value();
+        println!("policy-values: {{local}}/{{normal}}");
+        if local == 7 {{ assert_eq!(normal, 7); }}
+        else {{ assert_eq!(local, 1); assert_eq!(normal, 2); }}
     }}
 }}
 ''',
@@ -1666,6 +1673,35 @@ pub fn total() -> u64 {{ {total} }}
                     held = result.returncode == 0 and "reach fast path: unchanged edges" in fresh
                     checks.append((name, held, fresh[-700:]))
                     print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                if mode == "on":
+                    before = logs()
+                    pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "let _ = std::any::TypeId::of::<u64>(); let _ = named_dependency::VALUE; !std::ops::Not::not(x != 0)"))
+                    _, foreign_edit = side.cargo("test", "--lib")
+                    fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                    name = f"cfg sharing: {prime}-prime foreign trait reference keeps policy fast path"
+                    held = (foreign_edit.returncode == 0 and "field=references.items" in fresh
+                            and "sharing fast path" in fresh and "sharing full path" not in fresh
+                            and "sharing incremental path" not in fresh)
+                    checks.append((name, held, fresh[-700:]))
+                    print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                    for case, text in [
+                        ("rejection", feature.replace("if x == 0 { 7 }", "if x == 0 { super::different() }")),
+                        ("un-rejection", feature),
+                    ]:
+                        before = logs()
+                        pathlib.Path(ws, "src/features.rs").write_text(text)
+                        _, policy_edit = side.cargo("test", "--lib", "--", "--nocapture")
+                        fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                        updates = re.findall(r"sharing incremental path: bodies=(\d+) affected=(\d+) rejected=(\d+)->(\d+)", fresh)
+                        name = f"cfg sharing: {prime}-prime SCC incremental {case}"
+                        values = "policy-values: 1/2" if case == "rejection" else "policy-values: 7/7"
+                        held = (policy_edit.returncode == 0 and values in policy_edit.stdout
+                                and bool(updates) and "sharing full path" not in fresh
+                                and all(int(bodies) == 1 and 2 <= int(affected) <= 8
+                                        and (int(new) > int(old) if case == "rejection" else int(new) < int(old))
+                                        for bodies, affected, old, new in updates))
+                        checks.append((name, held, str(updates) + fresh[-700:]))
+                        print(f"  {'ok ' if held else 'NOT'} {name}: {updates}", flush=True)
                 before = logs()
                 pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "identity(x) != 0"))
                 _, edge_edit = side.cargo("test", "--lib")
