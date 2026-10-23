@@ -99,6 +99,47 @@ impl Cache {
         self.changed.insert(file);
     }
 
+    pub(super) fn needs_before_edit(&self, files: &[base_db::FileId]) -> bool {
+        self.shared.as_ref().is_some_and(|sharing| !sharing.is_empty())
+            && files.iter().any(|file| !self.files.contains_key(file))
+    }
+
+    pub(super) fn before_edit(
+        &mut self,
+        db: &dyn HirDatabase,
+        file: base_db::FileId,
+        functions: &[FunctionId],
+    ) {
+        if self.shared.as_ref().is_none_or(Sharing::is_empty)
+            || self.files.contains_key(&file)
+            || functions.is_empty()
+        {
+            return;
+        }
+        let mut facts = FileFacts::default();
+        for &func in functions {
+            let source = func.lookup(db).id.file_id;
+            let krate = func.krate(db);
+            if func.module(db).block(db).is_none()
+                && !facts.trees.iter().any(|&(k, f, _)| k == krate && f == source)
+            {
+                facts.trees.push((
+                    krate,
+                    source,
+                    hir_def::item_tree::file_item_tree_snapshot(db, source, krate),
+                ));
+            }
+            if hir_def::signatures::FunctionSignature::of(db, func).has_body() {
+                facts.bodies.push((
+                    func,
+                    true,
+                    crate::sharing::body_sharing_facts(db, func, true).clone(),
+                ));
+            }
+        }
+        self.files.insert(file, facts);
+    }
+
     pub(super) fn sharing(
         &mut self,
         db: &dyn HirDatabase,
@@ -119,7 +160,19 @@ impl Cache {
                     &hir_def::item_tree::file_item_tree_snapshot(db, *file, *krate) == tree
                 }) && facts.bodies.iter().all(|(func, normal, facts)| {
                     reason = "body facts changed";
-                    crate::sharing::body_sharing_facts(db, *func, *normal) == facts
+                    let new = crate::sharing::body_sharing_facts(db, *func, *normal);
+                    if new == facts {
+                        return true;
+                    }
+                    if std::env::var_os("RUSTD_STATS").is_some() {
+                        for (field, old, new) in facts.changed_fields(new) {
+                            eprintln!(
+                                "sharing fact mismatch: owner={func:?} name={} normal={normal} field={field} old={old} new={new}; program={program}",
+                                hir_def::signatures::FunctionSignature::of(db, *func).name.as_str(),
+                            );
+                        }
+                    }
+                    false
                 })
             });
         let validated = start.elapsed();

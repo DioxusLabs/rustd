@@ -1234,6 +1234,19 @@ impl Rejections {
         sharing
     }
 
+    pub fn sharing_before_edit(
+        &mut self,
+        db: &dyn HirDatabase,
+        file: base_db::FileId,
+        functions: &[FunctionId],
+    ) {
+        self.policy.before_edit(db, file, functions);
+    }
+
+    pub fn needs_sharing_facts(&self, files: &[base_db::FileId]) -> bool {
+        self.policy.needs_before_edit(files)
+    }
+
     /// A function the last build left to rustc that is not what rustc compiled, and why it was
     /// left. rustc's copies are those of the build the daemon started from: the first call, to
     /// be made after that build, notes what they are copies of.

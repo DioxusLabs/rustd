@@ -6228,7 +6228,20 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
             Watched::Source(id) => Some(id),
             Watched::Included(_) => None,
         });
-        outlines.before_edit(&db, &listed, &editing.collect::<Vec<_>>());
+        let editing: Vec<_> = editing.collect();
+        outlines.before_edit(&db, &listed, &editing);
+        if programs.iter().any(|program| program.known.needs_sharing_facts(&editing)) {
+            let functions = listed.in_files(&db, &editing);
+            hir::attach_db(&db, || {
+                for (&file, functions) in editing.iter().zip(functions) {
+                    if let Some(functions) = functions {
+                        for program in &mut programs {
+                            program.known.sharing_before_edit(&db, file, &functions);
+                        }
+                    }
+                }
+            });
+        }
         for &index in &gone {
             if let Watched::Source(id) = files[index].file {
                 change.change_file(id, None);
@@ -6904,7 +6917,7 @@ impl Program {
             ];
             let steps: Vec<String> =
                 steps.iter().map(|(name, took)| format!("{name}={}", took.as_micros())).collect();
-            eprintln!("timeline-us: {}", steps.join(" "));
+            eprintln!("timeline-us: {}; program={}", steps.join(" "), args.out.display());
             eprintln!(
                 "asked: {} roots, {} instances, slowest {:.1?}; longest on a thread: policy {:.1?}, \
                  rejected {:.1?}, roots {:.1?}, \

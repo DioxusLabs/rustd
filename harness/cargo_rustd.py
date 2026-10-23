@@ -1567,10 +1567,12 @@ def test_graph_sharing_incremental(work):
         ws = os.path.realpath(os.path.join(work, "sharing-incremental-" + mode))
         functions = "\n".join(f"pub fn f{i}<T: Copy>(x: T) -> (T, u64) {{ (x, if enabled(1) {{ {i} }} else {{ 0 }}) }}" for i in range(400))
         total = "+".join(f"f{i}(1u64).1" for i in range(400))
-        feature = "pub fn enabled(x: u64) -> bool { x != 0 }\nfn identity(x: u64) -> u64 { x }\npub struct Flag;\nimpl Flag { pub fn check(x: u64) -> bool { enabled(x) } }\npub fn dependency_value() -> u64 { named_dependency::value() }\n" + functions + "\n"
+        feature = "pub fn enabled(x: u64) -> bool { x != 0 }\nfn identity(x: u64) -> u64 { x }\npub struct Flag;\nimpl Flag { pub fn check(x: u64) -> bool { enabled(x) } }\npub fn dependency_value() -> u64 { named_dependency::value() }\npub fn schema_value() -> u64 { schema_probe::value() }\n" + functions + "\n"
         reports = "\n".join(f'#[test] fn report{i}() -> Result<(), &\'static str> {{ Ok(()) }}' for i in range(20))
         files = {
-            "Cargo.toml": '[package]\nname="sharing_incremental"\nversion="0.1.0"\nedition="2021"\n[workspace]\nmembers=["probe", "named_dependency"]\n[dependencies]\nnamed_dependency={path="named_dependency"}\n[dev-dependencies]\nprobe={path="probe"}\n',
+            "Cargo.toml": '[package]\nname="sharing_incremental"\nversion="0.1.0"\nedition="2021"\n[workspace]\nmembers=["probe", "named_dependency", "schema"]\n[dependencies]\nnamed_dependency={path="named_dependency"}\nschema_probe={path="schema"}\n[dev-dependencies]\nprobe={path="probe"}\n',
+            "schema/Cargo.toml": '[package]\nname="schema_probe"\nversion="0.1.0"\nedition="2021"\n[dev-dependencies]\nsharing_incremental={path=".."}\n',
+            "schema/src/lib.rs": 'pub fn value() -> u64 { 7 }\n#[cfg(test)] mod tests { #[test] fn dependency() { assert_eq!(sharing_incremental::schema_value(), 7); } }\n',
             "named_dependency/Cargo.toml": '[package]\nname="named_dependency"\nversion="0.1.0"\nedition="2021"\n',
             "named_dependency/src/lib.rs": 'pub fn value() -> u64 { 7 }\n',
             "probe/Cargo.toml": '[package]\nname="probe"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nsharing_incremental={path=".."}\n',
@@ -1744,6 +1746,28 @@ pub fn total() -> u64 {{ {total} }}
                         held = (result.returncode == 0) == succeeds and f"patch reports: {expected}" in fresh
                         checks.append((name, held, f"{result.stdout[-300:]} {fresh[-700:]}"))
                         print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                if mode == "on":
+                    pathlib.Path(ws, "src/features.rs").write_text(feature)
+                    pathlib.Path(ws, "src/lib.rs").write_text(files["src/lib.rs"])
+                    _, schema_prime = side.cargo("test", "-p", "schema_probe", "--lib")
+                    before = logs()
+                    pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "x != 2"))
+                    _, schema_edit = side.cargo("test", "-p", "schema_probe", "--lib")
+                    fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                    policy = [line for line in fresh.splitlines() if "sharing " in line and "/schema_probe-" in line]
+                    name = f"cfg sharing: {prime}-prime dependency body retains schema policy facts"
+                    held = schema_prime.returncode == schema_edit.returncode == 0 and any("sharing fast path" in line for line in policy) and not any("sharing full path" in line for line in policy)
+                    checks.append((name, held, "\n".join(policy)))
+                    print(f"  {'ok ' if held else 'NOT'} {name}: {policy}", flush=True)
+                    before = logs()
+                    pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "let _ = cfg!(test); x != 0"))
+                    _, schema_cfg = side.cargo("test", "-p", "schema_probe", "--lib")
+                    fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                    policy = [line for line in fresh.splitlines() if "sharing " in line and "/schema_probe-" in line]
+                    name = f"cfg sharing: {prime}-prime dependency cfg fact invalidates schema policy"
+                    held = schema_cfg.returncode == 0 and any("sharing full path" in line for line in policy) and any("field=cfg." in line for line in policy)
+                    checks.append((name, held, "\n".join(policy)))
+                    print(f"  {'ok ' if held else 'NOT'} {name}: {policy}", flush=True)
             finally:
                 side.cargo("stop")
                 pathlib.Path(ws, "src/features.rs").write_text(feature)
