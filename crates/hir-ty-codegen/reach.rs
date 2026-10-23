@@ -556,16 +556,17 @@ type Answer = (Vec<Reached>, Option<u128>, Vec<String>);
 pub(super) struct Cache {
     state: Option<Arc<Snapshot>>,
     changed: FxHashSet<base_db::FileId>,
+    patch: Option<FxHashSet<super::patch::Node>>,
+    previous: FxHashSet<super::patch::Node>,
 }
 
 #[derive(Clone)]
 struct Snapshot {
     input: ReachInput,
     topology: Arc<Topology>,
-    files: Arc<FxHashMap<base_db::FileId, Vec<usize>>>,
+    nodes: Arc<FxHashMap<super::patch::Node, Vec<usize>>>,
     bodies: Arc<FxHashMap<base_db::FileId, Vec<(FunctionId, crate::sharing::BodyItems)>>>,
     nested: Arc<FxHashSet<base_db::FileId>>,
-    unplaced: Arc<Vec<usize>>,
     edges: Arc<Vec<Edges>>,
     own: Vec<Option<u128>>,
     components: Vec<Option<u128>>,
@@ -573,6 +574,8 @@ struct Snapshot {
     ambient: Arc<FxHashSet<usize>>,
     code: Vec<Option<u128>>,
     ambient_code: Option<u128>,
+    alone: Vec<Option<u128>>,
+    groups: Arc<FxHashMap<usize, Vec<usize>>>,
     answer: Answer,
 }
 
@@ -583,6 +586,17 @@ impl Cache {
 
     pub(super) fn touch(&mut self, file: base_db::FileId) {
         self.changed.insert(file);
+        self.patch = None;
+    }
+
+    pub(super) fn patch(&mut self, changed: Option<FxHashSet<super::patch::Node>>) {
+        let Some(changed) = changed else {
+            self.clear();
+            return;
+        };
+        let mut candidates = std::mem::replace(&mut self.previous, changed);
+        candidates.extend(self.previous.iter().cloned());
+        self.patch = Some(candidates);
     }
 
     pub(super) fn reached(
@@ -593,6 +607,7 @@ impl Cache {
         tests: &[FunctionId],
         always: &[FunctionId],
         kept: &[StaticId],
+        program: &str,
     ) -> Answer {
         sharing.edited_crates(&mut edited);
         let mut edited: Vec<_> = edited.into_iter().collect();
@@ -608,20 +623,38 @@ impl Cache {
             }),
         );
         let changed = std::mem::take(&mut self.changed);
-        if let Some(state) = &mut self.state
-            && state.input == input
-            && Arc::make_mut(state).update(db, &changed)
-        {
+        let patch = self.patch.take();
+        let update = match &mut self.state {
+            None => Err("no retained snapshot"),
+            Some(state) if state.input != input => {
+                let before = state.input.data(db);
+                let after = input.data(db);
+                Err(if before.sharing != after.sharing {
+                    "sharing policy changed"
+                } else if before.edited != after.edited {
+                    "edited crates changed"
+                } else if before.tests != after.tests {
+                    "test roots changed"
+                } else if before.always != after.always {
+                    "always-reached roots changed"
+                } else {
+                    "kept statics changed"
+                })
+            }
+            Some(state) => Arc::make_mut(state).update(db, &changed, patch.as_ref(), program),
+        };
+        if update.is_ok() {
+            let state = self.state.as_ref().unwrap();
             if std::env::var_os("RUSTD_VERIFY_FASTPATH").is_some_and(|it| it == "1") {
                 assert_eq!(&state.answer, reach_program(db, input), "reach fast path");
             }
             if std::env::var_os("RUSTD_STATS").is_some() {
-                eprintln!("reach fast path: unchanged edges");
+                eprintln!("reach fast path: unchanged edges; program={program}");
             }
             return state.answer.clone();
         }
         if std::env::var_os("RUSTD_STATS").is_some() {
-            eprintln!("reach full path");
+            eprintln!("reach full path: {}; program={program}", update.unwrap_err());
         }
         let answer = reach_program(db, input).clone();
         self.state = Some(Arc::new(Snapshot::new(db, input, answer.clone())));
@@ -633,10 +666,9 @@ impl Snapshot {
     fn new(db: &dyn HirDatabase, input: ReachInput, answer: Answer) -> Self {
         let data = input.data(db);
         let topology = Arc::new(reach_topology(db, input).clone());
-        let mut files: FxHashMap<_, Vec<usize>> = FxHashMap::default();
+        let mut nodes: FxHashMap<_, Vec<usize>> = FxHashMap::default();
         let mut functions: FxHashSet<FunctionId> = FxHashSet::default();
         let mut nested = FxHashSet::default();
-        let mut unplaced = Vec::new();
         let mut edges = Vec::new();
         let mut own = Vec::new();
         for (id, node) in topology.graph.nodes.iter().enumerate() {
@@ -668,19 +700,12 @@ impl Snapshot {
             } {
                 functions.insert(func);
             }
-            let homes = match node {
-                Node::Root(id) => Some(vec![super::home::body_file(db, (*id).into())]),
-                Node::Static(id) => Some(vec![super::home::body_file(db, (*id).into())]),
-                Node::Instance(instance, _) => super::home::body_files(db, instance).map(Vec::from),
+            let key = match node {
+                Node::Root(id) => super::patch::Node::Root(*id),
+                Node::Static(id) => super::patch::Node::Static(*id),
+                Node::Instance(instance, _) => super::patch::Node::Instance(instance.clone()),
             };
-            match homes {
-                Some(homes) => {
-                    for file in homes {
-                        files.entry(file).or_default().push(id);
-                    }
-                }
-                None => unplaced.push(id),
-            }
+            nodes.entry(key).or_default().push(id);
             edges.push(
                 reach_edges(db, node.clone(), data.sharing.clone(), data.edited.clone()).clone(),
             );
@@ -711,6 +736,11 @@ impl Snapshot {
             .collect();
         let code = (0..data.tests.len()).map(|id| reach_root_code(db, input, id)).collect();
         let ambient_code = reach_ambient(db, input).as_ref().map(|it| it[0]);
+        let alone = (0..data.tests.len()).map(|id| reach_root_print(db, input, id)).collect();
+        let mut groups: FxHashMap<_, Vec<_>> = FxHashMap::default();
+        for (root, &group) in topology.groups.iter().enumerate() {
+            groups.entry(group).or_default().push(root);
+        }
         let mut bodies: FxHashMap<_, Vec<_>> = FxHashMap::default();
         for func in functions {
             if hir_def::signatures::FunctionSignature::of(db, func).has_body() {
@@ -723,10 +753,9 @@ impl Snapshot {
         Self {
             input,
             topology,
-            files: Arc::new(files),
+            nodes: Arc::new(nodes),
             bodies: Arc::new(bodies),
             nested: Arc::new(nested),
-            unplaced: Arc::new(unplaced),
             edges: Arc::new(edges),
             own,
             components,
@@ -734,16 +763,26 @@ impl Snapshot {
             ambient: Arc::new(ambient),
             code,
             ambient_code,
+            alone,
+            groups: Arc::new(groups),
             answer,
         }
     }
 
-    fn update(&mut self, db: &dyn HirDatabase, files: &FxHashSet<base_db::FileId>) -> bool {
+    fn update(
+        &mut self,
+        db: &dyn HirDatabase,
+        files: &FxHashSet<base_db::FileId>,
+        patch: Option<&FxHashSet<super::patch::Node>>,
+        program: &str,
+    ) -> Result<(), &'static str> {
         let data = self.input.data(db);
-        let mut candidates = FxHashSet::default();
+        if !files.is_empty() && patch.is_none() {
+            return Err("patch candidates unavailable");
+        }
         for file in files {
             if self.nested.contains(file) {
-                return false;
+                return Err("changed file contains nested items");
             }
             if self
                 .bodies
@@ -752,12 +791,16 @@ impl Snapshot {
                 .flatten()
                 .any(|(func, items)| crate::sharing::body_item_inventory(db, *func) != items)
             {
-                return false;
+                return Err("body item inventory changed");
             }
-            candidates.extend(self.files.get(file).into_iter().flatten().copied());
         }
-        if !files.is_empty() {
-            candidates.extend(self.unplaced.iter().copied());
+        let candidates: FxHashSet<_> = patch
+            .into_iter()
+            .flatten()
+            .flat_map(|node| self.nodes.get(node).into_iter().flatten().copied())
+            .collect();
+        if std::env::var_os("RUSTD_STATS").is_some() {
+            eprintln!("reach patch candidates: {}; program={program}", candidates.len());
         }
         let mut changed = FxHashSet::default();
         for id in candidates {
@@ -765,7 +808,7 @@ impl Snapshot {
             if reach_edges(db, node.clone(), data.sharing.clone(), data.edited.clone())
                 != &self.edges[id]
             {
-                return false;
+                return Err("outgoing edges changed");
             }
             let own = reach_own(db, node.clone(), data.sharing.clone(), data.edited.clone());
             if own != self.own[id] {
@@ -774,8 +817,13 @@ impl Snapshot {
             }
         }
         if changed.is_empty() {
-            return true;
+            if std::env::var_os("RUSTD_STATS").is_some() {
+                eprintln!("reach retained answer: unchanged component prints; program={program}");
+            }
+            return Ok(());
         }
+        let mut affected = Bits::default();
+        let before_ambient = self.ambient_code;
         for id in changed {
             let mut own: Option<Vec<_>> = self.topology.components[id]
                 .members(db)
@@ -791,25 +839,60 @@ impl Snapshot {
                 continue;
             }
             let (Some(old), Some(new)) = (old, new) else {
-                return false;
+                return Err("component code became known or unknown");
             };
             for root in self.roots[id].iter() {
                 self.code[root] =
                     self.code[root].map(|code| code.wrapping_sub(old).wrapping_add(new));
+                affected.insert(root);
             }
             if self.ambient.contains(&id) {
                 self.ambient_code =
                     self.ambient_code.map(|code| code.wrapping_sub(old).wrapping_add(new));
             }
         }
+        if before_ambient != self.ambient_code {
+            for root in 0..self.code.len() {
+                affected.insert(root);
+            }
+        }
         let ambient = self.ambient_code.map(|code| vec![code]);
-        let alone = self
-            .code
-            .iter()
-            .map(|code| code.zip(ambient.as_ref()).map(|it| print_of(&it)))
-            .collect();
-        self.answer = finish(&self.topology, alone, ambient.as_ref().map(print_of));
-        true
+        let mut groups = FxHashSet::default();
+        for root in affected.iter() {
+            let alone = self.code[root].zip(ambient.as_ref()).map(|it| print_of(&it));
+            if self.alone[root] != alone {
+                self.alone[root] = alone;
+                groups.insert(self.topology.groups[root]);
+            }
+        }
+        if std::env::var_os("RUSTD_STATS").is_some() {
+            eprintln!(
+                "reach updated roots: {}, groups: {}; program={program}",
+                affected.iter().count(),
+                groups.len()
+            );
+        }
+        refresh_groups(&self.groups, &self.alone, groups, &mut self.answer.0);
+        self.answer.1 = ambient.as_ref().map(print_of);
+        Ok(())
+    }
+}
+
+fn refresh_groups(
+    members: &FxHashMap<usize, Vec<usize>>,
+    alone: &[Option<u128>],
+    changed: FxHashSet<usize>,
+    reached: &mut [Reached],
+) {
+    for group in changed {
+        let members = &members[&group];
+        let mut together: Option<Vec<_>> = members.iter().map(|&root| alone[root]).collect();
+        if let Some(prints) = &mut together {
+            prints.sort_unstable();
+        }
+        for &root in members {
+            reached[root].print = alone[root].zip(together.as_ref()).map(|it| print_of(&it));
+        }
     }
 }
 
@@ -844,4 +927,39 @@ fn finish(topology: &Topology, alone: Vec<Option<u128>>, ambient: Option<u128>) 
         })
         .collect();
     (reached, ambient, topology.graph.unknown.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refreshing_groups_matches_full_aggregation() {
+        for mut alone in [Vec::new(), vec![Some(3), Some(5), Some(7)], vec![None, Some(5), Some(7)]]
+        {
+            let groups: Vec<_> =
+                (0..alone.len()).map(|root| if root < 2 { 0 } else { 2 }).collect();
+            let topology = Topology {
+                graph: Graph::default(),
+                components: Vec::new(),
+                of: Vec::new(),
+                tests: Vec::new(),
+                ambient: Vec::new(),
+                groups,
+            };
+            let mut members: FxHashMap<_, Vec<_>> = FxHashMap::default();
+            for (root, &group) in topology.groups.iter().enumerate() {
+                members.entry(group).or_default().push(root);
+            }
+            let mut reached = finish(&topology, alone.clone(), None).0;
+            refresh_groups(&members, &alone, FxHashSet::default(), &mut reached);
+            assert_eq!(reached, finish(&topology, alone.clone(), None).0);
+            for value in [Some(11), None, Some(3)] {
+                let Some(first) = alone.first_mut() else { continue };
+                *first = value;
+                refresh_groups(&members, &alone, [0].into_iter().collect(), &mut reached);
+                assert_eq!(reached, finish(&topology, alone.clone(), None).0);
+            }
+        }
+    }
 }

@@ -640,6 +640,7 @@ impl CodegenUnit {
                 }
             };
             if let Some(patch) = patch {
+                known.reach.patch(patch.reach_changed);
                 backend::Tally::global().report();
                 let compiled_now = known.compiled_since_last_build();
                 known.stats = BuildStats {
@@ -665,6 +666,7 @@ impl CodegenUnit {
                 return Ok(unit);
             }
         }
+        known.reach.clear();
         let patching = known.patching;
         let used_by_rustc = known.used_by_rustc;
         // FIXME: a rejection outlives an edit that would lift it. Dropping them here costs one
@@ -1218,12 +1220,13 @@ impl Rejections {
         tests: &[FunctionId],
         always: &[FunctionId],
         kept: &[StaticId],
+        program: &str,
     ) -> (Vec<Reached>, Option<u128>, Vec<String>) {
-        self.reach.reached(db, sharing, edited, tests, always, kept)
+        self.reach.reached(db, sharing, edited, tests, always, kept, program)
     }
 
-    pub fn sharing(&mut self, db: &dyn HirDatabase, sharing: Sharing) -> Sharing {
-        let sharing = self.policy.sharing(db, sharing);
+    pub fn sharing(&mut self, db: &dyn HirDatabase, sharing: Sharing, program: &str) -> Sharing {
+        let sharing = self.policy.sharing(db, sharing, program);
         if self.base.as_ref().is_some_and(|base| !base.shares_with(&sharing)) {
             eprintln!("patch discard: cfg sharing decisions changed");
             self.forget_base();

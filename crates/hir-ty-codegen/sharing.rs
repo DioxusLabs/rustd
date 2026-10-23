@@ -99,7 +99,12 @@ impl Cache {
         self.changed.insert(file);
     }
 
-    pub(super) fn sharing(&mut self, db: &dyn HirDatabase, input: Sharing) -> Sharing {
+    pub(super) fn sharing(
+        &mut self,
+        db: &dyn HirDatabase,
+        input: Sharing,
+        program: &str,
+    ) -> Sharing {
         let changed = std::mem::take(&mut self.changed);
         let same = self.input.as_ref() == Some(&input)
             && changed.iter().all(|file| {
@@ -135,12 +140,12 @@ impl Cache {
                 );
             }
             if !input.is_empty() && std::env::var_os("RUSTD_STATS").is_some() {
-                eprintln!("sharing fast path: unchanged facts");
+                eprintln!("sharing fast path: unchanged facts; program={program}");
             }
             return shared.clone();
         }
         if !input.is_empty() && std::env::var_os("RUSTD_STATS").is_some() {
-            eprintln!("sharing full path");
+            eprintln!("sharing full path; program={program}");
         }
         let shared = input.clone().capture(db);
         self.files.clear();
@@ -160,6 +165,9 @@ impl Cache {
                     let file = super::home::body_file(db, func.into());
                     let facts = self.files.entry(file).or_default();
                     facts.nested |= func.module(db).block(db).is_some();
+                    if facts.nested {
+                        continue;
+                    }
                     if !facts.trees.iter().any(|&(k, f, _)| k == krate && f == source) {
                         facts.trees.push((
                             krate,

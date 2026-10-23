@@ -1576,6 +1576,8 @@ def test_graph_sharing_incremental(work):
             "src/features.rs": feature,
             "src/lib.rs": f'''mod features;
 pub use features::*;
+thread_local! {{ static SAID: std::cell::RefCell<Option<String>> = None.into(); }}
+pub fn macro_local() -> u64 {{ SAID.with_borrow(|it| if it.is_none() {{ 3 }} else {{ 4 }}) }}
 pub fn total() -> u64 {{ {total} }}
 #[cfg(not(test))] pub fn different() -> u64 {{ 2 }}
 #[cfg(test)] pub fn different() -> u64 {{ 1 }}
@@ -1583,6 +1585,7 @@ pub fn total() -> u64 {{ {total} }}
     {reports}
     #[test] fn copies() {{
         assert!(super::Flag::check(1));
+        assert_eq!(super::macro_local(), 3);
         assert_eq!(super::total(), 79800);
         assert_eq!(super::total(), probe::total());
         assert_eq!(super::different(), 1);
@@ -1628,6 +1631,16 @@ pub fn total() -> u64 {{ {total} }}
                 held = "patch reports: 0 of 20" in fresh
                 checks.append((name, held, fresh[-700:]))
                 print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                name = f"cfg sharing: {mode} {prime}-prime reach checks only patch functions"
+                candidates = list(map(int, re.findall(r"reach patch candidates: (\d+)", fresh)))
+                held = bool(candidates) and max(candidates) <= 4
+                checks.append((name, held, str(candidates)))
+                print(f"  {'ok ' if held else 'NOT'} {name}: {candidates}", flush=True)
+                name = f"cfg sharing: {mode} {prime}-prime path diagnostics identify the program"
+                paths = re.findall(r"^(?:reach|sharing) (?:fast|full) path:?.*$", fresh, re.M)
+                held = bool(paths) and all("; program=" in line for line in paths)
+                checks.append((name, held, str(paths)))
+                print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
                 for query, limit in [("reach_topology", 0), ("reach_component_print", 2), ("reach_root_code", 1)] + ([("twin_index", 0), ("pair_safety", 0), ("pair_eligibility", 0), ("decision_serial", 0), ("applicable_adt_impls", 0), ("local_trait_impls", 0)] if mode == "on" else []):
                     name = f"cfg sharing: {mode} {prime}-prime {query} executions <= {limit}"
                     count_ran = sum(map(int, re.findall(rf"\b{query}=(\d+)", fresh)))
@@ -1655,6 +1668,14 @@ pub fn total() -> u64 {{ {total} }}
                 detail = f"topology {topology_ran}, roots {roots_ran}"
                 checks.append((name, held, detail))
                 print(f"  {'ok ' if held else 'NOT'} {name}: {detail}", flush=True)
+                before = logs()
+                pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "identity(x) != 0").replace("fn identity(x: u64) -> u64 { x }", "fn identity(x: u64) -> u64 { x + 1 }"))
+                _, new_callee_edit = side.cargo("test", "--lib")
+                fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                name = f"cfg sharing: {mode} {prime}-prime edit of callee absent from patch base verifies reach"
+                held = new_callee_edit.returncode == 0 and "reach fast path: unchanged edges" in fresh
+                checks.append((name, held, fresh[-700:]))
+                print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
                 if mode == "on":
                     before = logs()
                     pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "let _ = cfg!(test); identity(x) != 0"))

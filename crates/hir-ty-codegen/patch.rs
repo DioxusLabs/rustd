@@ -445,6 +445,7 @@ impl Touched {
 pub struct Stale {
     roots: Vec<FunctionId>,
     instances: Vec<Instance>,
+    reach_changed: FxHashSet<Node>,
     /// The statics with another value, which a patch defines again under their name.
     statics: Vec<StaticId>,
     /// What a patch can't replace, and why. That only matters for what the program still
@@ -495,6 +496,7 @@ pub(super) struct Patch {
     pub(super) bodies: usize,
     pub(super) phases: Phases,
     pub(super) sharing: super::SharingStats,
+    pub(super) reach_changed: Option<FxHashSet<Node>>,
 }
 
 /// An object that defines nothing.
@@ -857,7 +859,12 @@ impl Base {
                     eprintln!("check-all: MISSED root {root:?} of {:?}", self.crates[i]);
                     continue;
                 }
-                Some(Some(_)) => stale.roots.push(root),
+                Some(Some(mark)) => {
+                    stale.roots.push(root);
+                    if mark.seen() != self.marks[i].seen() {
+                        stale.reach_changed.insert(Node::Root(root));
+                    }
+                }
                 Some(None) => return stale.declined("a root of the base no longer compiles"),
                 None => return stale.declined("a root of the base is gone"),
             }
@@ -896,7 +903,12 @@ impl Base {
                     eprintln!("check-all: MISSED instance {instance:?} of {:?}", was.env.krate);
                     continue;
                 }
-                Some(Some(_)) if !was.forwarded => stale.instances.push(instance.clone()),
+                Some(Some(mark)) if !was.forwarded => {
+                    stale.instances.push(instance.clone());
+                    if Some(mark.seen()) != was.mark.map(|it| it.seen()) {
+                        stale.reach_changed.insert(Node::Instance(instance.clone()));
+                    }
+                }
                 // One that had no code of its own might have now.
                 _ => stale.broken.push((
                     Node::Instance(instance.clone()),
@@ -928,6 +940,7 @@ impl Base {
             let writable = probe(|| compiled_static(db, id).as_ref().ok().map(|it| it.writable));
             if writable == Some(Some(was.writable)) && !was.theirs && !is_thread_local(db, id) {
                 stale.statics.push(id);
+                stale.reach_changed.insert(Node::Static(id));
             } else {
                 stale.broken.push((Node::Static(id), "a static of the base changed"));
             }
@@ -1076,6 +1089,7 @@ impl Base {
         let mut changed_instances = Vec::new();
         let mut changed_statics = Vec::new();
         let mut broken = Vec::new();
+        let mut reach_changed = Some(FxHashSet::default());
         for part in stale {
             if let Some(why) = part.declined {
                 return Ok(Err(why));
@@ -1084,6 +1098,15 @@ impl Base {
             changed_instances.extend(part.instances);
             changed_statics.extend(part.statics);
             broken.extend(part.broken);
+            if part.their_walk_changed {
+                reach_changed = None;
+            }
+            if let Some(changed) = &mut reach_changed {
+                changed.extend(part.reach_changed);
+            }
+        }
+        if !broken.is_empty() {
+            reach_changed = None;
         }
         // What the edit took away is still in the base, where nothing refers to it any more.
         let unchanged = Unchanged {
@@ -1154,7 +1177,8 @@ impl Base {
                 return Ok(Err("a static of the base no longer has a value"));
             }
         }
-        let mut queued: FxHashSet<FunctionId> = known_roots().collect();
+        let base_roots: FxHashSet<FunctionId> = known_roots().collect();
+        let mut queued = base_roots.clone();
         let mut queue = changed_roots;
         queue.extend(cg.wanted.drain(..).filter(|&func| queued.insert(func)));
         let mut next = 0;
@@ -1190,6 +1214,24 @@ impl Base {
                 return Ok(Err("a function now shares an `async` block with one left to rustc"));
             }
         }
+        if let Some(changed) = &mut reach_changed {
+            changed.extend(
+                queue.iter().filter(|root| !base_roots.contains(root)).copied().map(Node::Root),
+            );
+            changed.extend(
+                cg.envs
+                    .iter()
+                    .filter(|(instance, _)| !self.instances.contains_key(instance))
+                    .map(|(instance, _)| Node::Instance(instance.clone())),
+            );
+            changed.extend(
+                cg.own_static_order
+                    .iter()
+                    .filter(|id| !self.statics.contains_key(id))
+                    .copied()
+                    .map(Node::Static),
+            );
+        }
         let (bodies, mut phases, sharing) = (cg.bodies, cg.phases, cg.sharing_stats);
         if cg.sharing_restart {
             return Ok(Err("a shared type reaches TypeId"));
@@ -1197,7 +1239,7 @@ impl Base {
         let start = stdx::time::Instant::now();
         let (object, _) = cg.finish()?;
         phases.object = start.elapsed();
-        Ok(Ok(Patch { object, bodies, phases, sharing }))
+        Ok(Ok(Patch { object, bodies, phases, sharing, reach_changed }))
     }
 }
 

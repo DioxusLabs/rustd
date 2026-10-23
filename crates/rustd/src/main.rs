@@ -3241,7 +3241,9 @@ fn build(
     // The program's `main` is called by one rustc wrote, when rustc built the crate.
     let own = |main: &FunctionId| resolver.own_crate_id(hir_def::HasModule::krate(main, db));
     let roots = Roots {
-        sharing: hir::attach_db(db, || known.sharing(db, program_sharing(db, args))),
+        sharing: hir::attach_db(db, || {
+            known.sharing(db, program_sharing(db, args), &args.out.display().to_string())
+        }),
         entries: &entries,
         on_demand: &on_demand,
         start: main.filter(|it| own(it).is_some()),
@@ -7047,8 +7049,10 @@ impl Tests {
         }
         let tests = Tests::named(db, listed, args);
         let roots: Vec<FunctionId> = tests.iter().map(|it| it.0).collect();
-        let sharing = known.sharing(db, program_sharing(db, args));
-        let (reached, _, unknown) = known.reached(db, sharing, edited, &roots, &always, &kept);
+        let program = args.out.display().to_string();
+        let sharing = known.sharing(db, program_sharing(db, args), &program);
+        let (reached, _, unknown) =
+            known.reached(db, sharing, edited, &roots, &always, &kept, &program);
         if !unknown.is_empty() {
             eprintln!("reached: not known: {}", unknown.join("; "));
         }
