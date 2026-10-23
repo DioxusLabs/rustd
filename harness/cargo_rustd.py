@@ -1568,6 +1568,7 @@ def test_graph_sharing_incremental(work):
         functions = "\n".join(f"pub fn f{i}<T: Copy>(x: T) -> (T, u64) {{ (x, if enabled(1) {{ {i} }} else {{ 0 }}) }}" for i in range(400))
         total = "+".join(f"f{i}(1u64).1" for i in range(400))
         feature = "pub fn enabled(x: u64) -> bool { x != 0 }\n" + functions + "\n"
+        reports = "\n".join(f'#[test] fn report{i}() -> Result<(), &\'static str> {{ Ok(()) }}' for i in range(20))
         files = {
             "Cargo.toml": '[package]\nname="sharing_incremental"\nversion="0.1.0"\nedition="2021"\n[workspace]\nmembers=["probe"]\n[dev-dependencies]\nprobe={path="probe"}\n',
             "probe/Cargo.toml": '[package]\nname="probe"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nsharing_incremental={path=".."}\n',
@@ -1579,6 +1580,7 @@ pub fn total() -> u64 {{ {total} }}
 #[cfg(not(test))] pub fn different() -> u64 {{ 2 }}
 #[cfg(test)] pub fn different() -> u64 {{ 1 }}
 #[cfg(test)] mod tests {{
+    {reports}
     #[test] fn copies() {{
         assert_eq!(super::total(), 79800);
         assert_eq!(super::total(), probe::total());
@@ -1596,6 +1598,8 @@ pub fn total() -> u64 {{ {total} }}
         for prime in ("cold", "retained"):
             env = dict(base_env(os.path.join(work, f"hi-{mode}-{prime[0]}")), RUSTD_CACHE=store,
                        RUSTD_STATS="1", RUSTD_CFG_SHARING="1" if mode == "on" else "0")
+            if mode == "on" and prime == "cold":
+                env["RUSTD_TRACE"] = "1"
             side = Side(ws, env, True)
             def logs():
                 return {path: path.read_text(errors="replace") for path in pathlib.Path(env["RUSTD_HOME"]).glob("**/log")}
@@ -1615,9 +1619,35 @@ pub fn total() -> u64 {{ {total} }}
                 detail = f"{count} backend functions; {fresh[-700:]}"
                 checks.append((name, held, detail))
                 print(f"  {'ok ' if held else 'NOT'} {name}  {detail}", flush=True)
+                name = f"cfg sharing: {mode} {prime}-prime edit keeps unchanged report shims"
+                held = "patch reports: 0 of 20" in fresh
+                checks.append((name, held, fresh[-700:]))
+                print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                if mode == "on" and prime == "cold":
+                    name = "cfg sharing: body edit keeps signature and impl compatibility queries"
+                    held = not re.search(r"(?:same_signature|applicable_adt_impls)=", fresh)
+                    checks.append((name, held, fresh[-700:]))
+                    print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                    source = files["src/lib.rs"]
+                    cases = [
+                        ("error result", source.replace("fn report0() -> Result<(), &'static str> { Ok(()) }", "fn report0() -> Result<(), &'static str> { Err(\"expected\") }"), "0 of 20", False),
+                        ("changed return", source.replace("fn report0() -> Result<(), &'static str> { Ok(()) }", "fn report0() -> std::process::ExitCode { std::process::ExitCode::SUCCESS }"), "1 of 20", True),
+                        ("unit return", source.replace("fn report0() -> Result<(), &'static str> { Ok(()) }", "fn report0() {}"), "0 of 19", True),
+                        ("new return", source.replace("fn copies() {", "fn copies() -> Result<(), &'static str> {").replace("assert_eq!(probe::different(), 2);", "assert_eq!(probe::different(), 2); Ok(())"), "1 of 21", True),
+                    ]
+                    for case, text, expected, succeeds in cases:
+                        before = logs()
+                        pathlib.Path(ws, "src/lib.rs").write_text(text)
+                        _, result = side.cargo("test", "--lib")
+                        fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                        name = f"cfg sharing: {case} report shim"
+                        held = (result.returncode == 0) == succeeds and f"patch reports: {expected}" in fresh
+                        checks.append((name, held, f"{result.stdout[-300:]} {fresh[-700:]}"))
+                        print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
             finally:
                 side.cargo("stop")
                 pathlib.Path(ws, "src/features.rs").write_text(feature)
+                pathlib.Path(ws, "src/lib.rs").write_text(files["src/lib.rs"])
     for prime in ("cold", "retained"):
         name = f"cfg sharing: {prime}-prime edit backend count <= off + 2"
         on, off = counts["on", prime], counts["off", prime]

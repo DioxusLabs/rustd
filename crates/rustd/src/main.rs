@@ -3141,6 +3141,7 @@ struct Build {
     instances: usize,
     codegen: Duration,
     emit: Duration,
+    emitted: [Duration; 3],
     /// How long finding the roots, checking what is cached and compiling took, in that order.
     steps: [Duration; 3],
     /// Within the checking, the longest a thread took over each kind of cached thing.
@@ -3321,10 +3322,13 @@ fn build(
     if let (Some(path), Some(patch)) = (&args.patch, &unit.patch) {
         replace(path, patch)?;
     }
+    let written = start.elapsed();
+    let mut reached = Duration::ZERO;
     let mut harness_unfit = None;
     if let Some(harness) = harness {
         // What each test can run, for the client to run only the ones an edit can change.
         Reached::of(db, listed, args).write(&args.out)?;
+        reached = start.elapsed() - written;
         let text = hir::attach_db(db, || match programs_own.first() {
             Some(&krate) if doctest => {
                 let runners: Vec<(String, Option<String>)> = listed
@@ -3353,6 +3357,7 @@ fn build(
             Err(reason) => harness_unfit = Some(reason),
         }
     }
+    let harnessed = start.elapsed() - written - reached;
     // A function of a crate rustc built nothing of has no copy to stand in for it.
     let missing = unit.skipped.iter().find(|(func, error)| {
         !error.no_symbol() && !resolver.rustc_built(hir_def::HasModule::krate(func, db))
@@ -3375,6 +3380,7 @@ fn build(
         instances: unit.instances,
         codegen,
         emit: start.elapsed(),
+        emitted: [written, reached, harnessed],
         steps: [setup, revalidate - setup, codegen - revalidate],
         looked,
         unfit: harness_unfit.or(report_unfit).or(missing).or_else(|| {
@@ -6859,6 +6865,9 @@ impl Program {
                     ),
                 ),
                 ("write", warm.emit),
+                ("write-object", warm.emitted[0]),
+                ("write-reach", warm.emitted[1]),
+                ("write-harness", warm.emitted[2]),
                 ("build-rest", built.saturating_sub(apply + warm.codegen + warm.emit)),
                 ("report", reported - built),
                 ("link", total - reported),
@@ -6867,15 +6876,19 @@ impl Program {
                 steps.iter().map(|(name, took)| format!("{name}={}", took.as_micros())).collect();
             eprintln!("timeline-us: {}", steps.join(" "));
             eprintln!(
-                "asked: {} roots, {} instances, slowest {:.1?}; longest on a thread: roots {:.1?}, \
-                 instances {:.1?}, statics {:.1?}, left {:.1?}",
+                "asked: {} roots, {} instances, slowest {:.1?}; longest on a thread: policy {:.1?}, \
+                 rejected {:.1?}, roots {:.1?}, \
+                 instances {:.1?}, statics {:.1?}, left {:.1?}; {} rejected instances",
                 warm.looked.roots_asked,
                 warm.looked.instances_asked,
                 warm.looked.slowest,
+                warm.looked.policy,
+                warm.looked.rejected,
                 warm.looked.roots,
                 warm.looked.instances,
                 warm.looked.statics,
                 warm.looked.left,
+                warm.looked.rejected_asked,
             );
         }
         eprintln!("edit-to-binary: {total:.1?}");

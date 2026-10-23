@@ -309,6 +309,7 @@ pub(super) struct Base {
     entries: Vec<FunctionId>,
     pub(super) compiled: Vec<(FunctionId, String)>,
     marks: Vec<Mark>,
+    reports: FxHashMap<FunctionId, Mark>,
     /// The crate of each of `compiled`, and the file it is written in.
     crates: Vec<Crate>,
     files: Vec<FileId>,
@@ -459,6 +460,8 @@ pub struct Stale {
 /// How long looking at each kind of thing in the base took, in the order they are looked at.
 #[derive(Default, Clone, Copy)]
 pub struct StaleSteps {
+    pub policy: std::time::Duration,
+    pub rejected: std::time::Duration,
     pub roots: std::time::Duration,
     pub instances: std::time::Duration,
     pub statics: std::time::Duration,
@@ -466,6 +469,7 @@ pub struct StaleSteps {
     pub left: std::time::Duration,
     /// How many roots and instances an edit could have changed, and so were asked about.
     pub roots_asked: usize,
+    pub rejected_asked: usize,
     pub instances_asked: usize,
     /// The longest any one of them took to answer.
     pub slowest: std::time::Duration,
@@ -514,6 +518,7 @@ impl Base {
         db: &dyn HirDatabase,
         cg: &ObjectCodegen<'_, '_>,
         entries: &[FunctionId],
+        reports: &[FunctionId],
         compiled: &[(FunctionId, String)],
         skipped: &[(FunctionId, CodegenError)],
     ) -> Option<Base> {
@@ -650,6 +655,13 @@ impl Base {
             entries: entries.to_vec(),
             compiled: compiled.to_vec(),
             marks,
+            reports: reports
+                .iter()
+                .map(|&test| {
+                    let compiled = super::compiled_report(db, test).as_ref().ok()?;
+                    Some((test, Mark::new(db, super::report_serial(db, test), &compiled.requests)))
+                })
+                .collect::<Option<_>>()?,
             homes: Homes::new(compiled, &crates, &files, &instances),
             crates,
             files,
@@ -794,7 +806,9 @@ impl Base {
     pub(super) fn stale(&self, db: &dyn HirDatabase, part: usize, parts: usize) -> Stale {
         let start = stdx::time::Instant::now();
         let mut stale = Stale::default();
-        if self.decisions_changed(db) {
+        let changed = self.decisions_changed(db);
+        stale.steps.policy = start.elapsed();
+        if changed {
             return stale.declined("cfg sharing decisions changed");
         }
         let every = |len: usize| (part..len).step_by(parts);
@@ -802,6 +816,7 @@ impl Base {
         // so if one did.
         let check_all = std::env::var_os("RUSTD_CHECK_ALL").is_some();
         for i in every(self.rejected.len()) {
+            stale.steps.rejected_asked += 1;
             let (instance, env) = &self.rejected[i];
             let compiles = probe(|| {
                 program_instance(db, instance.clone(), env.clone(), &self.sharing).is_ok()
@@ -810,6 +825,8 @@ impl Base {
                 return stale.declined("an instance that did not compile is another now");
             }
         }
+        stale.steps.rejected = start.elapsed() - stale.steps.policy;
+        let start = stdx::time::Instant::now();
         for i in self.roots_to_ask(check_all, part, parts) {
             let root = self.compiled[i].0;
             let touched = self.touched.reaches(self.crates[i])
@@ -1100,8 +1117,17 @@ impl Base {
         cg.phases.compile = verify;
         // What nothing reached any more can be reached again by the code compiled now.
         cg.replaced = unchanged;
+        let mut reports = 0;
         for &test in roots.reports {
-            cg.define_report(test)?;
+            let compiled = super::compiled_report(db, test).as_ref().map_err(Clone::clone)?;
+            let mark = Mark::new(db, super::report_serial(db, test), &compiled.requests);
+            if self.reports.get(&test) != Some(&mark) {
+                cg.define_report(test)?;
+                reports += 1;
+            }
+        }
+        if std::env::var_os("RUSTD_STATS").is_some() {
+            eprintln!("patch reports: {reports} of {}", roots.reports.len());
         }
         // rustc's copies are the ones the base was built against: what they call is in it.
         for instance in &changed_instances {

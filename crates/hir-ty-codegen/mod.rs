@@ -896,7 +896,14 @@ impl CodegenUnit {
                     declined,
                 };
                 if patching {
-                    *base = patch::Base::record(db, &cg, roots.entries, &compiled, &skipped);
+                    *base = patch::Base::record(
+                        db,
+                        &cg,
+                        roots.entries,
+                        roots.reports,
+                        &compiled,
+                        &skipped,
+                    );
                     if base.is_none() && std::env::var_os("RUSTD_STATS").is_some() {
                         eprintln!("patch discard: could not record base");
                     }
@@ -1216,11 +1223,14 @@ impl Rejections {
             self.stale.iter().map(|it| step(&it.steps)).max().unwrap_or_default()
         };
         StaleSteps {
+            policy: longest(|it| it.policy),
+            rejected: longest(|it| it.rejected),
             roots: longest(|it| it.roots),
             instances: longest(|it| it.instances),
             statics: longest(|it| it.statics),
             left: longest(|it| it.left),
             roots_asked: self.stale.iter().map(|it| it.steps.roots_asked).sum(),
+            rejected_asked: self.stale.iter().map(|it| it.steps.rejected_asked).sum(),
             instances_asked: self.stale.iter().map(|it| it.steps.instances_asked).sum(),
             slowest: longest(|it| it.slowest),
         }
@@ -1666,6 +1676,11 @@ fn instance_serial(db: &dyn HirDatabase, instance: Instance, env: StoredParamEnv
 #[salsa::tracked(returns(copy))]
 fn program_root_serial(db: &dyn HirDatabase, func: FunctionId, sharing: Sharing) -> u128 {
     program_root(db, func, &sharing).as_ref().map_or(0, print_of)
+}
+
+#[salsa::tracked(returns(copy))]
+fn report_serial(db: &dyn HirDatabase, func: FunctionId) -> u128 {
+    compiled_report(db, func).as_ref().map_or(0, print_of)
 }
 
 #[salsa::tracked(returns(copy))]

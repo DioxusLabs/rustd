@@ -123,13 +123,23 @@ impl Graph {
             return Vec::new();
         }
         let compiled: Result<(u128, &Requests), &CodegenError> = match &node {
-            Node::Root(func) => super::program_root(db, *func, &self.sharing)
-                .as_ref()
-                .map(|it| (print_of(it), &it.requests)),
+            Node::Root(func) => super::program_root(db, *func, &self.sharing).as_ref().map(|it| {
+                (super::program_root_serial(db, *func, self.sharing.clone()), &it.requests)
+            }),
             Node::Instance(instance, env) => {
                 super::program_instance(db, instance.clone(), env.clone(), &self.sharing)
                     .as_ref()
-                    .map(|it| (print_of(it), &it.requests))
+                    .map(|it| {
+                        (
+                            super::program_instance_serial(
+                                db,
+                                instance.clone(),
+                                env.clone(),
+                                self.sharing.clone(),
+                            ),
+                            &it.requests,
+                        )
+                    })
             }
             Node::Static(id) => {
                 compiled_static(db, *id).as_ref().map(|it| (static_serial(db, *id), &it.requests))
