@@ -8,6 +8,7 @@ use rustc_type_ir::{
 use std::{
     hash::{Hash, Hasher},
     sync::Arc,
+    time::Instant,
 };
 
 use crate::{
@@ -85,7 +86,6 @@ pub(super) struct Cache {
 
 #[derive(Default, Clone)]
 struct FileFacts {
-    nested: bool,
     trees: Vec<(Crate, hir_expand::HirFileId, Option<Arc<hir_def::item_tree::ItemTree>>)>,
     bodies: Vec<(FunctionId, bool, crate::sharing::BodySharingFacts)>,
 }
@@ -105,19 +105,24 @@ impl Cache {
         input: Sharing,
         program: &str,
     ) -> Sharing {
+        let start = Instant::now();
         let changed = std::mem::take(&mut self.changed);
+        let mut reason = "policy input changed";
         let same = self.input.as_ref() == Some(&input)
             && changed.iter().all(|file| {
-                self.files.get(file).is_some_and(|facts| {
-                    !facts.nested
-                        && facts.trees.iter().all(|(krate, file, tree)| {
-                            &hir_def::item_tree::file_item_tree_snapshot(db, *file, *krate) == tree
-                        })
-                        && facts.bodies.iter().all(|(func, normal, facts)| {
-                            crate::sharing::body_sharing_facts(db, *func, *normal) == facts
-                        })
+                let Some(facts) = self.files.get(file) else {
+                    reason = "changed file has no retained facts";
+                    return false;
+                };
+                facts.trees.iter().all(|(krate, file, tree)| {
+                    reason = "item tree changed";
+                    &hir_def::item_tree::file_item_tree_snapshot(db, *file, *krate) == tree
+                }) && facts.bodies.iter().all(|(func, normal, facts)| {
+                    reason = "body facts changed";
+                    crate::sharing::body_sharing_facts(db, *func, *normal) == facts
                 })
             });
+        let validated = start.elapsed();
         if same && let Some(shared) = &self.shared {
             if std::env::var_os("RUSTD_VERIFY_FASTPATH").is_some_and(|it| it == "1") {
                 let full = input.clone().capture(db);
@@ -141,13 +146,15 @@ impl Cache {
             }
             if !input.is_empty() && std::env::var_os("RUSTD_STATS").is_some() {
                 eprintln!("sharing fast path: unchanged facts; program={program}");
+                eprintln!("sharing validate-us: {}; program={program}", validated.as_micros());
             }
             return shared.clone();
         }
         if !input.is_empty() && std::env::var_os("RUSTD_STATS").is_some() {
-            eprintln!("sharing full path; program={program}");
+            eprintln!("sharing full path: {reason}; program={program}");
         }
         let shared = input.clone().capture(db);
+        let captured = start.elapsed();
         self.files.clear();
         if !input.is_empty() {
             let mut crates = FxHashMap::default();
@@ -164,11 +171,9 @@ impl Cache {
                     let source = func.lookup(db).id.file_id;
                     let file = super::home::body_file(db, func.into());
                     let facts = self.files.entry(file).or_default();
-                    facts.nested |= func.module(db).block(db).is_some();
-                    if facts.nested {
-                        continue;
-                    }
-                    if !facts.trees.iter().any(|&(k, f, _)| k == krate && f == source) {
+                    if func.module(db).block(db).is_none()
+                        && !facts.trees.iter().any(|&(k, f, _)| k == krate && f == source)
+                    {
                         facts.trees.push((
                             krate,
                             source,
@@ -185,6 +190,14 @@ impl Cache {
         }
         self.input = Some(input);
         self.shared = Some(shared.clone());
+        if !shared.is_empty() && std::env::var_os("RUSTD_STATS").is_some() {
+            eprintln!(
+                "sharing phases-us: validate={} capture={} inventory={}; program={program}",
+                validated.as_micros(),
+                (captured - validated).as_micros(),
+                (start.elapsed() - captured).as_micros(),
+            );
+        }
         shared
     }
 }

@@ -7,7 +7,10 @@
 //! nor one a macro is handed, nor one that declares items other than statics and constants.
 //! Such bodies count as part of what the rest of the program sees.
 
-use std::hash::{Hash, Hasher};
+use std::{
+    hash::{Hash, Hasher},
+    time::Instant,
+};
 
 use hir_def::{FunctionId, Lookup, ModuleDefId, expr_store::Body};
 use ide_db::{
@@ -83,6 +86,7 @@ impl Outlines {
 /// The [`outline`] of each file. A wide edit is of thousands of files: their bodies are
 /// lowered together and the files are hashed on all threads.
 fn outlines(db: &RootDatabase, listed: &Listed, files: &[FileId]) -> Vec<Option<u64>> {
+    let start = Instant::now();
     let stats = std::env::var_os("RUSTD_STATS").is_some();
     if files.len() > 1 {
         let mut crates: Vec<_> =
@@ -93,7 +97,9 @@ fn outlines(db: &RootDatabase, listed: &Listed, files: &[FileId]) -> Vec<Option<
     }
     let functions = listed.in_files(db, files);
     let bodies = functions.iter().flatten().flatten().map(|&it| it.into()).collect();
+    let functions_time = start.elapsed();
     crate::lower(db, bodies);
+    let lowered = start.elapsed();
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     let mut outlines = vec![None; files.len()];
     std::thread::scope(|scope| {
@@ -126,6 +132,15 @@ fn outlines(db: &RootDatabase, listed: &Listed, files: &[FileId]) -> Vec<Option<
             outlines[at] = outline;
         }
     });
+    if stats {
+        eprintln!(
+            "outlines-us: functions={} lower={} hash={}; files={}",
+            functions_time.as_micros(),
+            (lowered - functions_time).as_micros(),
+            (start.elapsed() - lowered).as_micros(),
+            files.len(),
+        );
+    }
     outlines
 }
 

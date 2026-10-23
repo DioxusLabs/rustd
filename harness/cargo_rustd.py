@@ -1567,10 +1567,12 @@ def test_graph_sharing_incremental(work):
         ws = os.path.realpath(os.path.join(work, "sharing-incremental-" + mode))
         functions = "\n".join(f"pub fn f{i}<T: Copy>(x: T) -> (T, u64) {{ (x, if enabled(1) {{ {i} }} else {{ 0 }}) }}" for i in range(400))
         total = "+".join(f"f{i}(1u64).1" for i in range(400))
-        feature = "pub fn enabled(x: u64) -> bool { x != 0 }\nfn identity(x: u64) -> u64 { x }\npub struct Flag;\nimpl Flag { pub fn check(x: u64) -> bool { enabled(x) } }\n" + functions + "\n"
+        feature = "pub fn enabled(x: u64) -> bool { x != 0 }\nfn identity(x: u64) -> u64 { x }\npub struct Flag;\nimpl Flag { pub fn check(x: u64) -> bool { enabled(x) } }\npub fn dependency_value() -> u64 { named_dependency::value() }\n" + functions + "\n"
         reports = "\n".join(f'#[test] fn report{i}() -> Result<(), &\'static str> {{ Ok(()) }}' for i in range(20))
         files = {
-            "Cargo.toml": '[package]\nname="sharing_incremental"\nversion="0.1.0"\nedition="2021"\n[workspace]\nmembers=["probe"]\n[dev-dependencies]\nprobe={path="probe"}\n',
+            "Cargo.toml": '[package]\nname="sharing_incremental"\nversion="0.1.0"\nedition="2021"\n[workspace]\nmembers=["probe", "named_dependency"]\n[dependencies]\nnamed_dependency={path="named_dependency"}\n[dev-dependencies]\nprobe={path="probe"}\n',
+            "named_dependency/Cargo.toml": '[package]\nname="named_dependency"\nversion="0.1.0"\nedition="2021"\n',
+            "named_dependency/src/lib.rs": 'pub fn value() -> u64 { 7 }\n',
             "probe/Cargo.toml": '[package]\nname="probe"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nsharing_incremental={path=".."}\n',
             "probe/src/lib.rs": 'pub fn total() -> u64 { sharing_incremental::total() }\npub fn different() -> u64 { sharing_incremental::different() }\n',
             "src/features.rs": feature,
@@ -1641,13 +1643,18 @@ pub fn total() -> u64 {{ {total} }}
                 held = bool(paths) and all("; program=" in line for line in paths)
                 checks.append((name, held, str(paths)))
                 print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
-                for query, limit in [("reach_topology", 0), ("reach_component_print", 2), ("reach_root_code", 1)] + ([("twin_index", 0), ("pair_safety", 0), ("pair_eligibility", 0), ("decision_serial", 0), ("applicable_adt_impls", 0), ("local_trait_impls", 0)] if mode == "on" else []):
+                for query, limit in [("reach_topology", 0), ("reach_component_print", 2), ("reach_root_code", 1), ("loaded_crates", 0)] + ([("twin_index", 0), ("pair_safety", 0), ("pair_eligibility", 0), ("decision_serial", 0), ("applicable_adt_impls", 0), ("local_trait_impls", 0)] if mode == "on" else []):
                     name = f"cfg sharing: {mode} {prime}-prime {query} executions <= {limit}"
                     count_ran = sum(map(int, re.findall(rf"\b{query}=(\d+)", fresh)))
                     held = ("queries:" in fresh and re.search(rf"\b{query}=\d+", primed) is not None
                             and count_ran <= limit)
                     checks.append((name, held, f"executed {count_ran}"))
                     print(f"  {'ok ' if held else 'NOT'} {name}: {count_ran}", flush=True)
+                name = f"cfg sharing: {mode} {prime}-prime edited file dependency names execute and backdate"
+                projected = sum(map(int, re.findall(r"\bfile_dependency_names=(\d+)", fresh)))
+                held = projected > 0 and re.search(r"\bloaded_crates=\d+", primed) is not None
+                checks.append((name, held, f"executed {projected}"))
+                print(f"  {'ok ' if held else 'NOT'} {name}: {projected}", flush=True)
                 for case, text in [("code-only edit", feature.replace("x != 0", "x != 3")), ("restored code", feature)]:
                     before = logs()
                     pathlib.Path(ws, "src/features.rs").write_text(text)
@@ -1688,6 +1695,10 @@ pub fn total() -> u64 {{ {total} }}
                 checks.append((name, held, fresh[-700:]))
                 print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
                 if mode == "on":
+                    name = f"cfg sharing: {prime}-prime unrelated nested impl permits one verified policy fast path"
+                    held = fresh.count("sharing fast path: unchanged facts") == 1 and "sharing full path" not in fresh
+                    checks.append((name, held, fresh[-700:]))
+                    print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
                     before = logs()
                     pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "let _ = cfg!(test); identity(x) != 0"))
                     _, cfg_edit = side.cargo("test", "--lib")

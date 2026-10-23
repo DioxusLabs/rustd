@@ -3240,10 +3240,11 @@ fn build(
     };
     // The program's `main` is called by one rustc wrote, when rustc built the crate.
     let own = |main: &FunctionId| resolver.own_crate_id(hir_def::HasModule::krate(main, db));
+    let sharing = hir::attach_db(db, || {
+        known.sharing(db, program_sharing(db, args), &args.out.display().to_string())
+    });
     let roots = Roots {
-        sharing: hir::attach_db(db, || {
-            known.sharing(db, program_sharing(db, args), &args.out.display().to_string())
-        }),
+        sharing: sharing.clone(),
         entries: &entries,
         on_demand: &on_demand,
         start: main.filter(|it| own(it).is_some()),
@@ -3269,19 +3270,25 @@ fn build(
     // What every question about a crate's code comes down to first, asked one crate to a
     // thread: left to the questions, whichever gets there has the others wait for all of it.
     let next = std::sync::atomic::AtomicUsize::new(0);
+    let impls = std::sync::atomic::AtomicU64::new(0);
     let stale: Option<Vec<_>> = std::thread::scope(|scope| {
         let parts: Vec<_> = (0..threads)
             .map(|part| {
-                let (db, known, local, next) = (db.clone(), &*known, &local, &next);
+                let (db, known, local, next, impls) = (db.clone(), &*known, &local, &next, &impls);
                 scope.spawn(move || {
                     PROBING.set(true);
                     hir::attach_db(&db, || {
+                        let start = Instant::now();
                         while let Some(&krate) =
                             local.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
                         {
                             hir_ty::method_resolution::TraitImpls::for_crate(&db, krate.into());
                             hir_ty::method_resolution::InherentImpls::for_crate(&db, krate.into());
                         }
+                        impls.fetch_max(
+                            start.elapsed().as_micros() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         known.stale(&db, part, threads)
                     })
                 })
@@ -3290,6 +3297,13 @@ fn build(
         parts.into_iter().map(|it| it.join().ok().flatten()).collect()
     });
     hir::attach_db(db, || known.set_stale(hir_db, stale.unwrap_or_default()));
+    if std::env::var_os("RUSTD_STATS").is_some() {
+        eprintln!(
+            "check impls longest-thread-us: {}; program={}",
+            impls.load(std::sync::atomic::Ordering::Relaxed),
+            args.out.display()
+        );
+    }
     let looked = known.stale_steps();
     let revalidate = start.elapsed();
     // Salsa attaches the database for the duration of the closure; the solver needs it.
@@ -3329,7 +3343,7 @@ fn build(
     let mut harness_unfit = None;
     if let Some(harness) = harness {
         // What each test can run, for the client to run only the ones an edit can change.
-        Reached::of(db, listed, args, known).write(&args.out)?;
+        Reached::of(db, listed, args, known, sharing).write(&args.out)?;
         reached = start.elapsed() - written;
         let text = hir::attach_db(db, || match programs_own.first() {
             Some(&krate) if doctest => {
@@ -6240,6 +6254,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
         if changed != 0 || !background {
             db.apply_change(change);
         }
+        let changed_db = start.elapsed();
         if !removed.is_empty() {
             tree.remove(&mut db, &removed);
             let mut index = 0;
@@ -6264,6 +6279,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
             unbuilt.edited.sort_unstable();
             unbuilt.edited.dedup();
         }
+        let noted = start.elapsed();
         let paths: FxHashMap<_, _> = files
             .iter()
             .filter_map(|it| match it.file {
@@ -6273,6 +6289,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
             .collect();
         let paths = Arc::new(Sources { paths });
         let sources = outlines.after_edit(&db, &listed, sources);
+        let outlined = start.elapsed();
         for (file, bodies_only) in sources {
             if bodies_only {
                 if std::env::var_os("RUSTD_STATS").is_some() {
@@ -6293,6 +6310,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
             });
             listed.touch(&db, Some(&moved));
         }
+        let invalidated = start.elapsed();
         // The examples of the libraries are written as their documentation says now.
         let crates =
             write_examples(&mut db, emits.triple(), |db| builds.settle(db, &mut programs))?;
@@ -6302,6 +6320,16 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                 it.unbuilt.stale = true;
             });
             listed.touch(&db, Some(&crates));
+        }
+        if std::env::var_os("RUSTD_STATS").is_some() {
+            eprintln!(
+                "apply-us: db={} bookkeeping={} outlines={} invalidate={} examples={}",
+                changed_db.as_micros(),
+                (noted - changed_db).as_micros(),
+                (outlined - noted).as_micros(),
+                (invalidated - outlined).as_micros(),
+                (start.elapsed() - invalidated).as_micros(),
+            );
         }
         let edit = Edit { start, age, settled, read, apply: start.elapsed(), changed };
         if background {
@@ -7034,7 +7062,13 @@ impl Tests {
     /// What each test of the program can run, as lines for the client that decides which
     /// of them to run: `test <print> <group> <name>`. A print of `-` is of code that is
     /// not all known.
-    fn reached(db: &RootDatabase, listed: &Listed, args: &Args, known: &mut Rejections) -> String {
+    fn reached(
+        db: &RootDatabase,
+        listed: &Listed,
+        args: &Args,
+        known: &mut Rejections,
+        sharing: hir_ty::mir::codegen::Sharing,
+    ) -> String {
         use std::fmt::Write as _;
         let (mut always, mut kept) = (Vec::new(), Vec::new());
         let mut edited = FxHashSet::default();
@@ -7050,7 +7084,6 @@ impl Tests {
         let tests = Tests::named(db, listed, args);
         let roots: Vec<FunctionId> = tests.iter().map(|it| it.0).collect();
         let program = args.out.display().to_string();
-        let sharing = known.sharing(db, program_sharing(db, args), &program);
         let (reached, _, unknown) =
             known.reached(db, sharing, edited, &roots, &always, &kept, &program);
         if !unknown.is_empty() {
@@ -7104,8 +7137,14 @@ fn trace_queries(db: &RootDatabase) {
 struct Reached(String);
 
 impl Reached {
-    fn of(db: &RootDatabase, listed: &Listed, args: &Args, known: &mut Rejections) -> Reached {
-        Reached(hir::attach_db(db, || Tests::reached(db, listed, args, known)))
+    fn of(
+        db: &RootDatabase,
+        listed: &Listed,
+        args: &Args,
+        known: &mut Rejections,
+        sharing: hir_ty::mir::codegen::Sharing,
+    ) -> Reached {
+        Reached(hir::attach_db(db, || Tests::reached(db, listed, args, known, sharing)))
     }
 
     fn path(object: &Path, suffix: &str) -> PathBuf {
