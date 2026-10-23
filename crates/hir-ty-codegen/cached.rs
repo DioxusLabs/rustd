@@ -486,6 +486,7 @@ impl Entry {
 /// The entries of the store that one program was asked about.
 pub(super) struct Entries {
     pub(super) type_ids: bool,
+    pub(super) checkout: bool,
     store: &'static Store,
     /// Whether the entries asked for are the ones with what a debugger is told.
     debug: bool,
@@ -703,6 +704,7 @@ impl Entries {
     ) -> Entries {
         Entries {
             type_ids: true,
+            checkout: true,
             store,
             debug,
             program,
@@ -732,6 +734,9 @@ impl Entries {
     }
 
     fn get_key(&self, name: &str, key: [u8; KEY]) -> Option<Arc<Entry>> {
+        if !self.checkout && super::stable::StableNames::of_checkout(name) {
+            return None;
+        }
         if let Some(known) = self.known().entries.get(&key) {
             return known.clone();
         }
@@ -996,6 +1001,25 @@ mod tests {
             assert!(!restricted.usable("id", &|_| true));
             assert!(!restricted.usable("caller", &|_| true));
             assert!(!restricted.usable("missing", &|_| true));
+        });
+    }
+
+    #[test]
+    fn checkout_entries_are_kept_but_not_hydrated_for_patches() {
+        with_entries(|entries| {
+            let checkout = "fn ~123:body<>";
+            keep_entry(entries, "plain", Vec::new());
+            keep_entry(entries, checkout, Vec::new());
+            keep_entry(entries, "caller", vec![CachedTarget::Named(checkout.to_owned())]);
+            assert!(entries.usable("caller", &|_| true));
+            let mut restricted = Entries::new(entries.store, true, None, None, None);
+            restricted.checkout = false;
+            assert!(restricted.usable("plain", &|_| true));
+            assert!(restricted.get(checkout).is_none());
+            assert!(!restricted.usable(checkout, &|_| true));
+            assert!(!restricted.usable("caller", &|_| true));
+            assert!(!restricted.usable("missing", &|_| true));
+            assert!(entries.get(checkout).is_some());
         });
     }
 

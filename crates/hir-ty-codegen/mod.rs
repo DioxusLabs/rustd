@@ -3845,7 +3845,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             source_paths: FxHashMap::default(),
             builder_ctx: FunctionBuilderContext::new(),
             location_counter: 0,
-            names: stable::StableNames::new(db, symbols, own_statics.crates.clone(), hydrate),
+            names: stable::StableNames::new(db, symbols, own_statics.crates.clone(), true),
             hydrate,
             stable_names: StableNameCache::default(),
             kept: Kept::default(),
@@ -3854,13 +3854,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 .filter(|_| base.is_none() && std::env::var_os("RUSTD_CACHE_CHECK").is_none())
                 .map(|store| {
                     let (home, library) = (symbols.cargo_home(), symbols.library_sources());
-                    std::sync::Arc::new(cached::Entries::new(
-                        store,
-                        debugged,
-                        program.flatten(),
-                        home,
-                        library,
-                    ))
+                    let mut entries =
+                        cached::Entries::new(store, debugged, program.flatten(), home, library);
+                    entries.checkout = hydrate;
+                    std::sync::Arc::new(entries)
                 }),
             named: FxHashMap::default(),
             found: Vec::new(),
