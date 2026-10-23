@@ -312,7 +312,7 @@ fn source_key(db: &dyn SourceDatabase, item: AttrDefId) -> Option<SourceKey> {
     Some(SourceKey { id: ast_key(db, id, 0)?, containers })
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TwinIndex {
     /// T to N. These are source matches, not a shareable set.
     pub twins: FxHashMap<AttrDefId, AttrDefId>,
@@ -327,7 +327,7 @@ pub struct TwinIndex {
     pub function_items: FxHashSet<AttrDefId>,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TwinBodyCounts {
     pub twins: usize,
     pub cfg_differing: usize,

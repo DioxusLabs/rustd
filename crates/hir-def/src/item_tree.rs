@@ -40,7 +40,7 @@ use std::{
     fmt::{self, Debug},
     hash::Hash,
     ops::Index,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
 use ast::{AstNode, StructKind};
@@ -138,12 +138,20 @@ pub fn file_item_tree(db: &dyn SourceDatabase, file_id: HirFileId, krate: Crate)
     }
 }
 
+pub fn file_item_tree_snapshot(
+    db: &dyn SourceDatabase,
+    file_id: HirFileId,
+    krate: Crate,
+) -> Option<Arc<ItemTree>> {
+    file_item_tree_query(db, file_id, krate).clone()
+}
+
 #[salsa::tracked(returns(ref))]
 fn file_item_tree_query(
     db: &dyn SourceDatabase,
     file_id: HirFileId,
     krate: Crate,
-) -> Option<Box<ItemTree>> {
+) -> Option<Arc<ItemTree>> {
     let _p = tracing::info_span!("file_item_tree_query", ?file_id).entered();
 
     let mut ctx = lower::Ctx::new(db, file_id, krate);
@@ -185,7 +193,7 @@ fn file_item_tree_query(
         None
     } else {
         item_tree.finalize();
-        Some(Box::new(item_tree))
+        Some(Arc::new(item_tree))
     }
 }
 

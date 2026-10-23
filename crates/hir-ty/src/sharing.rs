@@ -57,7 +57,7 @@ pub enum Rejection {
     Unknown,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Eligibility {
     /// Fully shareable T items before the crate-wide safety veto.
     pub candidates: FxHashSet<AttrDefId>,
@@ -68,7 +68,7 @@ pub struct Eligibility {
     pub test_only_statics: usize,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct References {
     items: FxHashSet<AttrDefId>,
     type_items: FxHashSet<AttrDefId>,
@@ -76,6 +76,53 @@ struct References {
     baked_items: FxHashSet<AttrDefId>,
     unknown: bool,
     generic_unresolved: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodySharingFacts {
+    references: Option<References>,
+    cfg: cfg::CfgReads,
+    items: BodyItems,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BodyItems {
+    declarations: Vec<ModuleDefId>,
+    impls: Vec<ImplId>,
+    macros: Vec<hir_def::MacroId>,
+}
+
+#[salsa::tracked(returns(ref))]
+pub fn body_item_inventory(db: &dyn HirDatabase, func: FunctionId) -> BodyItems {
+    let mut items = BodyItems::default();
+    for (_, map) in Body::of(db, func.into()).blocks(db) {
+        for (_, module) in map.modules(db) {
+            let scope = module.scope(db);
+            items.declarations.extend(scope.declarations());
+            items.declarations.extend(scope.unnamed_consts().map(ModuleDefId::ConstId));
+            items.impls.extend(scope.impls());
+            items.macros.extend(
+                scope
+                    .legacy_macros()
+                    .flat_map(|(_, ids)| ids.iter().copied())
+                    .chain(scope.macros().map(|(_, item)| item.def)),
+            );
+        }
+    }
+    items
+}
+
+#[salsa::tracked(returns(ref))]
+pub fn body_sharing_facts(
+    db: &dyn HirDatabase,
+    func: FunctionId,
+    normal: bool,
+) -> BodySharingFacts {
+    BodySharingFacts {
+        references: normal.then(|| references(db, func.into(), true).clone()),
+        cfg: Body::cfg_reads(db, func.into()).clone(),
+        items: body_item_inventory(db, func).clone(),
+    }
 }
 
 struct Collector<'db> {
