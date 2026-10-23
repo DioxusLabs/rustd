@@ -2722,14 +2722,17 @@ fn dump_twins(db: &RootDatabase, args: &Args) {
         };
         let enabled = eligibility.pair_veto.is_empty();
         eprintln!(
-            "cfg eligibility: {name}: eligible items {}, bodies {}; candidates items {}, bodies {}; rejected bodies: cfg-differing {}, transitive {}, static-closure {}, generic-unresolved {}, unknown {}; statics {}, test-only statics {}; pair veto: {veto}; both copies {both}; analysis {:.3}s, RSS {} MB",
+            "cfg eligibility: {name}: fully-shared items {}, bodies {}; analysis-shared items {}, bodies {}; candidates fully-shared items {}, bodies {}, analysis-shared items {}, bodies {}; rejected bodies: cfg-differing {}, transitive {}, generic-unresolved {}, unknown {}; statics {}, test-only statics {}; pair veto: {veto}; both copies {both}; analysis {:.3}s, RSS {} MB",
             if enabled { eligibility.candidates.len() } else { 0 },
             if enabled { bodies(&eligibility.candidates) } else { 0 },
+            if enabled { eligibility.analysis_shared.len() } else { 0 },
+            if enabled { bodies(&eligibility.analysis_shared) } else { 0 },
             eligibility.candidates.len(),
             bodies(&eligibility.candidates),
+            eligibility.analysis_shared.len(),
+            bodies(&eligibility.analysis_shared),
             rejected(hir_ty::sharing::Rejection::CfgDiffering),
             rejected(hir_ty::sharing::Rejection::Transitive),
-            rejected(hir_ty::sharing::Rejection::StaticClosure),
             rejected(hir_ty::sharing::Rejection::GenericUnresolved),
             rejected(hir_ty::sharing::Rejection::Unknown),
             eligibility.statics,
@@ -2743,10 +2746,14 @@ fn dump_twins(db: &RootDatabase, args: &Args) {
                     continue;
                 }
                 let hir_def::AttrDefId::FunctionId(id) = item else { continue };
-                let outcome = eligibility.rejected.get(&item).map_or("eligible", |why| match why {
+                let shared = if eligibility.analysis_shared.contains(&item) {
+                    "analysis-shared"
+                } else {
+                    "fully-shared"
+                };
+                let outcome = eligibility.rejected.get(&item).map_or(shared, |why| match why {
                     hir_ty::sharing::Rejection::CfgDiffering => "cfg-differing",
                     hir_ty::sharing::Rejection::Transitive => "transitive",
-                    hir_ty::sharing::Rejection::StaticClosure => "static-closure",
                     hir_ty::sharing::Rejection::GenericUnresolved => "generic-unresolved",
                     hir_ty::sharing::Rejection::Unknown => "unknown",
                 });
@@ -2756,47 +2763,9 @@ fn dump_twins(db: &RootDatabase, args: &Args) {
                 );
             }
         }
-        let preflight_start = Instant::now();
-        let mut preflight_roots: Vec<_> = program_roots
-            .iter()
-            .flat_map(|&krate| hir_def::twins::crate_items(db, krate).items.iter())
-            .filter_map(|&item| {
-                let hir_def::AttrDefId::FunctionId(id) = item else { return None };
-                let func = hir::Function::from(id);
-                (func.is_test(db) || func.is_bench(db) || func.name(db).as_str() == "main")
-                    .then_some(item)
-            })
-            .collect();
-        preflight_roots.extend(program_roots.iter().flat_map(|&krate| {
-            hir_def::twins::crate_items(db, krate)
-                .items
-                .iter()
-                .copied()
-                .filter(|item| matches!(item, hir_def::AttrDefId::StaticId(_)))
-        }));
-        let type_id = if both {
-            hir_ty::sharing::type_id_preflight(db, &preflight_roots, normal, test)
-        } else {
-            hir_ty::sharing::TypeIdVeto::None
-        };
         eprintln!(
-            "cfg TypeId: {name}: program {}, both copies {both}, {}; analysis {:.3}s, RSS {} MB",
-            args.out.display(),
-            match type_id {
-                hir_ty::sharing::TypeIdVeto::None => "no program veto".to_owned(),
-                hir_ty::sharing::TypeIdVeto::TypeId => "would veto program: TypeId/Any".to_owned(),
-                hir_ty::sharing::TypeIdVeto::Unknown(item) => {
-                    let name = match item {
-                        hir_def::AttrDefId::FunctionId(id) => {
-                            hir::Function::from(id).name(db).as_str().to_owned()
-                        }
-                        _ => format!("{item:?}"),
-                    };
-                    format!("would veto program: unknown at {name}")
-                }
-            },
-            preflight_start.elapsed().as_secs_f64(),
-            memory::resident().unwrap_or(0),
+            "cfg TypeId: {name}: program {}, both copies {both}; TypeId: deferred to codegen",
+            args.out.display()
         );
     }
 }

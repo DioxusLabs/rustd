@@ -1115,12 +1115,12 @@ fn integration() {
             r"cfg twins: test_graph: [^\n]+; function bodies: twins (\d+), cfg-differing (\d+), test-only (\d+), unmatched (\d+), unknown (\d+)", path.read_text(errors="replace"))]
         check("generated and format bodies have known twins", len(body_counts) >= 2 and all(count == (13, 3, 1, 0, 0) for count in body_counts), str(body_counts))
         text = "\n".join(path.read_text(errors="replace") for path in logs.glob("**/log"))
-        check("unrelated body is eligible", "cfg body: test_graph::value: eligible" in text, "value")
+        check("unrelated body is fully shared", "cfg body: test_graph::value: fully-shared" in text, "value")
         check("paired cfg constants reject their caller transitively", "cfg body: test_graph::configured: transitive" in text, "configured")
-        check("static reverse closure is rejected", "cfg body: test_graph::own: static-closure" in text, "Shape::own")
+        check("static reverse closure is analysis shared", "cfg body: test_graph::own: analysis-shared" in text, "Shape::own")
         eligibility = re.findall(r"cfg eligibility: test_graph: [^\n]+pair veto: ([^;]+);", text)
         check("the main pair has no safety veto", eligibility and all(reason == "none" for reason in eligibility), str(eligibility))
-        check("unknown TypeId reachability vetoes conservatively", "both copies true, would veto program: unknown" in text, "unknown program veto")
+        check("TypeId is deferred to codegen", "both copies true; TypeId: deferred to codegen" in text and "would veto program" not in text, "deferred")
 
         source = os.path.join(ws, "src/lib.rs")
         original = pathlib.Path(source).read_text()
@@ -1136,15 +1136,23 @@ mod tests {
         integration.write_text("#[test] fn integration() { test_graph::generated(); }\n")
         _, ran = side.cargo("test")
         fresh = "\n".join(path.read_text(errors="replace")[before.get(path, 0):] for path in logs.glob("**/log"))
-        check("positive program has no veto", ran.returncode == 0 and "both copies true, no program veto" in fresh, f"exit {ran.returncode}, expected no program veto with both copies")
+        check("positive program defers TypeId", ran.returncode == 0 and "both copies true; TypeId: deferred to codegen" in fresh, f"exit {ran.returncode}, expected deferred TypeId with both copies")
         integration.write_text(integration_source)
         variants = [
-            ("generic dispatch", "\npub fn unresolved<T: Value>(value: &T) -> u32 { value.get() }\n", "cfg body: test_graph::unresolved: generic-unresolved"),
+            ("generic dispatch", "\npub fn unresolved<T: Value>(value: &T) -> u32 { value.get() }\n", "cfg body: test_graph::unresolved: fully-shared"),
+            ("dyn dispatch", "\npub fn dynamic(value: &dyn Value) -> u32 { value.get() }\n", "cfg body: test_graph::dynamic: fully-shared"),
+            ("generic impl edges", "\npub struct Other;\nimpl Value for Other { fn get(&self) -> u32 { STATE } }\npub fn dispatch_all<T: Value>(value: &T) -> u32 { value.get() }\n", "cfg body: test_graph::dispatch_all: analysis-shared"),
+            ("dyn impl edges", "\npub struct Other;\nimpl Value for Other { fn get(&self) -> u32 { STATE } }\npub fn dynamic_all(value: &dyn Value) -> u32 { value.get() }\n", "cfg body: test_graph::dynamic_all: analysis-shared"),
+            ("projection edges", "\npub trait Project { type Output; }\nimpl Project for Shape { type Output = u32; }\npub fn projected<T: Project>(value: T::Output) -> T::Output { value }\n", "cfg body: test_graph::projected: fully-shared"),
+            ("foreign local argument", "\npub fn foreign_local() -> Option<Shape> { Some(Shape) }\n", "cfg body: test_graph::foreign_local: fully-shared"),
+            ("Self variant", "\nimpl Choice { pub fn one() -> Self { Self::One } }\n", "cfg body: test_graph::one: fully-shared"),
+            ("indirect unknown", "\npub fn indirect(f: fn() -> u32) -> u32 { f() }\n", "cfg body: test_graph::indirect: unknown"),
+            ("projected indirect unknown", "\npub struct Pointer { call: fn() -> u32 }\npub fn indirect_field(value: Pointer) -> u32 { (value.call)() }\n", "cfg body: test_graph::indirect_field: unknown"),
             ("TLS", '''\nthread_local! { static TLS: core::cell::Cell<u32> = const { core::cell::Cell::new(3) }; }
 pub fn tls_value() -> u32 { TLS.with(|value| value.get()) }
 #[test] fn tls_probe() { assert_eq!(tls_value(), 3); }
-''', "cfg body: test_graph::tls_value: static-closure"),
-            ("TypeId", "\n#[test] fn identity_probe() { let _ = std::any::TypeId::of::<Shape>(); }\n", "would veto program: TypeId/Any"),
+''', "cfg body: test_graph::tls_value: analysis-shared"),
+            ("TypeId", "\n#[test] fn identity_probe() { let _ = std::any::TypeId::of::<Shape>(); }\n", "TypeId: deferred to codegen"),
             ("common trait impl", "\n#[cfg(test)] impl core::fmt::Display for Shape { fn fmt(&self, _: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { Ok(()) } }\n", "pair veto: test-only-trait-impl"),
             ("test-only trait exception", "\n#[cfg(test)] trait Only {}\n#[cfg(test)] impl Only for Shape {}\n", "pair veto: none"),
             ("blanket impl", "\n#[cfg(test)] trait Only {}\n#[cfg(test)] impl<T> Only for T {}\n", "pair veto: test-only-blanket-impl"),
@@ -1153,8 +1161,14 @@ pub fn tls_value() -> u32 { TLS.with(|value| value.get()) }
             ("value namespace shadowing", "\n#[cfg(test)] fn Some() {}\n", "pair veto: namespace-shadowing"),
             ("macro namespace shadowing", "\n#[cfg(test)] use std::stringify as vec;\n", "pair veto: namespace-shadowing"),
             ("inherent method collision", "\n#[cfg(not(test))] impl Shape { fn collision() {} }\n#[cfg(test)] impl Shape { fn collision() {} }\n", "pair veto: colliding-inherent-method"),
-            ("test macro", "\n#[cfg(test)] macro_rules! only_test { () => { () } }\n", "pair veto: cfg-test-macro-rules"),
-            ("drop closure", "\npub struct Dropped;\nimpl Drop for Dropped { fn drop(&mut self) { let _ = STATE; } }\npub fn dropped() { let _ = Dropped; }\n", "cfg body: test_graph::dropped: static-closure"),
+            ("exported test macro", "\n#[cfg(test)] #[macro_export] macro_rules! only_test { () => { () } }\n", "pair veto: cfg-test-macro-rules"),
+            ("isolated test macro", "\n#[cfg(test)] mod isolated { macro_rules! only_test { () => { () } } fn use_it() { only_test!(); } }\n", "pair veto: none"),
+            ("shared foreign test macro", "\n#[cfg(test)] use core::assert as foreign_assert;\n", "pair veto: none"),
+            ("unused tail test macro", "\n#[cfg(test)] macro_rules! only_test { () => { () } }\n", "pair veto: none"),
+            ("textual test macro", "\n#[cfg(test)] macro_rules! only_test { () => { () } }pub fn after_macro() {}\n", "pair veto: cfg-test-macro-rules"),
+            ("macro_use test macro", "\n#[cfg(test)] #[macro_use] mod macros { macro_rules! only_test { () => { () } } }\npub fn after_macro() {}\n", "pair veto: cfg-test-macro-rules"),
+            ("re-exported test macro", "\n#[cfg(test)] mod macros { macro_rules! only_test { () => { () } } pub(crate) use only_test; }\n#[cfg(test)] use macros::only_test;\n", "pair veto: cfg-test-macro-rules"),
+            ("drop closure", "\npub struct Dropped;\nimpl Drop for Dropped { fn drop(&mut self) { let _ = STATE; } }\npub fn dropped() { let _ = Dropped; }\n", "cfg body: test_graph::dropped: analysis-shared"),
         ]
         for label, addition, expected in variants:
             before = {path: len(path.read_text(errors="replace")) for path in logs.glob("**/log")}
