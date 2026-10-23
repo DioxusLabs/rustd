@@ -16,7 +16,7 @@ use salsa::SalsaValue;
 use span::Edition;
 use tracing::{debug, instrument};
 
-use base_db::Crate;
+use base_db::{Crate, EditionedFileId};
 use hir_def::{
     AssocItemId, BlockIdLt, BuiltinDeriveImplId, ConstId, DefWithBodyId, FunctionId,
     GenericParamId, HasModule, ImplId, ItemContainerId, ModuleDefId, ModuleId, TraitId,
@@ -577,11 +577,7 @@ pub(crate) fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> 
     while !unnamed.is_empty()
         && let Some(file) = files.next()
     {
-        let text = db.file_text(file.file_id(db)).text(db);
-        if !unnamed.iter().any(|dep| text.contains(dep.name.symbol().as_str())) {
-            continue;
-        }
-        let names = identifiers(file.parse(db).syntax_node());
+        let names = file_dependency_names(db, file, krate);
         unnamed.retain(|dep| !names.contains(dep.name.symbol()));
     }
     for call in def_map.modules(db).flat_map(|(_, module)| module.scope(db).all_macro_calls()) {
@@ -606,6 +602,64 @@ pub(crate) fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> 
         }
     }
     ordered.into()
+}
+
+#[salsa::tracked(returns(ref))]
+fn file_dependency_names(
+    db: &dyn HirDatabase,
+    file: EditionedFileId,
+    krate: Crate,
+) -> FxHashSet<Symbol> {
+    let text = db.file_text(file.file_id(db)).text(db);
+    let possible: FxHashSet<_> = krate
+        .data(db)
+        .dependencies
+        .iter()
+        .filter(|dep| {
+            let data = dep.crate_id.data(db);
+            !(dep.is_sysroot() || data.origin.is_lang() || data.is_proc_macro)
+                && text.contains(dep.name.symbol().as_str())
+        })
+        .map(|dep| dep.name.symbol().clone())
+        .collect();
+    if possible.is_empty() {
+        return possible;
+    }
+    dependency_names_in_syntax(file.parse(db).syntax_node(), &possible)
+}
+
+fn dependency_names_in_syntax(
+    syntax: syntax::SyntaxNode,
+    possible: &FxHashSet<Symbol>,
+) -> FxHashSet<Symbol> {
+    syntax
+        .descendants_with_tokens()
+        .filter_map(|it| it.into_token())
+        .filter(|it| it.kind() == SyntaxKind::IDENT)
+        .map(|it| Symbol::intern(it.text()))
+        .filter(|name| possible.contains(name))
+        .collect()
+}
+
+#[cfg(test)]
+mod dependency_names_tests {
+    use super::*;
+
+    #[test]
+    fn only_dependency_identifiers_are_retained() {
+        let possible = FxHashSet::from_iter([Symbol::intern("dep")]);
+        for (text, expected) in [
+            ("fn f() { dep::run(); dep::other(); other::run(); }", true),
+            ("fn f( { dep::", true),
+            ("", false),
+            ("// dep\nfn f() { let _ = \"dep\"; dep_suffix::run(); }", false),
+        ] {
+            let syntax = syntax::SourceFile::parse(text, Edition::CURRENT).syntax_node();
+            let names = dependency_names_in_syntax(syntax.clone(), &possible);
+            assert_eq!(names, if expected { possible.clone() } else { FxHashSet::default() });
+            assert!(dependency_names_in_syntax(syntax, &FxHashSet::default()).is_empty());
+        }
+    }
 }
 
 /// The items of `scope` whose bodies may hold impls: an impl is one of its crate wherever it
