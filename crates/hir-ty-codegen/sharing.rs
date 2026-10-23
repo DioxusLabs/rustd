@@ -30,9 +30,19 @@ fn reverse_twins(
 }
 
 #[salsa::tracked(returns(copy))]
-fn decision_serial(db: &dyn HirDatabase, normal: Crate, test: Crate, both: bool) -> u128 {
+fn decision_serial(
+    db: &dyn HirDatabase,
+    normal: Crate,
+    test: Crate,
+    both: bool,
+    local: bool,
+) -> u128 {
     let twins = reverse_twins(db, normal, test);
-    let eligibility = crate::sharing::pair_eligibility(db, normal, test, both);
+    let eligibility = if local {
+        local_eligibility(db, normal, test)
+    } else {
+        crate::sharing::pair_eligibility(db, normal, test, both)
+    };
     let mut twins: Vec<_> = twins.iter().map(|(&n, &t)| super::print_of(&(&t, &n))).collect();
     let mut full: Vec<_> = eligibility.candidates.iter().map(super::print_of).collect();
     let mut analysis: Vec<_> = eligibility.analysis_shared.iter().map(super::print_of).collect();
@@ -42,11 +52,30 @@ fn decision_serial(db: &dyn HirDatabase, normal: Crate, test: Crate, both: bool)
     super::print_of(&(twins, full, analysis, &eligibility.pair_veto))
 }
 
+#[salsa::tracked(returns(ref))]
+fn local_eligibility(
+    db: &dyn HirDatabase,
+    normal: Crate,
+    test: Crate,
+) -> crate::sharing::Eligibility {
+    let mut result = crate::sharing::Eligibility::default();
+    let twins = super::backend::Tally::global()
+        .step(super::Step::LocalTwins, || hir_def::twins::twin_index(db, normal, test));
+    for &item in &twins.function_items {
+        let AttrDefId::FunctionId(func) = item else { continue };
+        if crate::sharing::local_analysis(db, normal, test, func).is_none() {
+            result.analysis_shared.insert(item);
+        }
+    }
+    result
+}
+
 /// The crate copies present in one program. An empty policy compiles without sharing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Sharing {
     pairs: Vec<(Crate, Crate, bool)>,
     enabled: bool,
+    local: bool,
     snapshot: Option<Arc<Policy>>,
 }
 
@@ -262,10 +291,14 @@ impl Sharing {
                 self.pairs
                     .iter()
                     .map(|&(n, t, both)| PairPolicy {
-                        key: (n, t, both, decision_serial(db, n, t, both)),
+                        key: (n, t, both, decision_serial(db, n, t, both, self.local)),
                         twins: hir_def::twins::twin_index(db, n, t).clone(),
                         reverse: reverse_twins(db, n, t).clone(),
-                        eligibility: crate::sharing::pair_eligibility(db, n, t, both).clone(),
+                        eligibility: if self.local {
+                            local_eligibility(db, n, t).clone()
+                        } else {
+                            crate::sharing::pair_eligibility(db, n, t, both).clone()
+                        },
                     })
                     .collect(),
             )));
@@ -306,9 +339,13 @@ impl Sharing {
         test: Crate,
         both: bool,
     ) -> &'a crate::sharing::Eligibility {
-        self.policy(normal, test)
-            .map(|it| &it.eligibility)
-            .unwrap_or_else(|| crate::sharing::pair_eligibility(db, normal, test, both))
+        self.policy(normal, test).map(|it| &it.eligibility).unwrap_or_else(|| {
+            if self.local {
+                local_eligibility(db, normal, test)
+            } else {
+                crate::sharing::pair_eligibility(db, normal, test, both)
+            }
+        })
     }
 
     pub(super) fn prewarm(&self, db: &dyn HirDatabase) {
@@ -318,9 +355,7 @@ impl Sharing {
         let tally = super::backend::Tally::global();
         for &(normal, test, both) in &self.pairs {
             tally.step(super::Step::TwinIndex, || hir_def::twins::twin_index(db, normal, test));
-            tally.step(super::Step::Eligibility, || {
-                crate::sharing::pair_eligibility(db, normal, test, both)
-            });
+            tally.step(super::Step::Eligibility, || self.eligibility(db, normal, test, both));
         }
     }
 
@@ -331,11 +366,16 @@ impl Sharing {
         if let Some(snapshot) = &self.snapshot {
             return snapshot.0.iter().map(|it| it.key.3).collect();
         }
-        self.pairs.iter().map(|&(n, t, both)| decision_serial(db, n, t, both)).collect()
+        self.pairs.iter().map(|&(n, t, both)| decision_serial(db, n, t, both, self.local)).collect()
     }
 
     pub fn new(pairs: Vec<(Crate, Crate, bool)>) -> Self {
-        Self { pairs, enabled: true, snapshot: None }
+        Self {
+            pairs,
+            enabled: true,
+            local: std::env::var_os("RUSTD_CFG_SHARING").is_some_and(|it| it == "local"),
+            snapshot: None,
+        }
     }
 
     pub fn disabled(mut self) -> Self {
@@ -348,7 +388,7 @@ impl Sharing {
     }
 
     pub(super) fn tentative(&self) -> bool {
-        self.enabled && self.pairs.iter().any(|it| it.2)
+        self.enabled && !self.local && self.pairs.iter().any(|it| it.2)
     }
 
     pub(super) fn test_crate(&self, krate: Crate) -> bool {
@@ -367,7 +407,7 @@ impl Sharing {
     }
 
     pub(super) fn item(&self, db: &dyn HirDatabase, item: AttrDefId) -> AttrDefId {
-        if self.is_empty() {
+        if self.is_empty() || self.local {
             return item;
         }
         for &(normal, test, both) in &self.pairs {

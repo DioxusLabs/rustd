@@ -270,12 +270,15 @@ pub(super) enum Step {
     StoreWrite,
     TwinIndex,
     Eligibility,
+    LocalDecision,
+    LocalSafety,
+    LocalTwins,
     Canonicalize,
     Remap,
 }
 
 impl Step {
-    const COUNT: usize = 11;
+    const COUNT: usize = 14;
     const ALL: [(Step, &str); Step::COUNT] = [
         (Step::Infer, "infer"),
         (Step::Mir, "mir"),
@@ -286,6 +289,9 @@ impl Step {
         (Step::StoreWrite, "store write"),
         (Step::TwinIndex, "twin index"),
         (Step::Eligibility, "eligibility"),
+        (Step::LocalDecision, "local decision"),
+        (Step::LocalSafety, "local pair safety"),
+        (Step::LocalTwins, "local twin lookups"),
         (Step::Canonicalize, "canonicalize"),
         (Step::Remap, "remap"),
     ];
@@ -345,6 +351,12 @@ impl Tally {
     /// Says what was compiled by which producer since the last call, on stderr. Times are
     /// summed over the threads that compiled.
     pub(super) fn report(&self) {
+        let local = crate::sharing::take_local_times();
+        for (step, time) in
+            [Step::LocalDecision, Step::LocalSafety, Step::LocalTwins].into_iter().zip(local)
+        {
+            self.add(step, time);
+        }
         let fallbacks =
             std::mem::take(&mut *self.fallbacks.lock().unwrap_or_else(|e| e.into_inner()));
         let wasted = Duration::from_nanos(self.wasted.swap(0, Ordering::Relaxed));

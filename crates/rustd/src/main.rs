@@ -2739,6 +2739,30 @@ fn dump_twins(db: &RootDatabase, args: &Args) {
             index.function_bodies.unknown
         );
         let both = present.contains(&normal) && present.contains(&test);
+        if std::env::var_os("RUSTD_CFG_SHARING").is_some_and(|it| it == "local") {
+            let mut counts = std::collections::BTreeMap::new();
+            for &item in &index.function_items {
+                let hir_def::AttrDefId::FunctionId(id) = item else { continue };
+                if !index.twins.contains_key(&item) {
+                    continue;
+                }
+                let outcome = hir_ty::sharing::local_analysis(db, normal, test, id)
+                    .map_or("analysis-shared", |reason| reason.class());
+                *counts.entry(outcome).or_insert(0usize) += 1;
+                if std::env::var("RUSTD_CFG_TWINS").is_ok_and(|value| value == "items") {
+                    eprintln!(
+                        "cfg body: {name}::{}: {outcome}",
+                        hir::Function::from(id).name(db).as_str()
+                    );
+                }
+            }
+            let safety = hir_ty::sharing::pair_safety(db, normal, test);
+            let veto = if safety.is_empty() { "none".to_owned() } else { safety.join(",") };
+            eprintln!(
+                "cfg eligibility: {name}: local analysis bodies {counts:?}; pair veto: {veto}; both copies {both}; TypeId: per-copy"
+            );
+            continue;
+        }
         let eligibility = hir_ty::sharing::pair_eligibility(db, normal, test, both);
         let bodies = |items: &FxHashSet<hir_def::AttrDefId>| {
             items.intersection(&index.function_items).count()
