@@ -27,6 +27,16 @@ pub fn layout_of_adt_query(
     args: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
 ) -> Result<Arc<Layout>, LayoutError> {
+    layout_of_adt_with(db, def, args, trait_env, &super::DbLayout(db))
+}
+
+pub(crate) fn layout_of_adt_with<'db>(
+    db: &'db dyn HirDatabase,
+    def: AdtId,
+    args: StoredGenericArgs,
+    trait_env: StoredParamEnvAndCrate,
+    provider: &dyn super::LayoutProvider<'db>,
+) -> Result<Arc<Layout>, LayoutError> {
     let krate = trait_env.krate;
     let Ok(target) = db.target_data_layout(krate) else {
         return Err(LayoutError::TargetLayoutNotAvailable);
@@ -40,7 +50,7 @@ pub fn layout_of_adt_query(
         var.fields()
             .iter()
             .map(|(fd, _)| {
-                db.layout_of_ty(field_ty(db, def, fd, args.as_ref()).store(), trait_env.clone())
+                provider.layout(field_ty(db, def, fd, args.as_ref()).store(), trait_env.clone())
             })
             .collect::<Result<Vec<_>, _>>()
     };

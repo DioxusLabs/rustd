@@ -117,6 +117,7 @@ use cast::{CastCheck, CastError};
 
 /// The entry point of type inference.
 fn infer_query<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> InferenceResult<'db> {
+    crate::mir::codegen::trace_analysis_query(db, def.into(), "infer");
     infer_query_with_inspect(db, def, None, LoweringMode::Analysis)
 }
 

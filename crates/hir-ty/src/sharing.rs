@@ -6,6 +6,9 @@
 //! Concrete calls use the selected impl; unresolved dispatch and vtables retain
 //! local impls whose instantiated trait arguments can unify. PairSafety must hold
 //! before using either diagnostic sharing class.
+//! ADT impl compatibility follows freshened impl-header comparison in
+//! <https://github.com/rust-lang/rust/blob/1.93.0/compiler/rustc_trait_selection/src/traits/coherence.rs>:
+//! retain possible overlaps without proving where-clauses.
 //! Textual macro escape follows `define_macro` and module visitation in
 //! `rustc_resolve/src/build_reduced_graph.rs` at the same rustc tag.
 
@@ -16,18 +19,20 @@ use hir_def::{
     AdtId, AttrDefId, CallableDefId, DefWithBodyId, FunctionId, GenericDefId, HasModule, ImplId,
     ItemContainerId, Lookup, ModuleDefId, TraitId, VariantId,
     attrs::AttrFlags,
-    expr_store::Body,
-    hir::{Expr, Pat, generics::GenericParams},
+    expr_store::{Body, ExpressionStore, HygieneId, StoreVisitor},
+    hir::{Array, Expr, ExprId, Pat, generics::GenericParams},
     resolver::{HasResolver, ValueNs},
     signatures::{ConstSignature, FunctionSignature, ImplSignature, TypeAliasSignature},
     twins::{crate_items, scope_pairs, twin_index},
+    type_ref::{TypeRef, TypeRefId},
 };
 use hir_expand::mod_path::{ModPath, PathKind};
 use petgraph::{algo::kosaraju_scc, graph::DiGraph};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     TypeFoldable, TypeFolder, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable,
-    TypeVisitableExt, TypeVisitor, inherent::IntoKind,
+    TypeVisitableExt, TypeVisitor,
+    inherent::{GenericArgs as _, IntoKind},
 };
 
 use crate::{
@@ -68,6 +73,7 @@ struct References {
     items: FxHashSet<AttrDefId>,
     type_items: FxHashSet<AttrDefId>,
     signature_types: FxHashSet<AttrDefId>,
+    baked_items: FxHashSet<AttrDefId>,
     unknown: bool,
     generic_unresolved: bool,
 }
@@ -159,6 +165,80 @@ fn local_trait_impls(db: &dyn HirDatabase, krate: Crate) -> FxHashMap<TraitId, V
         }
     }
     result
+}
+
+fn applicable_adt_impls(db: &dyn HirDatabase, adt: AdtId) -> FxHashSet<ImplId> {
+    struct MentionsAdt {
+        adt: AdtId,
+        found: bool,
+    }
+    impl<'db> TypeVisitor<DbInterner<'db>> for MentionsAdt {
+        type Result = ();
+        fn visit_ty(&mut self, ty: Ty<'db>) {
+            self.found |= matches!(ty.kind(), TyKind::Adt(def, _) if def.def_id() == self.adt);
+            ty.super_visit_with(self);
+        }
+    }
+    let krate = adt.module(db).krate(db);
+    let mut infcx = DbInterner::new_with(db, krate).infer_ctxt().build(TypingMode::PostAnalysis);
+    let mut result = FxHashSet::default();
+    for &item in &crate_items(db, krate).items {
+        let AttrDefId::ImplId(id) = item else { continue };
+        let mut mentions = MentionsAdt { adt, found: false };
+        db.impl_self_ty(id).skip_binder().visit_with(&mut mentions);
+        if let Some(trait_ref) = db.impl_trait(id) {
+            trait_ref.skip_binder().visit_with(&mut mentions);
+        }
+        let args = GenericArgs::identity_for_item(infcx.interner, id.into());
+        for clause in GenericPredicates::query_all(db, id.into())
+            .iter_instantiated(infcx.interner, args.as_slice())
+        {
+            clause.skip_norm_wip().visit_with(&mut mentions);
+        }
+        if mentions.found {
+            result.insert(id);
+            continue;
+        }
+        match db.impl_self_ty(id).skip_binder().kind() {
+            TyKind::Adt(def, _) if def.def_id() != adt => continue,
+            TyKind::Adt(..) | TyKind::Param(..) | TyKind::Alias(..) | TyKind::Error(..) => {}
+            _ => continue,
+        }
+        if infcx.probe(|_| {
+            let target_args = infcx.fresh_args_for_item(Span::Dummy, adt.into());
+            let target = Ty::new_adt(infcx.interner, adt, target_args);
+            let args = infcx.fresh_args_for_item(Span::Dummy, id.into());
+            let candidate = db.impl_self_ty(id).instantiate(infcx.interner, args).skip_norm_wip();
+            let candidate = candidate.fold_with(&mut CandidateArgs {
+                infcx: &infcx,
+                types: FxHashMap::default(),
+                consts: FxHashMap::default(),
+            });
+            infcx
+                .at(&ObligationCause::dummy(), crate::next_solver::ParamEnv::empty())
+                .eq(target, candidate)
+                .is_ok()
+        }) {
+            result.insert(id);
+        }
+    }
+    result
+}
+
+fn same_impl_items(
+    db: &dyn HirDatabase,
+    normal: ImplId,
+    test: ImplId,
+    twins: &FxHashMap<AttrDefId, AttrDefId>,
+) -> bool {
+    let normal: FxHashSet<_> =
+        normal.impl_items(db).items.iter().map(|(_, id)| AttrDefId::from(*id)).collect();
+    let test = test.impl_items(db);
+    test.items.len() == normal.len()
+        && test
+            .items
+            .iter()
+            .all(|(_, id)| twins.get(&AttrDefId::from(*id)).is_some_and(|id| normal.contains(id)))
 }
 
 impl<'db> Collector<'db> {
@@ -548,6 +628,7 @@ fn references(db: &dyn HirDatabase, item: AttrDefId, initializer: bool) -> Refer
     c.result.signature_types = c.result.type_items.clone();
     if let Some(owner) = body(db, item).filter(|_| initializer) {
         let lowered = Body::of(db, owner);
+        let baked = baked_expressions(&lowered);
         let infer = InferenceResult::of(db, owner);
         c.result.unknown |= infer.has_errors;
         for (_, ty) in infer.type_of_expr.iter() {
@@ -558,15 +639,29 @@ fn references(db: &dyn HirDatabase, item: AttrDefId, initializer: bool) -> Refer
         }
         let mut resolver = owner.resolver(db);
         for (expr, value) in lowered.exprs() {
+            let guard = resolver.update_to_inner_scope(db, owner, expr);
+            for path in baked_type_paths(&lowered, expr) {
+                if let Some(ValueNs::ConstId(id)) =
+                    resolver.resolve_path_in_value_ns_fully(db, &path, HygieneId::ROOT)
+                {
+                    c.result.items.insert(id.into());
+                    c.result.baked_items.insert(id.into());
+                }
+            }
             if let Some((id, args)) = infer.method_resolution(expr) {
                 c.function(id, args);
+                if baked.contains(&expr) {
+                    c.result.baked_items.insert(id.into());
+                }
             }
             if let Some((CandidateId::ConstId(id), args)) = infer.assoc_resolutions_for_expr(expr) {
                 c.result.items.insert(id.into());
+                if baked.contains(&expr) {
+                    c.result.baked_items.insert(id.into());
+                }
                 args.visit_with(&mut c);
             }
             if let Expr::Path(path) = value {
-                let guard = resolver.update_to_inner_scope(db, owner, expr);
                 match resolver.resolve_path_in_value_ns_fully(
                     db,
                     path,
@@ -574,6 +669,12 @@ fn references(db: &dyn HirDatabase, item: AttrDefId, initializer: bool) -> Refer
                 ) {
                     Some(ValueNs::ConstId(id)) => {
                         c.result.items.insert(id.into());
+                        if baked.contains(&expr) {
+                            c.result.baked_items.insert(id.into());
+                        }
+                    }
+                    Some(ValueNs::FunctionId(id)) if baked.contains(&expr) => {
+                        c.result.baked_items.insert(id.into());
                     }
                     Some(ValueNs::StaticId(id)) => {
                         c.result.items.insert(id.into());
@@ -583,12 +684,13 @@ fn references(db: &dyn HirDatabase, item: AttrDefId, initializer: bool) -> Refer
                     None if infer.variant_resolution_for_expr(expr).is_some() => (),
                     None => c.result.unknown = true,
                 }
-                resolver.reset_to_guard(guard);
             }
+            resolver.reset_to_guard(guard);
         }
         for (pat, value) in lowered.pats() {
             if let Some((CandidateId::ConstId(id), args)) = infer.assoc_resolutions_for_pat(pat) {
                 c.result.items.insert(id.into());
+                c.result.baked_items.insert(id.into());
                 args.visit_with(&mut c);
             } else if matches!(value, Pat::Path(_))
                 && infer.variant_resolution_for_pat(pat).is_none()
@@ -1024,31 +1126,64 @@ fn same_signature(
     }
 }
 
-fn baked_type_values_match(db: &dyn HirDatabase, n: AttrDefId, t: AttrDefId) -> bool {
-    struct Values<'db>(Vec<Const<'db>>);
-    impl<'db> TypeVisitor<DbInterner<'db>> for Values<'db> {
-        type Result = ();
-        fn visit_const(&mut self, value: Const<'db>) {
-            if matches!(value.kind(), ConstKind::Value(_)) {
-                self.0.push(value);
+fn baked_type_paths(store: &ExpressionStore, expr: ExprId) -> Vec<hir_def::expr_store::path::Path> {
+    struct Paths<'a> {
+        store: &'a ExpressionStore,
+        paths: Vec<hir_def::expr_store::path::Path>,
+    }
+    impl StoreVisitor for Paths<'_> {
+        fn on_type(&mut self, ty: TypeRefId) {
+            if let TypeRef::Path(path) = &self.store[ty] {
+                self.paths.push(path.clone());
             }
-            value.super_visit_with(self);
+            self.store.visit_type_ref_children(ty, self);
         }
     }
-    let (Some(n), Some(t)) = (body(db, n), body(db, t)) else { return true };
-    let (n, t) = (InferenceResult::of(db, n), InferenceResult::of(db, t));
-    let values = |infer: &InferenceResult<'_>| {
-        infer
-            .type_of_expr
-            .iter()
-            .map(|(id, ty)| {
-                let mut values = Values(Vec::new());
-                ty.as_ref().visit_with(&mut values);
-                (id, values.0)
-            })
-            .collect::<Vec<_>>()
-    };
-    values(n) == values(t)
+    let mut visitor = Paths { store, paths: Vec::new() };
+    store.visit_expr_children(expr, &mut visitor);
+    visitor.paths
+}
+
+fn baked_expressions(store: &ExpressionStore) -> FxHashSet<ExprId> {
+    struct Roots<'a> {
+        store: &'a ExpressionStore,
+        expressions: FxHashSet<ExprId>,
+    }
+    impl StoreVisitor for Roots<'_> {
+        fn on_anon_const_expr(&mut self, expr: ExprId) {
+            self.expressions.insert(expr);
+        }
+        fn on_type(&mut self, ty: TypeRefId) {
+            self.store.visit_type_ref_children(ty, self);
+        }
+    }
+    let mut roots = Roots { store, expressions: FxHashSet::default() };
+    for (expr, value) in store.exprs() {
+        match value {
+            Expr::Array(Array::Repeat { repeat, .. }) | Expr::Const(repeat) => {
+                roots.expressions.insert(*repeat);
+            }
+            _ => {}
+        }
+        store.visit_expr_children(expr, &mut roots);
+    }
+    for (ty, _) in store.types.iter() {
+        roots.on_type(ty);
+    }
+    for (pat, _) in store.pats() {
+        store.walk_exprs_in_pat(pat, |expr| {
+            roots.expressions.insert(expr);
+        });
+    }
+    let mut pending: Vec<_> = roots.expressions.iter().copied().collect();
+    while let Some(expr) = pending.pop() {
+        store.walk_child_exprs(expr, |child| {
+            if roots.expressions.insert(child) {
+                pending.push(child);
+            }
+        });
+    }
+    roots.expressions
 }
 
 #[salsa::tracked(returns(ref))]
@@ -1082,8 +1217,30 @@ pub fn pair_eligibility(
         .collect();
     let mut own = FxHashMap::default();
     let mut all_refs = FxHashMap::default();
+    let mut impl_mismatches = FxHashSet::default();
     for (&item, &node) in &nodes {
         let refs = references(db, item, !per_copy.contains(&item));
+        if let AttrDefId::AdtId(adt) = item {
+            let impls = applicable_adt_impls(db, adt);
+            for id in &impls {
+                if let Some(&dependency) = nodes.get(&AttrDefId::ImplId(*id)) {
+                    graph.add_edge(node, dependency, ());
+                }
+            }
+            if let Some(&AttrDefId::AdtId(test)) = matched.get(&item) {
+                let test_impls = applicable_adt_impls(db, test);
+                if impls.len() != test_impls.len()
+                    || test_impls.iter().any(|&test| {
+                        let Some(&AttrDefId::ImplId(normal)) = twins.twins.get(&test.into()) else {
+                            return true;
+                        };
+                        !impls.contains(&normal) || !same_impl_items(db, normal, test, &twins.twins)
+                    })
+                {
+                    impl_mismatches.insert(node);
+                }
+            }
+        }
         let reason = if let Some(&t) = matched.get(&item) {
             if !per_copy.contains(&item) && twins.cfg_differing_items.contains(&t) {
                 Some(Rejection::CfgDiffering)
@@ -1114,7 +1271,7 @@ pub fn pair_eligibility(
         }
         all_refs.insert(item, refs);
     }
-    let rejected = reverse_closure(&graph, own.keys().copied());
+    let rejected = reverse_closure(&graph, own.keys().copied().chain(impl_mismatches));
     let compatible: FxHashSet<_> = matched
         .iter()
         .filter_map(|(&n, &t)| same_signature(db, normal, n, t, &twins.twins).then_some(n))
@@ -1183,7 +1340,10 @@ pub fn pair_eligibility(
                                     && nodes
                                         .get(target)
                                         .is_none_or(|node| layout_bad.contains(node)))
-                    }) || !baked_type_values_match(db, n, t))
+                    }) || all_refs[&n].baked_items.iter().any(|target| {
+                        target.module(db).krate(db) == normal
+                            && nodes.get(target).is_none_or(|node| rejected.contains(node))
+                    }))
                 {
                     Some(Rejection::Transitive)
                 } else {

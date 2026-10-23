@@ -3746,6 +3746,7 @@ pub fn mir_body_query<'db>(
     db: &'db dyn HirDatabase,
     def: InferBodyId<'db>,
 ) -> Result<'db, MirBody<'db>> {
+    super::codegen::trace_analysis_query(db, def, "mir");
     let krate = def.krate(db);
     let edition = krate.data(db).edition;
     let detail = match def {

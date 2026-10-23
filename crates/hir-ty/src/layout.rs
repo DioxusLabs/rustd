@@ -73,6 +73,56 @@ pub type Layout = LayoutData<RustcFieldIdx, RustcEnumVariantIdx>;
 pub type TagEncoding = hir_def::layout::TagEncoding<RustcEnumVariantIdx>;
 pub type Variants = hir_def::layout::Variants<RustcFieldIdx, RustcEnumVariantIdx>;
 
+pub(crate) trait LayoutProvider<'db> {
+    fn db(&self) -> &'db dyn HirDatabase;
+    fn layout(&self, ty: StoredTy, env: StoredParamEnvAndCrate)
+    -> Result<Arc<Layout>, LayoutError>;
+    fn adt(
+        &self,
+        def: AdtId,
+        args: crate::next_solver::StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<Arc<Layout>, LayoutError> {
+        self.db().layout_of_adt(def, args, env)
+    }
+    fn coroutine(
+        &self,
+        id: crate::db::InternedCoroutineId<'db>,
+        args: crate::next_solver::StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+        by_move: bool,
+    ) -> Result<std::borrow::Cow<'db, crate::mir::MirBody<'db>>, LayoutError> {
+        let body = if by_move {
+            self.db().monomorphized_mir_body_for_coroutine_by_move(id, args, env)
+        } else {
+            self.db().monomorphized_mir_body_for_coroutine(id, args, env)
+        };
+        body.map(std::borrow::Cow::Borrowed).map_err(|_| LayoutError::Unknown)
+    }
+    fn coroutine_is_by_move(
+        &self,
+        id: crate::db::InternedCoroutineId<'db>,
+        args: rustc_type_ir::CoroutineArgs<DbInterner<'db>>,
+    ) -> bool {
+        crate::mir::is_by_move_coroutine(self.db(), id, args)
+    }
+}
+
+pub(crate) struct DbLayout<'db>(pub &'db dyn HirDatabase);
+
+impl<'db> LayoutProvider<'db> for DbLayout<'db> {
+    fn db(&self) -> &'db dyn HirDatabase {
+        self.0
+    }
+    fn layout(
+        &self,
+        ty: StoredTy,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<Arc<Layout>, LayoutError> {
+        self.0.layout_of_ty(ty, env)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum LayoutError {
     // FIXME: Remove more variants once they get added to LayoutCalculatorError
@@ -129,6 +179,7 @@ impl<'a> LayoutCx<'a> {
 // FIXME: move this to the `rustc_abi`.
 fn layout_of_simd_ty<'db>(
     db: &'db dyn HirDatabase,
+    provider: &dyn LayoutProvider<'db>,
     id: StructId,
     repr_packed: bool,
     args: &GenericArgs<'db>,
@@ -151,7 +202,7 @@ fn layout_of_simd_ty<'db>(
     };
 
     let e_len = try_const_usize(db, e_len).ok_or(LayoutError::HasErrorConst)? as u64;
-    let e_ly = db.layout_of_ty(e_ty.store(), env.store())?;
+    let e_ly = provider.layout(e_ty.store(), env.store())?;
 
     let cx = LayoutCx::new(dl);
     Ok(Arc::new(cx.calc.simd_type(e_ly, e_len, repr_packed)?))
@@ -162,6 +213,15 @@ pub fn layout_of_ty_query(
     db: &dyn HirDatabase,
     ty: StoredTy,
     trait_env: StoredParamEnvAndCrate,
+) -> Result<Arc<Layout>, LayoutError> {
+    layout_of_ty_with(db, ty, trait_env, &DbLayout(db))
+}
+
+pub(crate) fn layout_of_ty_with<'db>(
+    db: &'db dyn HirDatabase,
+    ty: StoredTy,
+    trait_env: StoredParamEnvAndCrate,
+    provider: &dyn LayoutProvider<'db>,
 ) -> Result<Arc<Layout>, LayoutError> {
     let krate = trait_env.krate;
     let interner = DbInterner::new_with(db, krate);
@@ -184,6 +244,7 @@ pub fn layout_of_ty_query(
                     if repr.simd() {
                         return layout_of_simd_ty(
                             db,
+                            provider,
                             s,
                             repr.packed(),
                             &args,
@@ -194,7 +255,7 @@ pub fn layout_of_ty_query(
                 }
                 _ => {}
             }
-            return db.layout_of_adt(def.def_id(), args.store(), trait_env);
+            return provider.adt(def.def_id(), args.store(), trait_env);
         }
         TyKind::Bool => Layout::scalar(
             dl,
@@ -262,7 +323,7 @@ pub fn layout_of_ty_query(
 
             let fields = tys
                 .iter()
-                .map(|k| db.layout_of_ty(k.store(), trait_env.clone()))
+                .map(|k| provider.layout(k.store(), trait_env.clone()))
                 .collect::<Result<Vec<_>, _>>()?;
             let fields = fields.iter().map(|it| &**it).collect::<Vec<_>>();
             let fields = fields.iter().collect::<IndexVec<_, _>>();
@@ -270,11 +331,11 @@ pub fn layout_of_ty_query(
         }
         TyKind::Array(element, count) => {
             let count = try_const_usize(db, count).ok_or(LayoutError::HasErrorConst)? as u64;
-            let element = db.layout_of_ty(element.store(), trait_env)?;
+            let element = provider.layout(element.store(), trait_env)?;
             cx.calc.array_like::<_, _, ()>(&element, Some(count))?
         }
         TyKind::Slice(element) => {
-            let element = db.layout_of_ty(element.store(), trait_env)?;
+            let element = provider.layout(element.store(), trait_env)?;
             cx.calc.array_like::<_, _, ()>(&element, None)?
         }
         TyKind::Str => {
@@ -342,7 +403,7 @@ pub fn layout_of_ty_query(
             let upvars = ty.closure_upvars_ty().expect("a closure");
             let fields = rustc_type_ir::inherent::Ty::tuple_fields(upvars)
                 .iter()
-                .map(|k| db.layout_of_ty(k.store(), trait_env.clone()))
+                .map(|k| provider.layout(k.store(), trait_env.clone()))
                 .collect::<Result<Vec<_>, _>>()?;
             let fields = fields.iter().map(|it| &**it).collect::<Vec<_>>();
             let fields = fields.iter().collect::<IndexVec<_, _>>();
@@ -354,31 +415,23 @@ pub fn layout_of_ty_query(
             // there, one such set over another. `CoroutineFrame` says which field is which.
             let args = args.as_coroutine();
             let parent_args = GenericArgs::new_from_slice(args.parent_args());
-            let body = if crate::mir::is_by_move_coroutine(db, id.0, args) {
-                db.monomorphized_mir_body_for_coroutine_by_move(
-                    id.0,
-                    parent_args.store(),
-                    trait_env.clone(),
-                )
-            } else {
-                db.monomorphized_mir_body_for_coroutine(
-                    id.0,
-                    parent_args.store(),
-                    trait_env.clone(),
-                )
-            }
-            .map_err(|_| LayoutError::Unknown)?;
+            let body = provider.coroutine(
+                id.0,
+                parent_args.store(),
+                trait_env.clone(),
+                provider.coroutine_is_by_move(id.0, args),
+            )?;
             let held = body.locals_held_across_yields(&infer_ctxt, trait_env.param_env(db));
             let upvars = rustc_type_ir::inherent::Ty::tuple_fields(args.tupled_upvars_ty())
                 .iter()
-                .map(|ty| db.layout_of_ty(ty.store(), trait_env.clone()))
+                .map(|ty| provider.layout(ty.store(), trait_env.clone()))
                 .collect::<Result<Vec<_>, _>>()?;
             // A local only holds a value some of the time, so nothing of it is a niche.
             let locals = held
                 .locals
                 .iter()
                 .map(|&local| {
-                    let of = db.layout_of_ty(body.locals[local].ty.clone(), trait_env.clone())?;
+                    let of = provider.layout(body.locals[local].ty.clone(), trait_env.clone())?;
                     let mut layout = LayoutData::unit(dl, true);
                     layout.size = of.size;
                     layout.align = of.align;
@@ -424,7 +477,7 @@ pub fn layout_of_ty_query(
         }
 
         TyKind::Pat(ty, pat) => {
-            let mut layout = (*db.layout_of_ty(ty.store(), trait_env.clone())?).clone();
+            let mut layout = (*provider.layout(ty.store(), trait_env.clone())?).clone();
             match pat.kind() {
                 PatternKind::Range { start, end } => {
                     if let BackendRepr::Scalar(scalar) = &mut layout.backend_repr {
