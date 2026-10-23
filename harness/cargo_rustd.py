@@ -1567,7 +1567,7 @@ def test_graph_sharing_incremental(work):
         ws = os.path.realpath(os.path.join(work, "sharing-incremental-" + mode))
         functions = "\n".join(f"pub fn f{i}<T: Copy>(x: T) -> (T, u64) {{ (x, if enabled(1) {{ {i} }} else {{ 0 }}) }}" for i in range(400))
         total = "+".join(f"f{i}(1u64).1" for i in range(400))
-        feature = "pub fn enabled(x: u64) -> bool { x != 0 }\nfn identity(x: u64) -> u64 { x }\n" + functions + "\n"
+        feature = "pub fn enabled(x: u64) -> bool { x != 0 }\nfn identity(x: u64) -> u64 { x }\npub struct Flag;\nimpl Flag { pub fn check(x: u64) -> bool { enabled(x) } }\n" + functions + "\n"
         reports = "\n".join(f'#[test] fn report{i}() -> Result<(), &\'static str> {{ Ok(()) }}' for i in range(20))
         files = {
             "Cargo.toml": '[package]\nname="sharing_incremental"\nversion="0.1.0"\nedition="2021"\n[workspace]\nmembers=["probe"]\n[dev-dependencies]\nprobe={path="probe"}\n',
@@ -1582,6 +1582,7 @@ pub fn total() -> u64 {{ {total} }}
 #[cfg(test)] mod tests {{
     {reports}
     #[test] fn copies() {{
+        assert!(super::Flag::check(1));
         assert_eq!(super::total(), 79800);
         assert_eq!(super::total(), probe::total());
         assert_eq!(super::different(), 1);
@@ -1622,7 +1623,7 @@ pub fn total() -> u64 {{ {total} }}
                 held = "patch reports: 0 of 20" in fresh
                 checks.append((name, held, fresh[-700:]))
                 print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
-                for query, limit in [("reach_topology", 0), ("reach_component_print", 2), ("reach_root_code", 1)] + ([("twin_index", 0), ("pair_safety", 0), ("pair_eligibility", 0), ("decision_serial", 0)] if mode == "on" else []):
+                for query, limit in [("reach_topology", 0), ("reach_component_print", 2), ("reach_root_code", 1)] + ([("twin_index", 0), ("pair_safety", 0), ("pair_eligibility", 0), ("decision_serial", 0), ("applicable_adt_impls", 0), ("local_trait_impls", 0)] if mode == "on" else []):
                     name = f"cfg sharing: {mode} {prime}-prime {query} executions <= {limit}"
                     count_ran = sum(map(int, re.findall(rf"\b{query}=(\d+)", fresh)))
                     held = ("queries:" in fresh and re.search(rf"\b{query}=\d+", primed) is not None
@@ -1640,6 +1641,18 @@ pub fn total() -> u64 {{ {total} }}
                 detail = f"topology {topology_ran}, roots {roots_ran}"
                 checks.append((name, held, detail))
                 print(f"  {'ok ' if held else 'NOT'} {name}: {detail}", flush=True)
+                if mode == "on":
+                    before = logs()
+                    pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "const _: u64 = 0; x != 0"))
+                    _, inventory_edit = side.cargo("test", "--lib")
+                    fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                    impls_ran = sum(map(int, re.findall(r"\blocal_impls=(\d+)", fresh)))
+                    applicable_ran = sum(map(int, re.findall(r"\bapplicable_adt_impls=(\d+)", fresh)))
+                    name = f"cfg sharing: {prime}-prime body item preserves ADT impl facts"
+                    held = inventory_edit.returncode == 0 and impls_ran > 0 and applicable_ran == 0
+                    detail = f"impl inventory {impls_ran}, ADT impl facts {applicable_ran}"
+                    checks.append((name, held, detail))
+                    print(f"  {'ok ' if held else 'NOT'} {name}: {detail}", flush=True)
                 if mode == "on" and prime == "cold":
                     source = files["src/lib.rs"]
                     cases = [

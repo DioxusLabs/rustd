@@ -106,19 +106,25 @@ fn print_tree(db: &dyn HirDatabase, roots: &[Component]) -> PrintTree {
             pending.extend(component.below(db));
         }
     }
-    let mut members: Vec<_> = seen.into_iter().collect();
-    members.sort_by_key(print_of);
-    let mut trees: Vec<_> = members
-        .chunks(32)
-        .map(|members| PrintTree::new(db, members.to_vec(), Vec::new()))
-        .collect();
-    while trees.len() > 1 {
-        trees = trees
-            .chunks(32)
-            .map(|children| PrintTree::new(db, Vec::new(), children.to_vec()))
-            .collect();
+    let mut members: Vec<_> = seen.into_iter().map(|it| (print_of(&it), it)).collect();
+    members.sort_by_key(|it| it.0);
+    print_subtree(db, &members, 128)
+}
+
+fn print_subtree(db: &dyn HirDatabase, members: &[(u128, Component)], bits: u32) -> PrintTree {
+    if members.len() <= 32 || bits == 0 {
+        return PrintTree::new(db, members.iter().map(|it| it.1).collect::<Vec<_>>(), Vec::new());
     }
-    trees.pop().unwrap_or_else(|| PrintTree::new(db, Vec::new(), Vec::new()))
+    let bits = bits.saturating_sub(5);
+    // Fixed hash prefixes let overlapping reach sets share their unchanged subtrees.
+    let mut children = Vec::new();
+    let mut rest = members;
+    while let Some(&(key, _)) = rest.first() {
+        let end = rest.partition_point(|it| it.0 >> bits == key >> bits);
+        children.push(print_subtree(db, &rest[..end], bits));
+        rest = &rest[end..];
+    }
+    PrintTree::new(db, Vec::new(), children)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -541,8 +547,17 @@ pub fn reached(
             kept: kept.to_vec(),
         }),
     );
+    reach_program(db, input).clone()
+}
+
+#[salsa::tracked(returns(ref))]
+fn reach_program(
+    db: &dyn HirDatabase,
+    input: ReachInput,
+) -> (Vec<Reached>, Option<u128>, Vec<String>) {
     let topology = reach_topology(db, input);
-    let alone: Vec<_> = (0..tests.len()).map(|id| reach_root_print(db, input, id)).collect();
+    let alone: Vec<_> =
+        (0..input.data(db).tests.len()).map(|id| reach_root_print(db, input, id)).collect();
     let group = &topology.groups;
     // What one test of a group leaves in a static is what another finds: each has the
     // result it has for the code of all of them.
