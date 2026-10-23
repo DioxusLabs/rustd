@@ -1197,6 +1197,114 @@ fn baked_expressions(store: &ExpressionStore) -> FxHashSet<ExprId> {
     roots.expressions
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ItemFacts {
+    twin: Option<AttrDefId>,
+    references: ReferenceFacts,
+    reason: Option<Rejection>,
+    compatible: bool,
+    unknown: bool,
+    impls: FxHashSet<AttrDefId>,
+    impl_mismatch: bool,
+}
+
+#[salsa::interned(debug, unsafe(no_lifetime), revisions = usize::MAX)]
+struct ReferenceFacts {
+    #[returns(ref)]
+    items: Vec<AttrDefId>,
+    #[returns(ref)]
+    type_items: Vec<AttrDefId>,
+    #[returns(ref)]
+    signature_types: Vec<AttrDefId>,
+    #[returns(ref)]
+    baked_items: Vec<AttrDefId>,
+}
+
+fn sorted_items(items: &FxHashSet<AttrDefId>) -> Vec<AttrDefId> {
+    let mut items: Vec<_> = items.iter().copied().collect();
+    items.sort_unstable_by_key(salsa::plumbing::AsId::as_id);
+    items
+}
+
+#[salsa::tracked(returns(ref))]
+fn eligibility_items(db: &dyn HirDatabase, krate: Crate) -> FxHashSet<AttrDefId> {
+    crate_items(db, krate).items.iter().copied().collect()
+}
+
+#[salsa::tracked(returns(ref))]
+fn normal_twins(
+    db: &dyn HirDatabase,
+    normal: Crate,
+    test: Crate,
+) -> FxHashMap<AttrDefId, AttrDefId> {
+    twin_index(db, normal, test).twins.iter().map(|(&t, &n)| (n, t)).collect()
+}
+
+#[salsa::tracked(returns(copy))]
+fn test_only_statics(db: &dyn HirDatabase, normal: Crate, test: Crate) -> usize {
+    twin_index(db, normal, test)
+        .test_only
+        .iter()
+        .filter(|item| matches!(item, AttrDefId::StaticId(_)))
+        .count()
+}
+
+#[salsa::tracked(returns(ref))]
+fn eligibility_facts(
+    db: &dyn HirDatabase,
+    normal: Crate,
+    test: Crate,
+    item: AttrDefId,
+) -> ItemFacts {
+    let twins = twin_index(db, normal, test);
+    let twin = normal_twins(db, normal, test).get(&item).copied();
+    let compatible = twin.is_some_and(|t| *same_signature(db, normal, item, t));
+    let per_copy = matches!(item, AttrDefId::StaticId(_)) && compatible;
+    let references = references(db, item, !per_copy);
+    let reason = match twin {
+        Some(t) if !per_copy && twins.cfg_differing_items.contains(&t) => {
+            Some(Rejection::CfgDiffering)
+        }
+        Some(t) if !per_copy && twins.unknown_items.contains(&t) => Some(Rejection::Unknown),
+        Some(_) if references.generic_unresolved => Some(Rejection::GenericUnresolved),
+        Some(_) if references.unknown => Some(Rejection::Unknown),
+        Some(_) => None,
+        None => Some(Rejection::Transitive),
+    };
+    let mut impls = FxHashSet::default();
+    let mut impl_mismatch = false;
+    if let AttrDefId::AdtId(adt) = item {
+        let normal_impls = applicable_adt_impls(db, adt);
+        impls.extend(normal_impls.iter().map(|&id| AttrDefId::ImplId(id)));
+        if let Some(AttrDefId::AdtId(test)) = twin {
+            let test_impls = applicable_adt_impls(db, test);
+            impl_mismatch = normal_impls.len() != test_impls.len()
+                || test_impls.iter().any(|&test| {
+                    let Some(&AttrDefId::ImplId(normal)) = twins.twins.get(&test.into()) else {
+                        return true;
+                    };
+                    !normal_impls.contains(&normal)
+                        || !same_impl_items(db, normal, test, &twins.twins)
+                });
+        }
+    }
+    ItemFacts {
+        twin,
+        references: ReferenceFacts::new(
+            db,
+            sorted_items(&references.items),
+            sorted_items(&references.type_items),
+            sorted_items(&references.signature_types),
+            sorted_items(&references.baked_items),
+        ),
+        reason,
+        compatible,
+        unknown: twin.is_some_and(|t| twins.unknown_items.contains(&t)),
+        impls,
+        impl_mismatch,
+    }
+}
+
 #[salsa::tracked(returns(ref))]
 pub fn pair_eligibility(
     db: &dyn HirDatabase,
@@ -1204,75 +1312,47 @@ pub fn pair_eligibility(
     test: Crate,
     both: bool,
 ) -> Eligibility {
-    let twins = twin_index(db, normal, test);
     let mut result = Eligibility {
         pair_veto: pair_safety(db, normal, test).clone(),
-        test_only_statics: twins
-            .test_only
-            .iter()
-            .filter(|item| matches!(item, AttrDefId::StaticId(_)))
-            .count(),
+        test_only_statics: test_only_statics(db, normal, test),
         ..Eligibility::default()
     };
     let mut graph = DiGraph::<AttrDefId, ()>::new();
     let nodes: FxHashMap<_, _> =
-        crate_items(db, normal).items.iter().map(|&item| (item, graph.add_node(item))).collect();
-    let matched: FxHashMap<_, _> = twins.twins.iter().map(|(&t, &n)| (n, t)).collect();
-    let per_copy: FxHashSet<_> = matched
-        .iter()
-        .filter_map(|(&n, &t)| {
-            let (AttrDefId::StaticId(n), AttrDefId::StaticId(t)) = (n, t) else { return None };
-            same_signature(db, normal, n.into(), t.into()).then_some(AttrDefId::from(n))
-        })
-        .collect();
+        eligibility_items(db, normal).iter().map(|&item| (item, graph.add_node(item))).collect();
+    let mut matched = FxHashMap::default();
+    let mut compatible = FxHashSet::default();
+    let mut unknown = FxHashSet::default();
     let mut own = FxHashMap::default();
     let mut all_refs = FxHashMap::default();
     let mut impl_mismatches = FxHashSet::default();
     for (&item, &node) in &nodes {
-        let refs = references(db, item, !per_copy.contains(&item));
-        if let AttrDefId::AdtId(adt) = item {
-            let impls = applicable_adt_impls(db, adt);
-            for id in impls {
-                if let Some(&dependency) = nodes.get(&AttrDefId::ImplId(*id)) {
-                    graph.add_edge(node, dependency, ());
-                }
-            }
-            if let Some(&AttrDefId::AdtId(test)) = matched.get(&item) {
-                let test_impls = applicable_adt_impls(db, test);
-                if impls.len() != test_impls.len()
-                    || test_impls.iter().any(|&test| {
-                        let Some(&AttrDefId::ImplId(normal)) = twins.twins.get(&test.into()) else {
-                            return true;
-                        };
-                        !impls.contains(&normal) || !same_impl_items(db, normal, test, &twins.twins)
-                    })
-                {
-                    impl_mismatches.insert(node);
-                }
+        let facts = eligibility_facts(db, normal, test, item);
+        let refs = &facts.references;
+        if let Some(twin) = facts.twin {
+            matched.insert(item, twin);
+        }
+        if facts.compatible {
+            compatible.insert(item);
+        }
+        if facts.unknown {
+            unknown.insert(item);
+        }
+        for id in &facts.impls {
+            if let Some(&dependency) = nodes.get(id) {
+                graph.add_edge(node, dependency, ());
             }
         }
-        let reason = if let Some(&t) = matched.get(&item) {
-            if !per_copy.contains(&item) && twins.cfg_differing_items.contains(&t) {
-                Some(Rejection::CfgDiffering)
-            } else if !per_copy.contains(&item) && twins.unknown_items.contains(&t) {
-                Some(Rejection::Unknown)
-            } else if refs.generic_unresolved {
-                Some(Rejection::GenericUnresolved)
-            } else if refs.unknown {
-                Some(Rejection::Unknown)
-            } else {
-                None
-            }
-        } else {
-            Some(Rejection::Transitive)
-        };
+        if facts.impl_mismatch {
+            impl_mismatches.insert(node);
+        }
         if matches!(item, AttrDefId::StaticId(_)) {
             result.statics += 1;
         }
-        if let Some(reason) = reason {
+        if let Some(reason) = facts.reason {
             own.insert(node, reason);
         }
-        for target in &refs.items {
+        for target in refs.items(db) {
             if let Some(&target) = nodes.get(target) {
                 graph.add_edge(node, target, ());
             } else if target.module(db).krate(db) == normal {
@@ -1282,21 +1362,17 @@ pub fn pair_eligibility(
         all_refs.insert(item, refs);
     }
     let rejected = reverse_closure(&graph, own.keys().copied().chain(impl_mismatches));
-    let compatible: FxHashSet<_> = matched
-        .iter()
-        .filter_map(|(&n, &t)| same_signature(db, normal, n, t).then_some(n))
-        .collect();
     let mut layout_graph = DiGraph::<AttrDefId, ()>::new();
     for &item in graph.node_weights() {
         layout_graph.add_node(item);
     }
     for (&item, refs) in &all_refs {
         let targets = if matches!(item, AttrDefId::EnumVariantId(_)) {
-            &refs.items
+            refs.items(db)
         } else if matches!(item, AttrDefId::FunctionId(_)) {
-            &refs.signature_types
+            refs.signature_types(db)
         } else {
-            &refs.type_items
+            refs.type_items(db)
         };
         for target in targets {
             if let Some(&target) = nodes.get(target) {
@@ -1312,7 +1388,7 @@ pub fn pair_eligibility(
                     AttrDefId::ConstId(_) => rejected.contains(&node),
                     AttrDefId::EnumVariantId(_) => {
                         own.contains_key(&node)
-                            || all_refs[&item].items.iter().any(|target| {
+                            || all_refs[&item].items(db).iter().any(|target| {
                                 matches!(target, AttrDefId::ConstId(_) | AttrDefId::FunctionId(_))
                                     && nodes.get(target).is_some_and(|node| rejected.contains(node))
                             })
@@ -1334,15 +1410,15 @@ pub fn pair_eligibility(
         let reason = own
             .get(&node)
             .copied()
-            .filter(|reason| *reason == Rejection::CfgDiffering || twins.unknown_items.contains(&t))
+            .filter(|reason| *reason == Rejection::CfgDiffering || unknown.contains(&n))
             .or_else(|| {
                 if let Some(reason) = own.get(&node).copied() {
                     Some(reason)
                 } else if rejected.contains(&node)
-                    && (all_refs[&n].items.iter().any(|target| {
+                    && (all_refs[&n].items(db).iter().any(|target| {
                         target.module(db).krate(db) == normal
                             && (!compatible.contains(target)
-                                || (all_refs[&n].type_items.contains(target)
+                                || (all_refs[&n].type_items(db).contains(target)
                                     || !matches!(
                                         target,
                                         AttrDefId::ConstId(_) | AttrDefId::EnumVariantId(_)
@@ -1350,7 +1426,7 @@ pub fn pair_eligibility(
                                     && nodes
                                         .get(target)
                                         .is_none_or(|node| layout_bad.contains(node)))
-                    }) || all_refs[&n].baked_items.iter().any(|target| {
+                    }) || all_refs[&n].baked_items(db).iter().any(|target| {
                         target.module(db).krate(db) == normal
                             && nodes.get(target).is_none_or(|node| rejected.contains(node))
                     }))
