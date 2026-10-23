@@ -7,12 +7,28 @@ use rustc_type_ir::{
 
 use crate::{
     InferBodyId,
-    db::{HirDatabase, InternedClosureId, InternedCoroutineId},
+    db::{HirDatabase, InternedClosureId, InternedCoroutineClosureId, InternedCoroutineId},
     next_solver::{DbInterner, Ty, TyKind},
     traits::{ParamEnvAndCrate, StoredParamEnvAndCrate},
 };
 
 use super::{Instance, InstanceDef};
+
+#[salsa::tracked(returns(ref))]
+fn analysis_twins(
+    db: &dyn HirDatabase,
+    normal: Crate,
+    test: Crate,
+    both: bool,
+) -> rustc_hash::FxHashMap<AttrDefId, AttrDefId> {
+    let fully_shared = &crate::sharing::pair_eligibility(db, normal, test, both).candidates;
+    hir_def::twins::twin_index(db, normal, test)
+        .twins
+        .iter()
+        .filter(|(t, _)| !fully_shared.contains(t))
+        .map(|(&t, &n)| (n, t))
+        .collect()
+}
 
 /// The crate copies present in one program. An empty policy compiles without sharing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -83,6 +99,114 @@ impl Sharing {
         })
     }
 
+    pub(super) fn analysis_source(
+        &self,
+        db: &dyn HirDatabase,
+        func: FunctionId,
+    ) -> Option<FunctionId> {
+        if self.is_empty() || !self.analysis_shared(db, func) {
+            return None;
+        }
+        for &(normal, test, both) in &self.pairs {
+            if func.krate(db) == test
+                && crate::sharing::pair_eligibility(db, normal, test, both).pair_veto.is_empty()
+                && let Some(&AttrDefId::FunctionId(source)) =
+                    hir_def::twins::twin_index(db, normal, test).twins.get(&func.into())
+            {
+                return Some(source);
+            }
+        }
+        None
+    }
+
+    pub(super) fn analysis_fold<'db, T: TypeFoldable<DbInterner<'db>>>(
+        &self,
+        db: &'db dyn HirDatabase,
+        source: FunctionId,
+        value: T,
+    ) -> T {
+        value.fold_with(&mut Canonical {
+            db,
+            sharing: self,
+            interner: DbInterner::new_with(db, source.krate(db)),
+            reverse: false,
+            analysis: Some(source.krate(db)),
+            opaque_only: false,
+        })
+    }
+
+    pub(super) fn reuse_opaques<'db, T: TypeFoldable<DbInterner<'db>>>(
+        &self,
+        db: &'db dyn HirDatabase,
+        krate: Crate,
+        value: T,
+    ) -> T {
+        value.fold_with(&mut Canonical {
+            db,
+            sharing: self,
+            interner: DbInterner::new_with(db, krate),
+            reverse: false,
+            analysis: None,
+            opaque_only: true,
+        })
+    }
+
+    pub(super) fn analysis_item(
+        &self,
+        db: &dyn HirDatabase,
+        source: FunctionId,
+        item: AttrDefId,
+    ) -> AttrDefId {
+        let normal = source.krate(db);
+        for &(n, t, both) in &self.pairs {
+            if n == normal && item.module(db).krate(db) == n {
+                return analysis_twins(db, n, t, both).get(&item).copied().unwrap_or(item);
+            }
+        }
+        item
+    }
+
+    pub(super) fn analysis_instance(
+        &self,
+        db: &dyn HirDatabase,
+        def: InstanceDef,
+    ) -> Option<(FunctionId, InstanceDef)> {
+        use salsa::plumbing::{AsId, FromId};
+        let owner = match def {
+            InstanceDef::Fn(f) => {
+                return self.analysis_source(db, f).map(|source| (source, InstanceDef::Fn(source)));
+            }
+            InstanceDef::Closure(id) => InternedClosureId::from_id(id).loc(db).owner,
+            InstanceDef::Coroutine(id) | InstanceDef::CoroutineByMove(id) => {
+                InternedCoroutineId::from_id(id).loc(db).owner
+            }
+            _ => return None,
+        };
+        let InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) = owner else {
+            return None;
+        };
+        let source = self.analysis_source(db, func)?;
+        let def = match def {
+            InstanceDef::Closure(id) => {
+                let mut loc = InternedClosureId::from_id(id).loc(db);
+                loc.owner = source.into();
+                InstanceDef::Closure(InternedClosureId::new(db, loc).as_id())
+            }
+            InstanceDef::Coroutine(id) | InstanceDef::CoroutineByMove(id) => {
+                let mut loc = InternedCoroutineId::from_id(id).loc(db);
+                loc.owner = source.into();
+                let id = InternedCoroutineId::new(db, loc).as_id();
+                if matches!(def, InstanceDef::CoroutineByMove(_)) {
+                    InstanceDef::CoroutineByMove(id)
+                } else {
+                    InstanceDef::Coroutine(id)
+                }
+            }
+            _ => return None,
+        };
+        Some((source, def))
+    }
+
     pub(super) fn function(&self, db: &dyn HirDatabase, func: FunctionId) -> FunctionId {
         match self.item(db, func.into()) {
             AttrDefId::FunctionId(it) => it,
@@ -135,6 +259,8 @@ impl Sharing {
             sharing: self,
             interner: DbInterner::new_with(db, krate),
             reverse: false,
+            analysis: None,
+            opaque_only: false,
         })
     }
 
@@ -147,7 +273,23 @@ impl Sharing {
             sharing: self,
             interner: DbInterner::new_no_crate(db),
             reverse: true,
+            analysis: None,
+            opaque_only: false,
         })
+    }
+
+    pub(super) fn coroutine_is_by_move<'db>(
+        &self,
+        db: &'db dyn HirDatabase,
+        id: InternedCoroutineId<'db>,
+        args: rustc_type_ir::CoroutineArgs<DbInterner<'db>>,
+    ) -> bool {
+        use salsa::plumbing::{AsId, FromId};
+        let id = match self.analysis_instance(db, InstanceDef::Coroutine(id.as_id())) {
+            Some((_, InstanceDef::Coroutine(source))) => InternedCoroutineId::from_id(source),
+            _ => id,
+        };
+        crate::mir::is_by_move_coroutine(db, id, args)
     }
 
     fn link_item(&self, db: &dyn HirDatabase, item: AttrDefId) -> AttrDefId {
@@ -218,7 +360,14 @@ impl Sharing {
         if remaining.found {
             return env;
         }
-        let krate = self.pairs.iter().find(|it| it.1 == env.krate).map_or(env.krate, |it| it.0);
+        let Some(&(krate, _, _)) = self.pairs.iter().find(|it| it.1 == env.krate) else {
+            return env;
+        };
+        let mut normal = NormalTypes { db, krate, found: false };
+        ty.visit_with(&mut normal);
+        if !normal.found {
+            return env;
+        }
         ParamEnvAndCrate { krate, param_env: self.fold(db, krate, env.param_env) }
     }
 
@@ -293,10 +442,23 @@ struct Canonical<'a, 'db> {
     sharing: &'a Sharing,
     interner: DbInterner<'db>,
     reverse: bool,
+    analysis: Option<Crate>,
+    opaque_only: bool,
 }
 
 impl<'db> Canonical<'_, 'db> {
     fn item(&self, item: AttrDefId) -> AttrDefId {
+        if self.opaque_only {
+            return item;
+        }
+        if let Some(normal) = self.analysis {
+            for &(n, t, both) in &self.sharing.pairs {
+                if n == normal && item.module(self.db).krate(self.db) == n {
+                    return analysis_twins(self.db, n, t, both).get(&item).copied().unwrap_or(item);
+                }
+            }
+            return item;
+        }
         if self.reverse {
             self.sharing.link_item(self.db, item)
         } else {
@@ -402,6 +564,26 @@ impl<'db> TypeFolder<DbInterner<'db>> for Canonical<'_, 'db> {
     }
 
     fn fold_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
+        if !self.reverse
+            && let TyKind::Alias(alias) = ty.kind()
+            && let crate::next_solver::AliasTyKind::Opaque { def_id } = alias.kind
+            && let crate::ImplTraitId::ReturnTypeImplTrait(func, index) = def_id.0.loc(self.db)
+        {
+            let target = if self.analysis.is_some() { self.function(func) } else { func };
+            if let Some(source) = self.sharing.analysis_source(self.db, target) {
+                use rustc_type_ir::Interner;
+                let opaque = crate::db::InternedOpaqueTyId::new(
+                    self.db,
+                    crate::ImplTraitId::ReturnTypeImplTrait(source, index),
+                );
+                let hidden = self
+                    .interner
+                    .type_of(opaque.into())
+                    .instantiate(self.interner, alias.args)
+                    .skip_norm_wip();
+                return self.sharing.analysis_fold(self.db, source, hidden);
+            }
+        }
         match ty.kind() {
             TyKind::Adt(adt, args) => {
                 if let AttrDefId::AdtId(id) = self.item(adt.def_id().into()) {
@@ -439,6 +621,15 @@ impl<'db> TypeFolder<DbInterner<'db>> for Canonical<'_, 'db> {
                 return Ty::new_coroutine(
                     self.interner,
                     InternedCoroutineId::new(self.db, loc).into(),
+                    args.fold_with(self),
+                );
+            }
+            TyKind::CoroutineClosure(id, args) => {
+                let mut loc = id.0.loc(self.db);
+                loc.owner = self.owner(loc.owner);
+                return Ty::new_coroutine_closure(
+                    self.interner,
+                    InternedCoroutineClosureId::new(self.db, loc).into(),
                     args.fold_with(self),
                 );
             }
@@ -499,6 +690,21 @@ impl<'db> TypeVisitor<DbInterner<'db>> for TestTypes<'_, 'db> {
     fn visit_ty(&mut self, ty: Ty<'db>) {
         if let Some(item) = type_item(self.db, ty) {
             self.found |= self.sharing.test_crate(item.module(self.db).krate(self.db));
+        }
+        ty.super_visit_with(self);
+    }
+}
+
+struct NormalTypes<'db> {
+    db: &'db dyn HirDatabase,
+    krate: Crate,
+    found: bool,
+}
+impl<'db> TypeVisitor<DbInterner<'db>> for NormalTypes<'db> {
+    type Result = ();
+    fn visit_ty(&mut self, ty: Ty<'db>) {
+        if let Some(item) = type_item(self.db, ty) {
+            self.found |= item.module(self.db).krate(self.db) == self.krate;
         }
         ty.super_visit_with(self);
     }

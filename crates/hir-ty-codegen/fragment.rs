@@ -153,6 +153,7 @@ impl PartialEq for Code {
 /// leaves what was built from it alone.
 #[derive(PartialEq, Hash)]
 pub struct CompiledFunction {
+    pub(super) sharing: super::Sharing,
     pub(super) requests: Requests,
     pub(super) code: Code,
     /// The body the function was compiled from and the statements of it that

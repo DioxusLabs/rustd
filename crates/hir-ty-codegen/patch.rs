@@ -232,7 +232,7 @@ impl Left {
         let code = compiled_root(db, root).as_ref().ok();
         Left {
             code: code.map(|it| Mark::new(db, root_serial(db, root), &it.requests)),
-            async_blocks: async_blocks(db, root).clone(),
+            async_blocks: async_blocks(db, root, super::Sharing::default()).clone(),
         }
     }
 }
@@ -1101,7 +1101,8 @@ impl Base {
         // A future is laid out by one compiler: a function that now handles one of rustc's
         // has to be left to rustc as well.
         if let Some(theirs) = self.their_async_blocks() {
-            let shares = |root| match (async_blocks(db, root).clone(), &theirs) {
+            let shares = |root| match (async_blocks(db, root, cg.sharing.clone()).clone(), &theirs)
+            {
                 (Some(ours), Some(theirs)) => !ours.is_disjoint(theirs),
                 (Some(ours), None) => !ours.is_empty(),
                 (None, _) => true,

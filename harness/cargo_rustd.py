@@ -1156,6 +1156,15 @@ pub const DIFFERENT_LENGTH: usize = if cfg!(test) { 9 } else { 7 };
 pub fn baked_length() -> usize { let value = [0u8; DIFFERENT_LENGTH]; value.len() }
 pub fn call_baked_length() -> usize { baked_length() }
 """, "cfg body: test_graph::call_baked_length: analysis-shared"),
+            ("baked const generic", """
+pub const DIFFERENT_LENGTH: usize = if cfg!(test) { 9 } else { 7 };
+fn length<const N: usize>() -> usize { N }
+pub fn baked_generic() -> usize { length::<DIFFERENT_LENGTH>() }
+""", "cfg body: test_graph::baked_generic: transitive"),
+            ("baked const annotation", """
+pub const DIFFERENT_LENGTH: usize = if cfg!(test) { 9 } else { 7 };
+pub fn baked_annotation() -> usize { let value: [u8; DIFFERENT_LENGTH] = Default::default(); value.len() }
+""", "cfg body: test_graph::baked_annotation: transitive"),
             ("concrete impl precision", """
 #[derive(Debug, Clone)]
 pub struct Changed { #[cfg(test)] extra: u32 }
@@ -1186,6 +1195,10 @@ pub fn changed_static_type() -> &'static StaticShape { &STATIC_SHAPE }
             ("dyn impl edges", "\npub struct Other;\nimpl Value for Other { fn get(&self) -> u32 { STATE } }\npub fn dynamic_all(value: &dyn Value) -> u32 { value.get() }\n", "cfg body: test_graph::dynamic_all: analysis-shared"),
             ("projection edges", "\npub trait Project { type Output; }\nimpl Project for Shape { type Output = u32; }\npub fn projected<T: Project>(value: T::Output) -> T::Output { value }\n", "cfg body: test_graph::projected: fully-shared"),
             ("foreign local argument", "\npub fn foreign_local() -> Option<Shape> { Some(Shape) }\n", "cfg body: test_graph::foreign_local: fully-shared"),
+            ("inherent impl type identity", "\nimpl Shape { pub fn changed(&self) -> bool { cfg!(test) } }\npub fn inherent_shape() -> Option<Shape> { Some(Shape) }\n", "cfg body: test_graph::inherent_shape: analysis-shared"),
+            ("blanket impl type identity", "\npub trait Blanket { fn changed(&self) -> bool; }\nimpl<T> Blanket for T { fn changed(&self) -> bool { cfg!(test) } }\npub fn blanket_shape() -> Option<Shape> { Some(Shape) }\n", "cfg body: test_graph::blanket_shape: analysis-shared"),
+            ("blanket predicate type identity", "\npub trait Bound<T> {}\npub trait Blanket { fn changed(&self) -> bool; }\nimpl<T: Bound<Shape>> Blanket for Vec<T> { fn changed(&self) -> bool { cfg!(test) } }\npub fn blanket_bound_shape() -> Option<Shape> { Some(Shape) }\n", "cfg body: test_graph::blanket_bound_shape: analysis-shared"),
+            ("trait argument type identity", "\npub trait Accept<T> { fn changed(&self) -> bool; }\nimpl Accept<Shape> for u32 { fn changed(&self) -> bool { cfg!(test) } }\npub fn argument_shape() -> Option<Shape> { Some(Shape) }\n", "cfg body: test_graph::argument_shape: analysis-shared"),
             ("Self variant", "\nimpl Choice { pub fn one() -> Self { Self::One } }\n", "cfg body: test_graph::one: fully-shared"),
             ("indirect unknown", "\npub fn indirect(f: fn() -> u32) -> u32 { f() }\n", "cfg body: test_graph::indirect: unknown"),
             ("projected indirect unknown", "\npub struct Pointer { call: fn() -> u32 }\npub fn indirect_field(value: Pointer) -> u32 { (value.call)() }\n", "cfg body: test_graph::indirect_field: unknown"),
@@ -1227,11 +1240,26 @@ def test_graph_sharing(work):
     files = {
         "Cargo.toml": '[package]\nname = "graph_sharing"\nversion = "0.1.0"\nedition = "2021"\n[workspace]\nmembers = ["probe"]\n[dev-dependencies]\nprobe = { path = "probe" }\n',
         "probe/Cargo.toml": '[package]\nname = "probe"\nversion = "0.1.0"\nedition = "2021"\n[dependencies]\ngraph_sharing = { path = ".." }\n',
-        "probe/src/lib.rs": '''pub fn normal() { assert_eq!(graph_sharing::lease(), 900); assert!(!graph_sharing::tested()); assert_eq!(graph_sharing::caller(), 7); }
+        "probe/src/lib.rs": '''pub fn normal() { assert_eq!(graph_sharing::lease(), 900); assert!(!graph_sharing::tested()); assert_eq!(graph_sharing::caller(), 7); assert_eq!(graph_sharing::const_operand(), 17); assert_eq!(graph_sharing::analysis_closure(), 7); assert_eq!(graph_sharing::analysis_result(true), Ok(7)); assert_eq!(graph_sharing::analysis_result(false), Err(())); }
 pub fn shared() -> u32 { graph_sharing::shared() }
 pub fn pointer() -> usize { graph_sharing::shared as usize }
 pub fn bump() -> usize { graph_sharing::bump() }
 pub fn read() -> usize { graph_sharing::read() }
+pub fn tls_bump() -> usize { graph_sharing::tls_bump() }
+pub fn tls_read() -> usize { graph_sharing::tls_read() }
+pub fn default_value() -> u32 { graph_sharing::analysis_default() }
+pub use graph_sharing::Defaulted as NormalDefault;
+pub trait ExternalValue { type Inner; }
+impl ExternalValue for u8 { type Inner = u8; }
+pub struct External<T: ExternalValue> { pub value: T::Inner }
+pub fn async_closure_value() -> u32 {
+    let mut future = std::pin::pin!(graph_sharing::analysis_async_closure());
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match std::future::Future::poll(future.as_mut(), &mut context) {
+        std::task::Poll::Ready(value) => value,
+        std::task::Poll::Pending => panic!("ready future"),
+    }
+}
 pub fn hidden_size() -> usize { graph_sharing::hidden_size() }
 ''',
         "src/main.rs": 'fn main() { println!("{}", graph_sharing::shared()); }\n',
@@ -1243,9 +1271,29 @@ pub fn lease() -> u32 { LEASE }
 pub fn tested() -> bool { cfg!(test) }
 pub fn different() -> u32 { if cfg!(test) { 9 } else { 7 } }
 pub fn caller() -> u32 { different() }
+const PER_COPY: u32 = if cfg!(test) { 19 } else { 17 };
+pub fn const_operand() -> u32 { PER_COPY }
+pub fn analysis_closure() -> u32 { let call = || different(); call() }
+pub async fn analysis_async() -> usize {
+    let iter = changed();
+    std::future::ready(()).await;
+    iter.count()
+}
+pub fn analysis_result(ok: bool) -> Result<u32, ()> {
+    if ok { Ok(different()) } else { Err(()) }
+}
+pub struct Defaulted(pub u32);
+impl Default for Defaulted {
+    fn default() -> Self { Self(if cfg!(test) { 19 } else { 17 }) }
+}
+pub fn analysis_default() -> u32 { Some(()).map(|_| Defaulted::default().0).unwrap() }
+pub async fn analysis_async_closure() -> u32 { let call = async || different(); call().await }
 static STATE: AtomicUsize = AtomicUsize::new(0);
 pub fn bump() -> usize { STATE.fetch_add(1, Ordering::SeqCst) }
 pub fn read() -> usize { STATE.load(Ordering::SeqCst) }
+std::thread_local! { static TLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+pub fn tls_bump() -> usize { TLS.with(|value| value.replace(value.get() + 1)) }
+pub fn tls_read() -> usize { TLS.with(|value| value.get()) }
 pub fn static_generic<T: std::fmt::Debug>(value: T) -> String {
     let _ = STATE.load(Ordering::SeqCst);
     format!("{:?}", value)
@@ -1273,10 +1321,33 @@ pub fn hidden_size() -> usize { std::mem::size_of_val(&changed()) }
 #[cfg(test)] mod tests {
     struct Only;
     impl super::Calc for Only { fn calc(&self) -> u32 { 11 } }
+    #[test] fn s3c_identity() {
+        let local: super::Defaulted = Default::default();
+        let normal: probe::NormalDefault = Default::default();
+        assert_eq!(local.0, 19);
+        assert_eq!(normal.0, 17);
+    }
+    #[test] fn dev_dependency_layout() {
+        let value = probe::External::<u8> { value: 3 };
+        assert_eq!(value.value, 3);
+    }
     #[test] fn both_copies() {
         assert_eq!(super::lease(), 1);
         assert!(super::tested());
         assert_eq!(super::caller(), 9);
+        assert_eq!(super::const_operand(), 19);
+        assert_eq!(super::analysis_closure(), 9);
+        assert_eq!(super::analysis_result(true), Ok(9));
+        assert_eq!(super::analysis_result(false), Err(()));
+        assert_eq!(super::analysis_default(), 19);
+        assert_eq!(probe::default_value(), 17);
+        let mut closure = std::pin::pin!(super::analysis_async_closure());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert_eq!(std::future::Future::poll(closure.as_mut(), &mut context), std::task::Poll::Ready(9));
+        assert_eq!(probe::async_closure_value(), 7);
+        let mut future = std::pin::pin!(super::analysis_async());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert_eq!(std::future::Future::poll(future.as_mut(), &mut context), std::task::Poll::Ready(128));
         probe::normal();
         assert_eq!(super::shared(), 42);
         assert_eq!(probe::shared(), 42);
@@ -1296,6 +1367,10 @@ pub fn hidden_size() -> usize { std::mem::size_of_val(&changed()) }
         assert_eq!(probe::read(), 0);
         assert_eq!(probe::bump(), 0);
         assert_eq!(super::read(), 1);
+        assert_eq!(super::tls_bump(), 0);
+        assert_eq!(probe::tls_read(), 0);
+        assert_eq!(probe::tls_bump(), 0);
+        assert_eq!(super::tls_read(), 1);
         assert_eq!(super::count(), 128);
         assert_ne!(super::hidden_size(), probe::hidden_size());
     }
@@ -1314,7 +1389,7 @@ pub fn hidden_size() -> usize { std::mem::size_of_val(&changed()) }
         path = pathlib.Path(ws, file)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
-    side = Side(ws, dict(base_env(os.path.join(work, "home-graph-sharing")), RUSTD_CFG_TWINS="items", RUSTD_CACHE_CHECK="1"), True)
+    side = Side(ws, dict(base_env(os.path.join(work, "home-graph-sharing")), RUSTD_CFG_TWINS="items", RUSTD_CACHE_CHECK="1", RUSTD_CFG_ANALYSIS_TRACE="1"), True)
     checks = []
 
     def check(name, held, detail):
@@ -1338,6 +1413,11 @@ pub fn hidden_size() -> usize { std::mem::size_of_val(&changed()) }
         shared = re.findall(r"cfg codegen body: shared: T compiled (\d+), redirected (\d+)", text)
         check("shared function has no T compilation", bool(shared) and all(t == "0" and n == "1" for t, n in shared), str(shared))
         check("opaque callers stay analysis-shared", "cfg body: graph_sharing::count: analysis-shared" in text and "cfg body: graph_sharing::hidden_size: analysis-shared" in text, "count, hidden_size")
+        for body in ("caller", "count", "hidden_size", "bump", "read", "tls_bump", "tls_read", "static_generic", "const_operand", "analysis_closure", "analysis_async", "analysis_result", "analysis_default", "analysis_async_closure"):
+            queries = re.findall(rf"cfg analysis query: (infer|mir) {body}: test (true|false)", text)
+            check(f"{body} reuses N analysis", bool(queries) and all(copy == "false" for _, copy in queries), str(queries))
+            compiled = re.findall(rf"cfg codegen body: {body}: T compiled 1, redirected 0, analysis-shared (\d+)", text)
+            check(f"{body} compiled from N MIR", bool(compiled) and all(count == "1" for count in compiled), str(compiled))
         _, built = side.cargo("run", "--bin", "graph_sharing")
         check("CLI before edit", built.returncode == 0 and built.stdout.strip() == "42", built.stderr[-200:])
         rewrite(os.path.join(ws, "src/lib.rs"), "40 + 2", "41 + 2")
@@ -1392,10 +1472,16 @@ impl IntoIterator for Batch {
 static STATE: AtomicUsize = AtomicUsize::new(0);
 pub fn bump() -> usize { STATE.fetch_add(1, Ordering::SeqCst) }
 pub fn boxed() -> Box<dyn std::any::Any> { Box::new(Token) }
+pub fn changed() -> u8 { if cfg!(test) { 3 } else { 4 } }
+pub fn flatten() -> Option<u8> {
+    let _ = STATE.load(Ordering::SeqCst);
+    vec![Batch(vec![changed()])].into_iter().flatten().next()
+}
 #[test] fn one_copy() {
     let mut flattened = vec![Batch(vec![3])].into_iter().flatten();
     assert_eq!(flattened.next(), Some(3));
     assert_eq!(flattened.next(), None);
+    assert_eq!(flatten(), Some(3));
     assert_eq!(bump(), 0);
     assert_eq!(STATE.load(Ordering::SeqCst), 1);
     let value: Box<dyn std::any::Any> = Box::new(Token);
@@ -1404,13 +1490,14 @@ pub fn boxed() -> Box<dyn std::any::Any> { Box::new(Token) }
     assert!(boxed().downcast::<Token>().is_ok());
 }
 ''')
-    single = Side(single_ws, dict(base_env(os.path.join(work, "home-sharing-single")), RUSTD_CFG_TWINS="items"), True)
+    single = Side(single_ws, dict(base_env(os.path.join(work, "home-sharing-single")), RUSTD_CFG_TWINS="items", RUSTD_CFG_ANALYSIS_TRACE="1"), True)
     try:
         single.cargo("test")
         wait_warm(single, single_ws)
         _, result = single.cargo("test")
         text = "\n".join(path.read_text(errors="replace") for path in pathlib.Path(single.env["RUSTD_HOME"]).glob("**/log"))
         check("one copy retains static and TypeId identity", result.returncode == 0 and how_built(result.stderr) == "daemon" and "cfg codegen body: bump: T compiled 0, redirected 1" in text and "TypeId restarts 1" not in text, result.stderr[-300:])
+        check("one-copy analysis Flatten uses N impl environment", result.returncode == 0 and "cfg codegen body: flatten: T compiled 1, redirected 0, analysis-shared 1" in text and "cfg analysis query: mir flatten: test true" not in text and "cfg analysis query: infer flatten: test true" not in text, result.stderr[-300:])
     finally:
         single.cargo("stop")
     return checks

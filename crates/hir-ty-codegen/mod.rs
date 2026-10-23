@@ -55,7 +55,6 @@ use syntax::{AstNode, AstToken, SyntaxElement, SyntaxKind, SyntaxNode, TextRange
 use triomphe::Arc;
 use unicode_width::UnicodeWidthChar;
 
-use crate::mir::is_by_move_coroutine;
 use crate::{
     CallableDefId, InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate,
     consteval::try_const_usize,
@@ -109,9 +108,26 @@ pub use home::body_file;
 mod llvm;
 mod patch;
 mod promote;
+mod remap;
 mod settled;
 mod sharing;
 pub use sharing::Sharing;
+
+pub(crate) fn trace_analysis_query(db: &dyn HirDatabase, owner: InferBodyId<'_>, phase: &str) {
+    if std::env::var_os("RUSTD_CFG_ANALYSIS_TRACE").is_some()
+        && let InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) = owner
+    {
+        let test = func
+            .krate(db)
+            .cfg_options(db)
+            .without_recording()
+            .check_atom(&cfg::CfgAtom::Flag(intern::sym::test));
+        eprintln!(
+            "cfg analysis query: {phase} {}: test {test}",
+            FunctionSignature::of(db, func).name.as_str()
+        );
+    }
+}
 mod stable;
 pub use stable::{block_place, lower_declared};
 mod store;
@@ -131,7 +147,7 @@ mod vtable;
 pub mod wasm;
 mod wasm_object;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, salsa::SalsaValue)]
 pub enum CodegenError {
     /// The function uses something this backend can't compile yet; fall back to rustc.
     Unsupported(String),
@@ -707,7 +723,10 @@ impl CodegenUnit {
                 let told = cg.debug.is_some().then_some(&cg.told);
                 symbols.in_parallel(ours.len(), &|db, symbols, at| {
                     if symbols.function(ours[at]).is_none() {
-                        _ = db.mir_body(sharing.function(db, ours[at]).into());
+                        let source = sharing
+                            .analysis_source(db, ours[at])
+                            .unwrap_or_else(|| sharing.function(db, ours[at]));
+                        _ = db.mir_body(source.into());
                     } else if let (Ok(compiled), Some(told)) =
                         (program_root(db, ours[at], &sharing).as_ref(), told)
                     {
@@ -797,7 +816,7 @@ impl CodegenUnit {
             if failed.is_empty() && (!from_rustc.is_empty() || !generic.is_empty()) {
                 let mut theirs = Some(FxHashSet::default());
                 for root in from_rustc.iter().chain(&generic) {
-                    let blocks = async_blocks(db, *root).clone();
+                    let blocks = async_blocks(db, *root, sharing.clone()).clone();
                     theirs = theirs.zip(blocks).map(|(mut all, blocks)| {
                         all.extend(blocks);
                         all
@@ -805,7 +824,7 @@ impl CodegenUnit {
                 }
                 let before = left.len();
                 left.extend(compiled.iter().map(|it| it.0).filter(|&root| {
-                    match (async_blocks(db, root).clone(), &theirs) {
+                    match (async_blocks(db, root, sharing.clone()).clone(), &theirs) {
                         (Some(ours), Some(theirs)) => !ours.is_disjoint(theirs),
                         (Some(ours), None) => !ours.is_empty(),
                         (None, _) => true,
@@ -1709,7 +1728,8 @@ fn compile_root<'db>(
     func: FunctionId,
     sharing: Sharing,
 ) -> Result<CompiledFunction> {
-    let (body, env) = root_body(db, func)?;
+    let (body, env) = program_body(db, func, &sharing)?;
+    let body = &*body;
     if std::env::var("RUSTD_DUMP_MIR")
         .is_ok_and(|want| FunctionSignature::of(db, func).name.as_str() == want)
     {
@@ -1859,7 +1879,9 @@ fn compile_instance<'db>(
             InstanceDef::Fn(_)
             | InstanceDef::Closure(_)
             | InstanceDef::Coroutine(_)
-            | InstanceDef::CoroutineByMove(_) => instance_body(db, &instance, stored_env)?,
+            | InstanceDef::CoroutineByMove(_) => {
+                program_instance_body(db, &instance, stored_env, &sharing)?
+            }
         };
     let body = &*body;
     let dump = std::env::var("RUSTD_DUMP_MIR").ok();
@@ -2152,6 +2174,36 @@ fn instance_body<'db>(
     body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))
 }
 
+fn program_instance_body<'db>(
+    db: &'db dyn HirDatabase,
+    instance: &Instance,
+    env: StoredParamEnvAndCrate,
+    sharing: &Sharing,
+) -> Result<Cow<'db, MirBody<'db>>> {
+    if sharing.is_empty() {
+        return instance_body(db, instance, env);
+    }
+    let analysis = sharing.analysis_instance(db, instance.def);
+    let def = analysis.map_or(instance.def, |(_, def)| def);
+    let raw = match def {
+        InstanceDef::Fn(func) => db.mir_body(func.into()),
+        InstanceDef::Closure(id) => db.mir_body_for_closure(InternedClosureId::from_id(id)),
+        InstanceDef::Coroutine(id) => db.mir_body_for_coroutine(InternedCoroutineId::from_id(id)),
+        InstanceDef::CoroutineByMove(id) => {
+            db.mir_body_for_coroutine_by_move(InternedCoroutineId::from_id(id))
+        }
+        _ => unsupported!("analysis-sharing a shim"),
+    }
+    .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+    let mapped = match analysis {
+        Some((source, _)) => remap::body(db, sharing, source, raw)?,
+        None => remap::opaques(db, sharing, raw)?,
+    };
+    monomorphized(db, &mapped, &instance.args, &env)
+        .map(Cow::Owned)
+        .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))
+}
+
 /// The types a body takes and returns, which is all its callers have to know about it. Asked
 /// for on its own so that they do not depend on the rest of the body.
 #[derive(Clone, PartialEq, Eq)]
@@ -2167,8 +2219,9 @@ fn body_types<'db>(
     db: &'db dyn HirDatabase,
     instance: Instance,
     env: StoredParamEnvAndCrate,
+    sharing: Sharing,
 ) -> Result<BodyTypes> {
-    let body = &*instance_body(db, &instance, env)?;
+    let body = &*program_instance_body(db, &instance, env, &sharing)?;
     Ok(BodyTypes {
         params: body.param_locals.iter().map(|&local| body.locals[local].ty.clone()).collect(),
         returned: body.locals[returned_local(body)].ty.clone(),
@@ -2180,7 +2233,7 @@ fn body_types<'db>(
 /// another type. rustc lays such a future out differently, so the function that makes one has
 /// to come from the compiler that compiles what holds and polls it.
 #[salsa::tracked]
-fn returns_async_block<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> bool {
+fn returns_async_block<'db>(db: &'db dyn HirDatabase, func: FunctionId, sharing: Sharing) -> bool {
     struct Finder {
         opaque: bool,
         coroutine: bool,
@@ -2204,8 +2257,8 @@ fn returns_async_block<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> bool 
     if !finder.opaque && !FunctionSignature::of(db, func).is_async() {
         return false;
     }
-    let Ok((body, _)) = root_body(db, func) else { return false };
-    let returned = body.locals[returned_local(body)].ty.as_ref();
+    let Ok((body, _)) = program_body(db, func, &sharing) else { return false };
+    let returned = body.locals[returned_local(&body)].ty.as_ref();
     rustc_type_ir::TypeVisitable::visit_with(&returned, &mut finder);
     finder.coroutine
 }
@@ -2227,10 +2280,11 @@ fn fn_trait_methods(lang_items: &LangItems) -> [[Option<FunctionId>; 3]; 2] {
 fn coroutine_instance<'db>(
     db: &'db dyn HirDatabase,
     ty: Ty<'db>,
+    sharing: &Sharing,
 ) -> Option<(InstanceDef, GenericArgs<'db>)> {
     let TyKind::Coroutine(id, args) = ty.kind() else { return None };
     let args = args.as_coroutine();
-    let def = match is_by_move_coroutine(db, id.0, args) {
+    let def = match sharing.coroutine_is_by_move(db, id.0, args) {
         true => InstanceDef::CoroutineByMove(id.0.as_id()),
         false => InstanceDef::Coroutine(id.0.as_id()),
     };
@@ -2241,7 +2295,11 @@ fn coroutine_instance<'db>(
 /// can't be read. rustc lays a future out differently, so every function that touches one
 /// has to come from the same compiler.
 #[salsa::tracked(returns(ref))]
-fn async_blocks<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Option<FxHashSet<salsa::Id>> {
+fn async_blocks<'db>(
+    db: &'db dyn HirDatabase,
+    func: FunctionId,
+    sharing: Sharing,
+) -> Option<FxHashSet<salsa::Id>> {
     struct Collector<'db>(Vec<Ty<'db>>);
     impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for Collector<'db> {
         type Result = ();
@@ -2255,7 +2313,7 @@ fn async_blocks<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Option<FxHas
             rustc_type_ir::TypeSuperVisitable::super_visit_with(&ty, self)
         }
     }
-    let (body, env) = root_body(db, func).ok()?;
+    let (body, env) = program_body(db, func, &sharing).ok()?;
     let (mut found, mut seen) = (FxHashSet::default(), FxHashSet::default());
     let mut bodies = vec![body];
     while let Some(body) = bodies.pop() {
@@ -2272,24 +2330,45 @@ fn async_blocks<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Option<FxHas
                     found.insert(id.0.as_id());
                     let args = args.as_coroutine();
                     let parent = GenericArgs::new_from_slice(args.parent_args()).store();
-                    match is_by_move_coroutine(db, id.0, args) {
-                        true => db.monomorphized_mir_body_for_coroutine_by_move(
-                            id.0,
-                            parent,
-                            env.store(),
-                        ),
-                        false => db.monomorphized_mir_body_for_coroutine(id.0, parent, env.store()),
-                    }
+                    let def = if sharing.coroutine_is_by_move(db, id.0, args) {
+                        InstanceDef::CoroutineByMove(id.0.as_id())
+                    } else {
+                        InstanceDef::Coroutine(id.0.as_id())
+                    };
+                    program_instance_body(
+                        db,
+                        &Instance { def, args: parent, checked: false },
+                        env.store(),
+                        &sharing,
+                    )
                 }
                 TyKind::CoroutineClosure(id, args) => {
                     let parent =
                         GenericArgs::new_from_slice(args.as_coroutine_closure().parent_args());
                     let closure = id.0.as_closure(db);
-                    db.monomorphized_mir_body_for_closure(closure, parent.store(), env.store())
+                    program_instance_body(
+                        db,
+                        &Instance {
+                            def: InstanceDef::Closure(closure.as_id()),
+                            args: parent.store(),
+                            checked: false,
+                        },
+                        env.store(),
+                        &sharing,
+                    )
                 }
                 TyKind::Closure(id, args) => {
                     let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
-                    db.monomorphized_mir_body_for_closure(id.0, parent.store(), env.store())
+                    program_instance_body(
+                        db,
+                        &Instance {
+                            def: InstanceDef::Closure(id.0.as_id()),
+                            args: parent.store(),
+                            checked: false,
+                        },
+                        env.store(),
+                        &sharing,
+                    )
                 }
                 _ => continue,
             };
@@ -2475,13 +2554,15 @@ impl Ready<'_> {
 struct ToldTypes(
     #[allow(clippy::type_complexity)]
     std::sync::Arc<
-        std::sync::Mutex<FxHashMap<(StoredParamEnvAndCrate, StoredTy), Option<debuginfo::TypeSet>>>,
+        std::sync::Mutex<
+            FxHashMap<(StoredParamEnvAndCrate, StoredTy, Sharing), Option<debuginfo::TypeSet>>,
+        >,
     >,
     std::sync::Arc<debuginfo::Descriptions>,
 );
 
 /// The types a thread tells of itself, by the environment they are in.
-type OwnTypes<'db> = FxHashMap<StoredParamEnvAndCrate, debuginfo::Types<'db>>;
+type OwnTypes<'db> = FxHashMap<(StoredParamEnvAndCrate, Sharing), debuginfo::Types<'db>>;
 
 impl ToldTypes {
     fn told<'db>(
@@ -2490,14 +2571,15 @@ impl ToldTypes {
         own: &mut OwnTypes<'db>,
         env: &StoredParamEnvAndCrate,
         ty: &StoredTy,
+        sharing: &Sharing,
     ) -> Option<debuginfo::TypeSet> {
-        let key = (env.clone(), ty.clone());
+        let key = (env.clone(), ty.clone(), sharing.clone());
         if let Some(told) = self.0.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
             return told.clone();
         }
-        let types = own
-            .entry(env.clone())
-            .or_insert_with(|| debuginfo::Types::new(db, env.as_ref(db), self.1.clone()));
+        let types = own.entry((env.clone(), sharing.clone())).or_insert_with(|| {
+            debuginfo::Types::new(db, env.as_ref(db), self.1.clone(), sharing.clone())
+        });
         let told = types.describe(ty.as_ref());
         // Another thread may have told of it meanwhile, and the functions share one set.
         self.0.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_insert(told).clone()
@@ -2511,7 +2593,7 @@ impl ToldTypes {
         compiled: &CompiledFunction,
     ) {
         if let (Some(_), Some((env, variables))) = (&compiled.source, &compiled.variables) {
-            variables.iter().for_each(|it| _ = self.told(db, own, env, &it.ty));
+            variables.iter().for_each(|it| _ = self.told(db, own, env, &it.ty, &compiled.sharing));
         }
     }
 }
@@ -2522,7 +2604,7 @@ impl ToldTypes {
 fn describe_variables<'db>(
     db: &'db dyn HirDatabase,
     owner: DefWithBodyId,
-    (told, own, env): (&ToldTypes, &mut OwnTypes<'db>, &StoredParamEnvAndCrate),
+    (told, own, env, sharing): (&ToldTypes, &mut OwnTypes<'db>, &StoredParamEnvAndCrate, &Sharing),
     variables: &[Variable],
     places: &SlotPlaces,
     scopes: &FxHashMap<BindingId, u32>,
@@ -2546,7 +2628,9 @@ fn describe_variables<'db>(
         let ty = match firsts.get(&ty) {
             Some(&first) => first,
             None => {
-                let Some(described) = told.told(db, own, env, &variable.ty) else { continue };
+                let Some(described) = told.told(db, own, env, &variable.ty, sharing) else {
+                    continue;
+                };
                 let first = debug.types.len() as u32;
                 debug.types.push(described);
                 firsts.insert(ty, first);
@@ -3203,9 +3287,10 @@ fn compile_shared<'db>(
         })
         .collect::<Vec<_>>();
     let variables = Some((env.store(), variables)).filter(|it| !it.1.is_empty());
+    let sharing = cg.sharing.clone();
     let (requests, layouts) = cg.finish();
     COMPILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Ok(CompiledFunction { requests, code, source, closure: None, variables, layouts })
+    Ok(CompiledFunction { sharing, requests, code, source, closure: None, variables, layouts })
 }
 
 fn build<'db>(
@@ -3292,6 +3377,7 @@ fn inlinable(
     db: &dyn HirDatabase,
     instance: Instance,
     env: StoredParamEnvAndCrate,
+    sharing: Sharing,
 ) -> Option<fragment::Inlinable> {
     /// The most blocks and statements the body of a function that is inlined has, and
     /// the most instructions it is built to with what it calls inlined into it.
@@ -3299,7 +3385,8 @@ fn inlinable(
     const STATEMENTS: usize = 12;
     const INSTRUCTIONS: usize = 64;
     let InstanceDef::Fn(func) = instance.def else { return None };
-    let generic = db.mir_body(func.into()).ok()?;
+    let source = sharing.analysis_source(db, func).unwrap_or(func);
+    let generic = db.mir_body(source.into()).ok()?;
     let statements: usize = generic.basic_blocks.iter().map(|it| it.1.statements.len()).sum();
     if generic.basic_blocks.len() > BLOCKS
         || statements > STATEMENTS
@@ -3308,8 +3395,9 @@ fn inlinable(
     {
         return None;
     }
-    let body = instance_body(db, &instance, env.clone()).ok()?;
+    let body = program_instance_body(db, &instance, env.clone(), &sharing).ok()?;
     let mut cg = Recorder::new(db, &**target().ok()?, selected_target().ok()?, instance.checked);
+    cg.sharing = sharing;
     cg.unlocated = true;
     let args = instance.args.clone();
     let mut ctx = build(&mut cg, env.as_ref(db), Some(&*body), false, |fx| {
@@ -3332,6 +3420,7 @@ fn inlinable_cycle(
     _: salsa::Id,
     _: Instance,
     _: StoredParamEnvAndCrate,
+    _: Sharing,
 ) -> Option<fragment::Inlinable> {
     None
 }
@@ -3496,6 +3585,41 @@ fn emit_wasm(func: &cranelift_codegen::ir::Function, calls: Calls) -> Result<Cod
 
 /// The body of a non-generic function, with the types it only knows as `impl Trait`
 /// resolved.
+fn program_body<'db>(
+    db: &'db dyn HirDatabase,
+    func: FunctionId,
+    sharing: &Sharing,
+) -> Result<(Cow<'db, MirBody<'db>>, ParamEnvAndCrate<'db>)> {
+    if let Some(source) = sharing.analysis_source(db, func) {
+        let raw = db
+            .mir_body(source.into())
+            .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+        let mapped = remap::body(db, sharing, source, raw)?;
+        let env = ParamEnvAndCrate {
+            param_env: crate::next_solver::ParamEnv::empty(),
+            krate: func.krate(db),
+        };
+        let args = GenericArgs::new_from_slice(&[]).store();
+        let body = monomorphized(db, &mapped, &args, &env.store())
+            .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+        Ok((Cow::Owned(body), env))
+    } else if !sharing.is_empty() {
+        let raw =
+            db.mir_body(func.into()).map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+        let mapped = remap::opaques(db, sharing, raw)?;
+        let env = ParamEnvAndCrate {
+            param_env: crate::next_solver::ParamEnv::empty(),
+            krate: func.krate(db),
+        };
+        let args = GenericArgs::new_from_slice(&[]).store();
+        let body = monomorphized(db, &mapped, &args, &env.store())
+            .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+        Ok((Cow::Owned(body), env))
+    } else {
+        root_body(db, func).map(|(body, env)| (Cow::Borrowed(body), env))
+    }
+}
+
 fn root_body<'db>(
     db: &'db dyn HirDatabase,
     func: FunctionId,
@@ -3765,14 +3889,15 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if self.counting_sharing.test_crate(func.krate(db)) {
             self.sharing_stats.redirected += usize::from(redirected);
             self.sharing_stats.t_compiled += usize::from(!redirected);
-            self.sharing_stats.analysis_shared_compiled +=
-                usize::from(!redirected && self.counting_sharing.analysis_shared(db, func));
+            let analysis = !redirected && self.sharing.analysis_source(db, func).is_some();
+            self.sharing_stats.analysis_shared_compiled += usize::from(analysis);
             if std::env::var_os("RUSTD_CFG_TWINS").is_some() {
                 eprintln!(
-                    "cfg codegen body: {}: T compiled {}, redirected {}",
+                    "cfg codegen body: {}: T compiled {}, redirected {}, analysis-shared {}",
                     FunctionSignature::of(db, func).name.as_str(),
                     usize::from(!redirected),
-                    usize::from(redirected)
+                    usize::from(redirected),
+                    usize::from(analysis)
                 );
             }
         }
@@ -4158,7 +4283,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             };
             rows.sort_by_key(|row| row.0);
             let scopes = describe_scopes(db, *owner, variables, &rows, len, &mut debug);
-            let types = (&self.told, &mut self.types, env);
+            let types = (&self.told, &mut self.types, env, &compiled.sharing);
             describe_variables(db, *owner, types, variables, places, &scopes, &mut debug);
         }
         let len = compiled.code.bytes.len() as u32;
@@ -5043,7 +5168,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             && let Some(symbol) = self.rustc_copy(symbol, instance.checked)
             // rustc's copy of a function of another crate would hand out rustc's future.
             && (self.own_statics.crates.contains(&func.krate(self.db))
-                || !returns_async_block(self.db, func))
+                || !returns_async_block(self.db, func, self.sharing.clone()))
         {
             self.want(func);
             return self.import(&symbol, sig);
@@ -5097,8 +5222,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             && let Some(of) = self.type_id_argument(func, args)
         {
             let of = self.sharing.link_type(self.db, of);
-            let mut hasher =
-                type_id::TypeIdHasher::new(self.db, self.symbols, &self.own_statics.crates);
+            let mut hasher = type_id::TypeIdHasher::new(
+                self.db,
+                self.symbols,
+                &self.own_statics.crates,
+                self.sharing.clone(),
+            );
             if let Some(hash) = hasher.type_id(of) {
                 return self.constant_type_id(instance.clone(), sig, hash);
             }
@@ -5302,7 +5431,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     fn ours_alone(&self, id: StaticId) -> bool {
         self.symbols.private_static_owner(id).is_some_and(|func| {
             !self.own_statics.crates.contains(&func.krate(self.db))
-                && *returns_async_block(self.db, func)
+                && *returns_async_block(self.db, func, self.sharing.clone())
         })
     }
 
@@ -5311,7 +5440,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let InstanceDef::Fn(func) = instance.def else { return None };
         // rustc's copy of a function of another crate would hand out rustc's future.
         if !self.own_statics.crates.contains(&func.krate(self.db))
-            && *returns_async_block(self.db, func)
+            && *returns_async_block(self.db, func, self.sharing.clone())
         {
             return None;
         }
@@ -6348,19 +6477,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
 
     fn layout(&self, ty: Ty<'db>) -> Result<Arc<Layout>> {
         let canonical = self.cg.sharing.fold(self.cg.db, self.env.krate, ty);
-        let env = if canonical == ty {
-            self.env
-        } else {
-            self.cg.sharing.type_env(self.cg.db, canonical, self.env)
-        };
+        let env = self.cg.sharing.type_env(self.cg.db, canonical, self.env);
         let ty = canonical;
         if let Some(layout) = self.layouts.borrow().get(&ty) {
             return Ok(layout.clone());
         }
-        let layout = self
-            .cg
-            .db
-            .layout_of_ty(ty.store(), env.store())
+        let layout = remap::layout(self.cg.db, ty.store(), env.store(), self.cg.sharing.clone())
             .map_err(|e| CodegenError::Frontend(format!("layout of {ty:?}: {e:?}")))?;
         if let Some(log) = &self.cg.layouts {
             log.borrow_mut().entry(ty).or_insert((layout.size.bytes(), layout.align.abi.bytes()));
@@ -7279,14 +7401,30 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if layout.size.bytes() == 0 || self.mentions_location(body, expr) {
             return None;
         }
-        let constant = monomorphized_promoted_mir_body_query(
-            db,
-            body.owner,
-            expr,
-            self.args.clone()?,
-            self.env.store(),
-        )
-        .ok()?;
+        let constant = if let InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(source)) =
+            body.owner
+            && self.cg.sharing.analysis_item(db, source, source.into()) != source.into()
+        {
+            remap::promoted(
+                db,
+                source,
+                expr,
+                self.args.clone()?,
+                self.env.store(),
+                self.cg.sharing.clone(),
+            )
+            .as_ref()
+            .ok()?
+        } else {
+            monomorphized_promoted_mir_body_query(
+                db,
+                body.owner,
+                expr,
+                self.args.clone()?,
+                self.env.store(),
+            )
+            .ok()?
+        };
         let allocation = interpret_mir(db, constant, false, Some(self.env)).ok()?.0.ok()?;
         let ty = allocation.ty;
         let blob = self.allocation_blob(allocation, false).ok()?;
@@ -7430,7 +7568,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn body_types(&self, def: InstanceDef, args: GenericArgs<'db>) -> Result<&'db BodyTypes> {
         // The types of a body are the same however it is compiled.
         let instance = Instance { def, args: args.store(), checked: false };
-        body_types(self.cg.db, instance, self.env.store()).as_ref().map_err(Clone::clone)
+        body_types(self.cg.db, instance, self.env.store(), self.cg.sharing.clone())
+            .as_ref()
+            .map_err(Clone::clone)
     }
 
     /// The signature the body of an instance is compiled with.
@@ -10076,7 +10216,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if is_dyn_method(self.interner, self.env.param_env, func, generic_args).is_some() {
             return self.reified(fn_ty, false);
         }
-        let (callee, callee_args) = db.lookup_impl_method(self.env, func, generic_args);
+        let (callee, callee_args) = self.lookup_impl_method(func, generic_args);
         let either::Either::Left(callee) = callee else {
             unsupported!("fn pointer to a builtin derive method");
         };
@@ -11124,7 +11264,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     TyKind::CoroutineClosure(id, generic_args) => {
                         let closure = generic_args.as_coroutine_closure();
                         if let TyKind::Coroutine(future, future_args) = dst_ty.kind()
-                            && is_by_move_coroutine(
+                            && self.cg.sharing.coroutine_is_by_move(
                                 self.cg.db,
                                 future.0,
                                 future_args.as_coroutine(),
@@ -11239,8 +11379,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn implements_fn_itself(&self, method: FunctionId, ty: Ty<'db>, tuple_ty: Ty<'db>) -> bool {
         let db = self.cg.db;
         let args = GenericArgs::new_from_slice(&[ty.into(), tuple_ty.into()]);
-        let (either::Either::Left(callee), _) = db.lookup_impl_method(self.env, method, args)
-        else {
+        let (either::Either::Left(callee), _) = self.lookup_impl_method(method, args) else {
             return false;
         };
         let ItemContainerId::ImplId(impl_) = callee.lookup(db).container else {
@@ -11548,7 +11687,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return self.cg.callee(InstanceDef::CallOnceShim, trait_ref.args, self.env, &sig);
         }
         if Some(func) == lang_items.FuturePoll
-            && let Some((def, parent_args)) = coroutine_instance(db, self_ty)
+            && let Some((def, parent_args)) = coroutine_instance(db, self_ty, &self.cg.sharing)
         {
             let sig = self.body_signature(self.body_types(def, parent_args)?)?;
             return self.cg.callee(def, parent_args, self.env, &sig);
@@ -11556,7 +11695,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let Some(args) = self.vtable_method_args(func, trait_ref) else {
             unsupported!("generic method in a vtable");
         };
-        let (callee, callee_args) = db.lookup_impl_method(self.env, func, args);
+        let (callee, callee_args) = self.lookup_impl_method(func, args);
         let either::Either::Left(callee) = callee else {
             unsupported!("builtin derive method in a vtable");
         };
@@ -11702,7 +11841,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                         unsupported!("shim for an intrinsic");
                     }
                     let db = self.cg.db;
-                    let (callee, _) = db.lookup_impl_method(self.env, func, generic_args);
+                    let (callee, _) = self.lookup_impl_method(func, generic_args);
                     if let either::Either::Left(callee) = callee
                         && track_caller(db, callee)
                     {
@@ -11898,7 +12037,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let Some(func) = self.interner.lang_items().FnOnce_call_once else {
             unsupported!("no `FnOnce::call_once`");
         };
-        let (callee, callee_args) = self.cg.db.lookup_impl_method(self.env, func, args);
+        let (callee, callee_args) = self.lookup_impl_method(func, args);
         let either::Either::Left(callee) = callee else {
             unsupported!("builtin derive method in a vtable");
         };
@@ -12023,6 +12162,22 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         sig
     }
 
+    fn lookup_impl_method(
+        &self,
+        func: FunctionId,
+        args: GenericArgs<'db>,
+    ) -> (
+        either::Either<
+            FunctionId,
+            (hir_def::BuiltinDeriveImplId, hir_def::builtin_derive::BuiltinDeriveImplMethod),
+        >,
+        GenericArgs<'db>,
+    ) {
+        let ty = Ty::new_fn_def(self.interner, CallableDefId::FunctionId(func).into(), args);
+        let env = self.cg.sharing.type_env(self.cg.db, ty, self.env);
+        self.cg.db.lookup_impl_method(env, func, args)
+    }
+
     /// Calls `func` with arguments that live at the given addresses.
     fn call_direct(
         &mut self,
@@ -12045,7 +12200,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             let dyn_ty = generic_args.type_at(0);
             return self.call_virtual(func, dyn_ty, receiver, receiver_ty, rest, dst, dst_ty);
         }
-        let (callee, callee_args) = db.lookup_impl_method(self.env, func, generic_args);
+        let (callee, callee_args) = self.lookup_impl_method(func, generic_args);
         let either::Either::Left(callee) = callee else {
             unsupported!("call to builtin derive method");
         };
@@ -12199,7 +12354,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             _ => Region::new_erased(interner),
         });
         let instance = Instance { def, args: args.store(), checked: self.cg.checked };
-        let body = inlinable(db, instance, self.env.store()).as_ref()?;
+        let body = inlinable(db, instance, self.env.store(), self.cg.sharing.clone()).as_ref()?;
         if body.func.signature != *sig {
             return None;
         }
@@ -14076,13 +14231,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// Calls the `poll` of the `async` block of type `ty`, which is what `Future::poll` is for
     /// it. `args` are the pinned reference and the context.
     fn coroutine_callee(&mut self, ty: Ty<'db>) -> Option<Callee<'db>> {
-        let (def, parent_args) = coroutine_instance(self.cg.db, ty)?;
+        let (def, parent_args) = coroutine_instance(self.cg.db, ty, &self.cg.sharing)?;
         Some(Callee::Instance(def, parent_args))
     }
 
     /// Drops the `async` block at `addr`, by polling it with no context.
     fn drop_coroutine(&mut self, addr: Value, ty: Ty<'db>) -> Result<()> {
-        let Some((def, parent_args)) = coroutine_instance(self.cg.db, ty) else {
+        let Some((def, parent_args)) = coroutine_instance(self.cg.db, ty, &self.cg.sharing) else {
             unsupported!("drop glue for {ty:?}");
         };
         let body = self.body_types(def, parent_args)?;

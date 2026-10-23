@@ -35,7 +35,6 @@ use crate::{
     layout::CoroutineFrame,
     layout::struct_tail_erasing_lifetimes,
     layout::{Layout, RustcFieldIdx},
-    mir::is_by_move_coroutine,
     mir::type_name::rustc_debug_name,
     next_solver::{
         DbInterner, GenericArgs, Ty, TyKind, TypingMode,
@@ -80,6 +79,7 @@ impl Descriptions {
 /// is told as depends on nothing but the type, so it is found once for every function with
 /// a variable of it: the layouts and the names are most of what telling of variables costs.
 pub(in super::super) struct Types<'db> {
+    sharing: super::super::Sharing,
     descriptions: Arc<Descriptions>,
     db: &'db dyn HirDatabase,
     env: ParamEnvAndCrate<'db>,
@@ -102,10 +102,12 @@ impl<'db> Types<'db> {
         db: &'db dyn HirDatabase,
         env: ParamEnvAndCrate<'db>,
         descriptions: Arc<Descriptions>,
+        sharing: super::super::Sharing,
     ) -> Self {
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
         Types {
+            sharing,
             descriptions,
             db,
             env,
@@ -165,7 +167,13 @@ impl<'db> Types<'db> {
         let mut layout = None;
         let link = match ty.kind() {
             TyKind::Adt(..) => {
-                let found = self.db.layout_of_ty(ty.store(), self.env.store()).ok()?;
+                let found = super::super::remap::layout(
+                    self.db,
+                    ty.store(),
+                    self.env.store(),
+                    self.sharing.clone(),
+                )
+                .ok()?;
                 let link = !self.is_pointer(ty, found.size.bytes());
                 layout = Some(found);
                 link
@@ -192,7 +200,13 @@ impl<'db> Types<'db> {
         }
         let layout = match layout {
             Some(layout) => layout,
-            None => self.db.layout_of_ty(ty.store(), self.env.store()).ok()?,
+            None => super::super::remap::layout(
+                self.db,
+                ty.store(),
+                self.env.store(),
+                self.sharing.clone(),
+            )
+            .ok()?,
         };
         let name = self.name(ty)?;
         // A type that is made of itself finds its place here. What stands there until the
@@ -521,7 +535,13 @@ impl<'db> Types<'db> {
         fields
     }
 
-    fn capture_names(&self, closure: InternedClosure<'db>) -> Option<Vec<String>> {
+    fn capture_names(&self, mut closure: InternedClosure<'db>) -> Option<Vec<String>> {
+        if let crate::InferBodyId::DefWithBodyId(hir_def::DefWithBodyId::FunctionId(func)) =
+            closure.owner
+            && let Some(source) = self.sharing.analysis_source(self.db, func)
+        {
+            closure.owner = source.into();
+        }
         let store = ExpressionStore::of(self.db, closure.owner.expression_store_owner(self.db));
         let infer = InferenceResult::of(self.db, closure.owner);
         let captured = infer.closures_data.get(&closure.expr)?.min_captures.values().flatten();
@@ -582,18 +602,18 @@ impl<'db> Types<'db> {
         let captured =
             self.captures(id.0.loc(self.db), args.tupled_upvars_ty(), offset_of, pointers);
         let parent_args = GenericArgs::new_from_slice(args.parent_args());
-        let body = match is_by_move_coroutine(self.db, id.0, args) {
-            true => self.db.monomorphized_mir_body_for_coroutine_by_move(
-                id.0,
-                parent_args.store(),
-                self.env.store(),
-            ),
-            false => self.db.monomorphized_mir_body_for_coroutine(
-                id.0,
-                parent_args.store(),
-                self.env.store(),
-            ),
-        }
+        use salsa::plumbing::AsId;
+        let def = if self.sharing.coroutine_is_by_move(self.db, id.0, args) {
+            super::super::InstanceDef::CoroutineByMove(id.0.as_id())
+        } else {
+            super::super::InstanceDef::Coroutine(id.0.as_id())
+        };
+        let body = super::super::program_instance_body(
+            self.db,
+            &super::super::Instance { def, args: parent_args.store(), checked: false },
+            self.env.store(),
+            &self.sharing,
+        )
         .ok()?;
         let held = body.locals_held_across_yields(&self.infcx, self.env.param_env);
         let closure = id.0.loc(self.db);
