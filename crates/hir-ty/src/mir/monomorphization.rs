@@ -6,6 +6,13 @@
 //! * Normalizing types, for example replacing RPIT of other functions called in this body.
 //!
 //! So the monomorphization should be called even if the substitution is empty.
+//!
+//! Opaque revelation follows rustc's `normalize_opaque_type` in PostAnalysis:
+//! https://github.com/rust-lang/rust/blob/1.91.0/compiler/rustc_next_trait_solver/src/solve/normalizes_to/opaque_types.rs
+//! The hidden type is instantiated only after resolving the implementing method, as in
+//! `resolve_associated_item`:
+//! https://github.com/rust-lang/rust/blob/1.91.0/compiler/rustc_ty_utils/src/instance.rs
+//! Resolving nested opaques one at a time preserves that order for trait RPITs too.
 
 use rustc_next_trait_solver::placeholder::BoundVarReplacer;
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
@@ -35,15 +42,17 @@ use crate::{
 
 use super::{MirBody, MirLowerError, Operand, OperandKind, Rvalue, StatementKind, TerminatorKind};
 
-struct Filler<'db> {
+struct Filler<'db, 'a> {
     infcx: InferCtxt<'db>,
     trait_env: ParamEnvAndCrate<'db>,
     subst: GenericArgs<'db>,
     /// One entry for each binder the fold is inside of, as normalization wants them.
     universes: Vec<Option<UniverseIndex>>,
+    opaque: &'a dyn Fn(InternedOpaqueTyId<'db>, GenericArgs<'db>) -> Ty<'db>,
+    revealing: Vec<Ty<'db>>,
 }
 
-impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
+impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db, '_> {
     type Error = MirLowerError<'db>;
 
     fn cx(&self) -> DbInterner<'db> {
@@ -77,13 +86,16 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
                     kind: AliasTyKind::Opaque { def_id }, args, ..
                 }) = ty.kind()
                 {
-                    let hidden = self
-                        .infcx
-                        .interner
-                        .type_of(def_id.into())
-                        .instantiate(self.infcx.interner, args)
-                        .skip_norm_wip();
-                    return hidden.try_fold_with(self);
+                    if self.revealing.contains(&ty) {
+                        return Err(MirLowerError::NotSupported(
+                            "recursive opaque type".to_owned(),
+                        ));
+                    }
+                    let hidden = (self.opaque)(def_id.0, args);
+                    self.revealing.push(ty);
+                    let result = hidden.try_fold_with(self);
+                    self.revealing.pop();
+                    return result;
                 }
 
                 let ty = self.normalized(ty)?;
@@ -132,7 +144,7 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
     }
 }
 
-impl<'db> Filler<'db> {
+impl<'db, 'a> Filler<'db, 'a> {
     /// `alias` as what it is an alias of. One that names the lifetimes of a binder around it,
     /// like `D::Data<'a>` in `for<'a> fn(&'a mut T) -> D::Data<'a>`, is normalized with
     /// placeholders in their place, which are put back afterwards.
@@ -158,10 +170,15 @@ impl<'db> Filler<'db> {
         ))
     }
 
-    fn new(db: &'db dyn HirDatabase, env: ParamEnvAndCrate<'db>, subst: GenericArgs<'db>) -> Self {
+    fn new(
+        db: &'db dyn HirDatabase,
+        env: ParamEnvAndCrate<'db>,
+        subst: GenericArgs<'db>,
+        opaque: &'a dyn Fn(InternedOpaqueTyId<'db>, GenericArgs<'db>) -> Ty<'db>,
+    ) -> Self {
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
-        Self { infcx, trait_env: env, subst, universes: Vec::new() }
+        Self { infcx, trait_env: env, subst, universes: Vec::new(), opaque, revealing: Vec::new() }
     }
 
     /// The `impl Trait` a trait method returns is the one of the impl's method once the
@@ -363,7 +380,20 @@ pub(crate) fn monomorphized<'db>(
     subst: &StoredGenericArgs,
     trait_env: &StoredParamEnvAndCrate,
 ) -> Result<MirBody<'db>, MirLowerError<'db>> {
-    let mut filler = Filler::new(db, trait_env.as_ref(db), subst.as_ref());
+    let interner = DbInterner::new_with(db, trait_env.krate);
+    monomorphized_with(db, body, subst, trait_env, &|def, args| {
+        interner.type_of(def.into()).instantiate(interner, args).skip_norm_wip()
+    })
+}
+
+pub(crate) fn monomorphized_with<'db>(
+    db: &'db dyn HirDatabase,
+    body: &MirBody<'db>,
+    subst: &StoredGenericArgs,
+    trait_env: &StoredParamEnvAndCrate,
+    opaque: &dyn Fn(InternedOpaqueTyId<'db>, GenericArgs<'db>) -> Ty<'db>,
+) -> Result<MirBody<'db>, MirLowerError<'db>> {
+    let mut filler = Filler::new(db, trait_env.as_ref(db), subst.as_ref(), opaque);
     let mut body = body.clone();
     filler.fill_body(&mut body)?;
     Ok(body)
