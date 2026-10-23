@@ -25,9 +25,9 @@ fn reverse_twins(
 
 #[salsa::tracked(returns(copy))]
 fn decision_serial(db: &dyn HirDatabase, normal: Crate, test: Crate, both: bool) -> u128 {
-    let twins = hir_def::twins::twin_index(db, normal, test);
+    let twins = reverse_twins(db, normal, test);
     let eligibility = crate::sharing::pair_eligibility(db, normal, test, both);
-    let mut twins: Vec<_> = twins.twins.iter().map(|pair| super::print_of(&pair)).collect();
+    let mut twins: Vec<_> = twins.iter().map(|(&n, &t)| super::print_of(&(&t, &n))).collect();
     let mut full: Vec<_> = eligibility.candidates.iter().map(super::print_of).collect();
     let mut analysis: Vec<_> = eligibility.analysis_shared.iter().map(super::print_of).collect();
     twins.sort_unstable();

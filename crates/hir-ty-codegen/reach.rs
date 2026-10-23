@@ -9,6 +9,7 @@ use hir_def::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::IntoKind as _;
+use std::sync::Arc;
 
 use crate::next_solver::TyKind;
 
@@ -22,7 +23,7 @@ use super::{
     print_of, static_serial,
 };
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Node {
     Root(FunctionId),
     Instance(Instance, StoredParamEnvAndCrate),
@@ -51,20 +52,147 @@ impl Node {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct Graph {
     sharing: super::Sharing,
-    homes: super::home::Homes,
     ids: FxHashMap<Node, usize>,
-    /// The print of each node's own code and of the source locations it reports.
-    own: Vec<Option<u128>>,
+    nodes: Vec<Node>,
     edges: Vec<Vec<usize>>,
     /// The statics among the nodes that a running program can change.
     written: Vec<usize>,
     /// The crates an edit can change the code of.
-    edited: FxHashSet<Crate>,
+    edited: Arc<[Crate]>,
     /// The first nodes that did not compile, and why.
     unknown: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Input {
+    sharing: super::Sharing,
+    edited: Arc<[Crate]>,
+    tests: Vec<FunctionId>,
+    always: Vec<FunctionId>,
+    kept: Vec<StaticId>,
+}
+
+#[salsa::interned(debug, unsafe(no_lifetime), revisions = usize::MAX)]
+struct ReachInput {
+    #[returns(ref)]
+    data: Arc<Input>,
+}
+
+#[salsa::interned(debug, unsafe(no_lifetime), revisions = usize::MAX)]
+struct Component {
+    #[returns(ref)]
+    members: Vec<Node>,
+    #[returns(ref)]
+    below: Vec<Component>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Edges {
+    targets: Vec<Node>,
+    written: bool,
+    unknown: Option<String>,
+}
+
+fn settled(db: &dyn HirDatabase, node: &Node, edited: &[Crate]) -> bool {
+    let krate = match node {
+        Node::Root(func) => func.krate(db),
+        Node::Instance(Instance { def: InstanceDef::Fn(func), args, .. }, _)
+            if args.as_ref().iter().all(|it| it.region().is_some()) =>
+        {
+            func.krate(db)
+        }
+        Node::Instance(..) => return false,
+        Node::Static(id) => id.krate(db),
+    };
+    !edited.contains(&krate)
+}
+
+fn compiled<'db>(
+    db: &'db dyn HirDatabase,
+    node: &Node,
+    sharing: &super::Sharing,
+) -> Result<(u128, &'db Requests), &'db CodegenError> {
+    match node {
+        Node::Root(func) => super::program_root(db, *func, sharing)
+            .as_ref()
+            .map(|it| (super::program_root_serial(db, *func, sharing.clone()), &it.requests)),
+        Node::Instance(instance, env) => {
+            super::program_instance(db, instance.clone(), env.clone(), sharing).as_ref().map(|it| {
+                (
+                    super::program_instance_serial(
+                        db,
+                        instance.clone(),
+                        env.clone(),
+                        sharing.clone(),
+                    ),
+                    &it.requests,
+                )
+            })
+        }
+        Node::Static(id) => {
+            compiled_static(db, *id).as_ref().map(|it| (static_serial(db, *id), &it.requests))
+        }
+    }
+}
+
+#[salsa::tracked(returns(ref))]
+fn reach_edges(
+    db: &dyn HirDatabase,
+    node: Node,
+    sharing: super::Sharing,
+    edited: Arc<[Crate]>,
+) -> Edges {
+    let mut result = Edges { targets: Vec::new(), written: false, unknown: None };
+    if settled(db, &node, &edited) || foreign(db, &node) {
+        return result;
+    }
+    if let Node::Static(id) = node {
+        result.written = is_thread_local(db, id)
+            || compiled_static(db, id).as_ref().map_or(true, |it| it.writable);
+    }
+    let (_, requests) = match compiled(db, &node, &sharing) {
+        Ok(it) => it,
+        Err(why) => {
+            if !matches!(&node, Node::Instance(it, _) if names_type_id(db, it)) {
+                result.unknown = Some(format!("{}: {why:?}", node.name(db)));
+            }
+            return result;
+        }
+    };
+    let mut homes = super::home::Homes::default();
+    result.targets.extend(requests.funcs.iter().filter_map(|it| match &it.target {
+        FuncTarget::Instance(instance, env) => Some(match instance.def {
+            InstanceDef::Fn(func) if instance.args.as_ref().is_empty() => Node::Root(func),
+            _ => Node::Instance(instance.clone(), homes.home(db, instance, env)),
+        }),
+        FuncTarget::Symbol(_) | FuncTarget::Path(_) | FuncTarget::Asm(_) => None,
+    }));
+    result.targets.extend(requests.datas.iter().filter_map(|it| match it {
+        DataRequest::Static(id) => Some(Node::Static(*id)),
+        _ => None,
+    }));
+    result.targets.sort_by_key(print_of);
+    result.targets.dedup();
+    result
+}
+
+#[salsa::tracked(returns(copy))]
+fn reach_own(
+    db: &dyn HirDatabase,
+    node: Node,
+    sharing: super::Sharing,
+    edited: Arc<[Crate]>,
+) -> Option<u128> {
+    if settled(db, &node, &edited) || foreign(db, &node) {
+        return Some(0);
+    }
+    match compiled(db, &node, &sharing) {
+        Ok((serial, requests)) => Some(print_of(&Mark::new(db, serial, requests).seen())),
+        Err(_) => matches!(&node, Node::Instance(it, _) if names_type_id(db, it)).then_some(0),
+    }
 }
 
 /// Whether the instance is `core::any::TypeId::of::<T>`.
@@ -94,7 +222,7 @@ impl Graph {
         if let Some(&id) = self.ids.get(&node) {
             return id;
         }
-        let first = self.own.len();
+        let first = self.nodes.len();
         let mut stack = vec![(first, self.add(db, node).into_iter())];
         while let Some((id, targets)) = stack.last_mut() {
             let id = *id;
@@ -104,7 +232,7 @@ impl Graph {
             };
             let known = self.ids.get(&target).copied();
             let target = known.unwrap_or_else(|| {
-                let new = self.own.len();
+                let new = self.nodes.len();
                 stack.push((new, self.add(db, target).into_iter()));
                 new
             });
@@ -115,92 +243,26 @@ impl Graph {
 
     /// Takes the node in and says what it refers to.
     fn add(&mut self, db: &dyn HirDatabase, node: Node) -> Vec<Node> {
-        let id = self.own.len();
+        let id = self.nodes.len();
         self.ids.insert(node.clone(), id);
+        self.nodes.push(node.clone());
         self.edges.push(Vec::new());
-        if self.settled(db, &node) || foreign(db, &node) {
-            self.own.push(Some(0));
-            return Vec::new();
-        }
-        let compiled: Result<(u128, &Requests), &CodegenError> = match &node {
-            Node::Root(func) => super::program_root(db, *func, &self.sharing).as_ref().map(|it| {
-                (super::program_root_serial(db, *func, self.sharing.clone()), &it.requests)
-            }),
-            Node::Instance(instance, env) => {
-                super::program_instance(db, instance.clone(), env.clone(), &self.sharing)
-                    .as_ref()
-                    .map(|it| {
-                        (
-                            super::program_instance_serial(
-                                db,
-                                instance.clone(),
-                                env.clone(),
-                                self.sharing.clone(),
-                            ),
-                            &it.requests,
-                        )
-                    })
-            }
-            Node::Static(id) => {
-                compiled_static(db, *id).as_ref().map(|it| (static_serial(db, *id), &it.requests))
-            }
-        };
-        if let Node::Static(it) = node
-            && (is_thread_local(db, it)
-                || compiled_static(db, it).as_ref().map_or(true, |it| it.writable))
-        {
+        let edges = reach_edges(db, node, self.sharing.clone(), self.edited.clone());
+        if edges.written {
             self.written.push(id);
         }
-        let (serial, requests) = match compiled {
-            Ok(compiled) => compiled,
-            Err(why) => {
-                // `TypeId::of` is a number the build takes from rustc, of the type alone.
-                let known = matches!(&node, Node::Instance(it, _) if names_type_id(db, it));
-                if !known && self.unknown.len() < 8 {
-                    self.unknown.push(format!("{}: {why:?}", node.name(db)));
-                }
-                self.own.push(known.then_some(0));
-                return Vec::new();
-            }
-        };
-        self.own.push(Some(print_of(&Mark::new(db, serial, requests).seen())));
-        let funcs = requests.funcs.iter().filter_map(|it| match &it.target {
-            FuncTarget::Instance(instance, env) => Some(match instance.def {
-                InstanceDef::Fn(func) if instance.args.as_ref().is_empty() => Node::Root(func),
-                _ => Node::Instance(instance.clone(), self.homes.home(db, instance, env)),
-            }),
-            // Code rustc compiled, which is the same until cargo builds again, or a name the
-            // linker resolves, which the caller hands in as reached by everything.
-            FuncTarget::Symbol(_) | FuncTarget::Path(_) | FuncTarget::Asm(_) => None,
-        });
-        let statics = requests.datas.iter().filter_map(|it| match it {
-            DataRequest::Static(id) => Some(Node::Static(*id)),
-            _ => None,
-        });
-        funcs.chain(statics).collect()
-    }
-
-    /// Whether the node is of a crate no edit reaches, and of nothing else: a function
-    /// without type arguments, or a static. What it calls is then of such crates too,
-    /// unless it was handed it when the program ran, by code that is a node of its own.
-    fn settled(&self, db: &dyn HirDatabase, node: &Node) -> bool {
-        let krate = match node {
-            Node::Root(func) => func.krate(db),
-            Node::Instance(Instance { def: InstanceDef::Fn(func), args, .. }, _)
-                if args.as_ref().iter().all(|it| it.region().is_some()) =>
-            {
-                func.krate(db)
-            }
-            Node::Instance(..) => return false,
-            Node::Static(id) => id.krate(db),
-        };
-        !self.edited.contains(&krate)
+        if let Some(unknown) = &edges.unknown
+            && self.unknown.len() < 8
+        {
+            self.unknown.push(unknown.clone());
+        }
+        edges.targets.clone()
     }
     /// The strongly connected components, each after the ones it refers to, and the
     /// component of each node.
     fn components(&self) -> (Vec<Vec<usize>>, Vec<usize>) {
         const NONE: usize = usize::MAX;
-        let count = self.own.len();
+        let count = self.nodes.len();
         let (mut index, mut low) = (vec![NONE; count], vec![0; count]);
         let mut of = vec![NONE; count];
         let mut components: Vec<Vec<usize>> = Vec::new();
@@ -242,7 +304,7 @@ impl Graph {
 }
 
 /// A set of small numbers.
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Bits(Vec<u64>);
 
 impl Bits {
@@ -272,30 +334,32 @@ impl Bits {
 /// others. `always` and `kept` are what runs or is found without any code naming it: every
 /// test is taken to reach them. With it, the print of what all of them reach, and the first
 /// things reached that did not compile.
-pub fn reached(
-    db: &dyn HirDatabase,
-    sharing: super::Sharing,
-    mut edited: FxHashSet<Crate>,
-    tests: &[FunctionId],
-    always: &[FunctionId],
-    kept: &[StaticId],
-) -> (Vec<Reached>, Option<u128>, Vec<String>) {
-    sharing.edited_crates(&mut edited);
-    let mut graph = Graph { sharing, edited, ..Graph::default() };
-    let tests: Vec<usize> = tests.iter().map(|&it| graph.node(db, Node::Root(it))).collect();
-    let mut ambient: Vec<usize> = always.iter().map(|&it| graph.node(db, Node::Root(it))).collect();
-    ambient.extend(kept.iter().map(|&it| graph.node(db, Node::Static(it))));
+#[derive(Debug, PartialEq, Eq)]
+struct Topology {
+    graph: Graph,
+    components: Vec<Component>,
+    of: Vec<usize>,
+    tests: Vec<usize>,
+    ambient: Vec<usize>,
+    groups: Vec<usize>,
+}
+
+#[salsa::tracked(returns(ref))]
+fn reach_topology(db: &dyn HirDatabase, input: ReachInput) -> Topology {
+    let input = input.data(db);
+    let mut graph =
+        Graph { sharing: input.sharing.clone(), edited: input.edited.clone(), ..Graph::default() };
+    let tests: Vec<usize> = input.tests.iter().map(|&it| graph.node(db, Node::Root(it))).collect();
+    let mut ambient: Vec<usize> =
+        input.always.iter().map(|&it| graph.node(db, Node::Root(it))).collect();
+    ambient.extend(input.kept.iter().map(|&it| graph.node(db, Node::Static(it))));
     let (components, of) = graph.components();
     let written: FxHashMap<usize, usize> =
         graph.written.iter().enumerate().map(|(at, &node)| (node, at)).collect();
-    // Per component: the print of all it reaches, and the written statics among that.
-    let mut prints: Vec<Option<u128>> = Vec::with_capacity(components.len());
+    // Per component: its dependencies and the written statics among them.
+    let mut reachable = Vec::with_capacity(components.len());
     let mut shared: Vec<Bits> = Vec::with_capacity(components.len());
     for (at, members) in components.iter().enumerate() {
-        let mut own: Option<Vec<u128>> = members.iter().map(|&it| graph.own[it]).collect();
-        if let Some(own) = &mut own {
-            own.sort_unstable();
-        }
         let mut below: Vec<usize> =
             members.iter().flat_map(|&it| &graph.edges[it]).map(|&it| of[it]).collect();
         below.sort_unstable();
@@ -303,20 +367,16 @@ pub fn reached(
         below.retain(|&it| it != at);
         let mut statics = Bits::default();
         members.iter().filter_map(|it| written.get(it)).for_each(|&it| statics.insert(it));
-        let mut reached: Option<Vec<u128>> = below.iter().map(|&it| prints[it]).collect();
-        if let Some(reached) = &mut reached {
-            reached.sort_unstable();
-        }
         for &it in &below {
             statics.union(&shared[it]);
         }
-        prints.push(own.zip(reached).map(|it| print_of(&it)));
+        let mut members: Vec<_> = members.iter().map(|&it| graph.nodes[it].clone()).collect();
+        members.sort_by_key(print_of);
+        let mut below: Vec<_> = below.into_iter().map(|id| reachable[id]).collect();
+        below.sort_by_key(print_of);
+        reachable.push(Component::new(db, members, below));
         shared.push(statics);
     }
-    let mut everywhere: Vec<Option<u128>> = ambient.iter().map(|&it| prints[of[it]]).collect();
-    everywhere.sort_unstable();
-    everywhere.dedup();
-    let everywhere: Option<Vec<u128>> = everywhere.into_iter().collect();
     let mut ambient_shared = Bits::default();
     ambient.iter().for_each(|&it| ambient_shared.union(&shared[of[it]]));
     // The tests that reach a static in common are one group.
@@ -336,15 +396,109 @@ pub fn reached(
             group[a.max(b)] = a.min(b);
         }
     }
-    let alone: Vec<Option<u128>> = tests
-        .iter()
-        .map(|&it| prints[of[it]].zip(everywhere.as_ref()).map(|it| print_of(&it)))
-        .collect();
     let group: Vec<usize> = (0..tests.len()).map(|at| find(&mut group, at)).collect();
+    Topology { graph, components: reachable, of, tests, ambient, groups: group }
+}
+
+#[salsa::tracked(returns(copy))]
+fn reach_component_print(
+    db: &dyn HirDatabase,
+    component: Component,
+    sharing: super::Sharing,
+    edited: Arc<[Crate]>,
+) -> Option<u128> {
+    let mut own: Option<Vec<u128>> = component
+        .members(db)
+        .iter()
+        .map(|node| reach_own(db, node.clone(), sharing.clone(), edited.clone()))
+        .collect();
+    if let Some(own) = &mut own {
+        own.sort_unstable();
+    }
+    let mut below: Option<Vec<u128>> = component
+        .below(db)
+        .iter()
+        .map(|&component| reach_component_print(db, component, sharing.clone(), edited.clone()))
+        .collect();
+    if let Some(below) = &mut below {
+        below.sort_unstable();
+    }
+    own.zip(below).map(|it| print_of(&it))
+}
+
+#[salsa::tracked(returns(ref))]
+fn reach_ambient_components(db: &dyn HirDatabase, input: ReachInput) -> Vec<Component> {
+    let topology = reach_topology(db, input);
+    topology.ambient.iter().map(|&id| topology.components[topology.of[id]]).collect()
+}
+
+#[salsa::tracked(returns(ref))]
+fn reach_ambient(db: &dyn HirDatabase, input: ReachInput) -> Option<Vec<u128>> {
+    let mut prints: Vec<_> = reach_ambient_components(db, input)
+        .iter()
+        .map(|&component| {
+            reach_component_print(
+                db,
+                component,
+                input.data(db).sharing.clone(),
+                input.data(db).edited.clone(),
+            )
+        })
+        .collect();
+    prints.sort_unstable();
+    prints.dedup();
+    prints.into_iter().collect()
+}
+
+#[salsa::tracked(returns(copy))]
+fn reach_root_component(db: &dyn HirDatabase, input: ReachInput, test: usize) -> Component {
+    let topology = reach_topology(db, input);
+    topology.components[topology.of[topology.tests[test]]]
+}
+
+#[salsa::tracked(returns(copy))]
+fn reach_root_code(db: &dyn HirDatabase, input: ReachInput, test: usize) -> Option<u128> {
+    reach_component_print(
+        db,
+        reach_root_component(db, input, test),
+        input.data(db).sharing.clone(),
+        input.data(db).edited.clone(),
+    )
+}
+
+#[salsa::tracked(returns(copy))]
+fn reach_root_print(db: &dyn HirDatabase, input: ReachInput, test: usize) -> Option<u128> {
+    reach_root_code(db, input, test).zip(reach_ambient(db, input).as_ref()).map(|it| print_of(&it))
+}
+
+pub fn reached(
+    db: &dyn HirDatabase,
+    sharing: super::Sharing,
+    mut edited: FxHashSet<Crate>,
+    tests: &[FunctionId],
+    always: &[FunctionId],
+    kept: &[StaticId],
+) -> (Vec<Reached>, Option<u128>, Vec<String>) {
+    sharing.edited_crates(&mut edited);
+    let mut edited: Vec<_> = edited.into_iter().collect();
+    edited.sort_by_key(print_of);
+    let input = ReachInput::new(
+        db,
+        Arc::new(Input {
+            sharing,
+            edited: edited.into(),
+            tests: tests.to_vec(),
+            always: always.to_vec(),
+            kept: kept.to_vec(),
+        }),
+    );
+    let topology = reach_topology(db, input);
+    let alone: Vec<_> = (0..tests.len()).map(|id| reach_root_print(db, input, id)).collect();
+    let group = &topology.groups;
     // What one test of a group leaves in a static is what another finds: each has the
     // result it has for the code of all of them.
     let mut together: FxHashMap<usize, Option<Vec<u128>>> = FxHashMap::default();
-    for (&group, &print) in std::iter::zip(&group, &alone) {
+    for (&group, &print) in std::iter::zip(group, &alone) {
         let prints = together.entry(group).or_insert_with(|| Some(Vec::new()));
         match (prints.as_mut(), print) {
             (Some(prints), Some(print)) => prints.push(print),
@@ -352,11 +506,11 @@ pub fn reached(
         }
     }
     together.values_mut().flatten().for_each(|it| it.sort_unstable());
-    let reached = std::iter::zip(group, alone)
+    let reached = std::iter::zip(group.iter().copied(), alone)
         .map(|(group, alone)| {
             let all = together[&group].as_ref();
             Reached { print: alone.zip(all).map(|it| print_of(&it)), group }
         })
         .collect();
-    (reached, everywhere.as_ref().map(print_of), graph.unknown)
+    (reached, reach_ambient(db, input).as_ref().map(print_of), topology.graph.unknown.clone())
 }

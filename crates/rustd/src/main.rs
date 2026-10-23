@@ -5685,7 +5685,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
     }
     memory::report(&mut db, "warm-up")?;
     eprintln!("watching {} files", files.len());
-    ide_db::executions::take(&db);
+    trace_queries(&db);
     // Requests wait here while a build is under way, and those that have come by the time it
     // is done are built together.
     let (sender, events) = std::sync::mpsc::channel();
@@ -6891,6 +6891,7 @@ impl Program {
                 warm.looked.rejected_asked,
             );
         }
+        trace_queries(db);
         eprintln!("edit-to-binary: {total:.1?}");
         if let Some(why) = failed {
             return Ok(Err(why));
@@ -7090,6 +7091,15 @@ fn lint_of(
         })
         .collect();
     Ok(lint::linted(db, &crates, &paths))
+}
+
+fn trace_queries(db: &RootDatabase) {
+    let ran = ide_db::executions::take(db);
+    if std::env::var_os("RUSTD_TRACE").is_some() {
+        let ran: Vec<_> =
+            ran.into_iter().map(|(query, count)| format!("{query}={count}")).collect();
+        eprintln!("queries: {}", ran.join(" "));
+    }
 }
 
 /// What each test of a program can run, as [`Tests::reached`] writes it.

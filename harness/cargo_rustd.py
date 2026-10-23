@@ -1567,7 +1567,7 @@ def test_graph_sharing_incremental(work):
         ws = os.path.realpath(os.path.join(work, "sharing-incremental-" + mode))
         functions = "\n".join(f"pub fn f{i}<T: Copy>(x: T) -> (T, u64) {{ (x, if enabled(1) {{ {i} }} else {{ 0 }}) }}" for i in range(400))
         total = "+".join(f"f{i}(1u64).1" for i in range(400))
-        feature = "pub fn enabled(x: u64) -> bool { x != 0 }\n" + functions + "\n"
+        feature = "pub fn enabled(x: u64) -> bool { x != 0 }\nfn identity(x: u64) -> u64 { x }\n" + functions + "\n"
         reports = "\n".join(f'#[test] fn report{i}() -> Result<(), &\'static str> {{ Ok(()) }}' for i in range(20))
         files = {
             "Cargo.toml": '[package]\nname="sharing_incremental"\nversion="0.1.0"\nedition="2021"\n[workspace]\nmembers=["probe"]\n[dev-dependencies]\nprobe={path="probe"}\n',
@@ -1597,7 +1597,7 @@ pub fn total() -> u64 {{ {total} }}
         store = os.path.join(work, "store-sharing-incremental-" + mode)
         for prime in ("cold", "retained"):
             env = dict(base_env(os.path.join(work, f"hi-{mode}-{prime[0]}")), RUSTD_CACHE=store,
-                       RUSTD_STATS="1", RUSTD_CFG_SHARING="1" if mode == "on" else "0")
+                       RUSTD_STATS="1", RUSTD_TRACE="1", RUSTD_CFG_SHARING="1" if mode == "on" else "0")
             side = Side(ws, env, True)
             def logs():
                 return {path: path.read_text(errors="replace") for path in pathlib.Path(env["RUSTD_HOME"]).glob("**/log")}
@@ -1605,6 +1605,7 @@ pub fn total() -> u64 {{ {total} }}
                 _, built = side.cargo("test", "--lib")
                 wait_warm(side, ws)
                 before = logs()
+                primed = "\n".join(before.values())
                 pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "let enabled = x != 0;\n    enabled"))
                 _, edited = side.cargo("test", "--lib")
                 fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
@@ -1621,6 +1622,24 @@ pub fn total() -> u64 {{ {total} }}
                 held = "patch reports: 0 of 20" in fresh
                 checks.append((name, held, fresh[-700:]))
                 print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                for query, limit in [("reach_topology", 0), ("reach_root_code", 1)] + ([("pair_eligibility", 0), ("decision_serial", 0)] if mode == "on" else []):
+                    name = f"cfg sharing: {mode} {prime}-prime {query} executions <= {limit}"
+                    count_ran = sum(map(int, re.findall(rf"\b{query}=(\d+)", fresh)))
+                    held = ("queries:" in fresh and re.search(rf"\b{query}=\d+", primed) is not None
+                            and count_ran <= limit)
+                    checks.append((name, held, f"executed {count_ran}"))
+                    print(f"  {'ok ' if held else 'NOT'} {name}: {count_ran}", flush=True)
+                before = logs()
+                pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "identity(x) != 0"))
+                _, edge_edit = side.cargo("test", "--lib")
+                fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                name = f"cfg sharing: {mode} {prime}-prime edge edit leaves unrelated roots cached"
+                topology_ran = sum(map(int, re.findall(r"\breach_topology=(\d+)", fresh)))
+                roots_ran = sum(map(int, re.findall(r"\breach_root_code=(\d+)", fresh)))
+                held = edge_edit.returncode == 0 and topology_ran == 1 and roots_ran == 1
+                detail = f"topology {topology_ran}, roots {roots_ran}"
+                checks.append((name, held, detail))
+                print(f"  {'ok ' if held else 'NOT'} {name}: {detail}", flush=True)
                 if mode == "on" and prime == "cold":
                     source = files["src/lib.rs"]
                     cases = [
