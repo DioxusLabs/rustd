@@ -588,9 +588,7 @@ impl CodegenUnit {
         known: &mut Rejections,
     ) -> Result<CodegenUnit> {
         let mut sharing = roots.sharing.clone();
-        if !sharing.is_empty() {
-            known.base = None;
-        }
+        sharing.prewarm(db);
         let mut sharing_restarts = 0;
         let on_demand: FxHashSet<FunctionId> = roots.on_demand.iter().copied().collect();
         let all = || roots.entries.iter().chain(roots.on_demand).copied();
@@ -632,7 +630,7 @@ impl CodegenUnit {
                 backend::Tally::global().report();
                 let compiled_now = known.compiled_since_last_build();
                 known.stats = BuildStats {
-                    sharing: SharingStats::default(),
+                    sharing: patch.sharing,
                     bodies: base.bodies,
                     reused: base.bodies.saturating_sub(compiled_now),
                     compiled: compiled_now,
@@ -654,8 +652,7 @@ impl CodegenUnit {
                 return Ok(unit);
             }
         }
-        let needs_patch = known.patching;
-        let patching = needs_patch && sharing.is_empty();
+        let patching = known.patching;
         let used_by_rustc = known.used_by_rustc;
         // FIXME: a rejection outlives an edit that would lift it. Dropping them here costs one
         // full pass per rejected call chain, and they go away with the rustc fallback.
@@ -937,7 +934,7 @@ impl CodegenUnit {
                 }
                 backend::Tally::global().report();
                 (*theirs, *unknown) = (own_statics.theirs, own_statics.unknown);
-                let patch = if needs_patch { Some(patch::empty_object()?) } else { None };
+                let patch = if patching { Some(patch::empty_object()?) } else { None };
                 return Ok(CodegenUnit {
                     object: Some(object),
                     patch,
@@ -1651,6 +1648,21 @@ fn instance_serial(db: &dyn HirDatabase, instance: Instance, env: StoredParamEnv
 }
 
 #[salsa::tracked(returns(copy))]
+fn program_root_serial(db: &dyn HirDatabase, func: FunctionId, sharing: Sharing) -> u128 {
+    program_root(db, func, &sharing).as_ref().map_or(0, print_of)
+}
+
+#[salsa::tracked(returns(copy))]
+fn program_instance_serial(
+    db: &dyn HirDatabase,
+    instance: Instance,
+    env: StoredParamEnvAndCrate,
+    sharing: Sharing,
+) -> u128 {
+    program_instance(db, instance, env, &sharing).as_ref().map_or(0, print_of)
+}
+
+#[salsa::tracked(returns(copy))]
 fn static_serial(db: &dyn HirDatabase, id: StaticId) -> u128 {
     compiled_static(db, id).as_ref().map_or(0, print_of)
 }
@@ -2279,16 +2291,22 @@ fn program_instance_body<'db>(
         _ => unsupported!("analysis-sharing a shim"),
     }
     .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
-    let mapped = match analysis {
-        Some((source, _)) => remap::body(db, sharing, source, raw)?,
-        None => remap::opaques(db, sharing, raw)?,
-    };
-    remap::monomorphized(db, sharing, &mapped, &instance.args, &env).map(Cow::Owned).map_err(|e| {
-        if std::env::var_os("RUSTD_CFG_SHARING_TRACE").is_some() {
-            eprintln!("sharing mono error: {instance:?}, env {:?}: {e:?}", env.krate);
-        }
-        CodegenError::Frontend(format!("mir: {e:?}"))
-    })
+    let tally = backend::Tally::global();
+    let mapped = tally.step(Step::Remap, || match analysis {
+        Some((source, _)) => remap::body(db, sharing, source, raw),
+        None => remap::opaques(db, sharing, raw),
+    })?;
+    tally
+        .step(Step::Monomorphize, || {
+            remap::monomorphized(db, sharing, &mapped, &instance.args, &env)
+        })
+        .map(Cow::Owned)
+        .map_err(|e| {
+            if std::env::var_os("RUSTD_CFG_SHARING_TRACE").is_some() {
+                eprintln!("sharing mono error: {instance:?}, env {:?}: {e:?}", env.krate);
+            }
+            CodegenError::Frontend(format!("mir: {e:?}"))
+        })
 }
 
 /// The types a body takes and returns, which is all its callers have to know about it. Asked

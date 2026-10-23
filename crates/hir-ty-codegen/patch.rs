@@ -26,8 +26,9 @@ use super::{
     compiled_static, declaration_location,
     fragment::{CompiledFunction, DataRequest, FuncTarget, Requests},
     home::{body_file, body_files},
-    instance_serial, is_thread_local, left_to_rustc, root_serial, row_location, source_location,
-    static_serial, target,
+    instance_serial, is_thread_local, left_to_rustc, program_instance, program_instance_serial,
+    program_root, program_root_serial, root_serial, row_location, source_location, static_serial,
+    target,
 };
 
 /// What a compiled function or static was when the base took it in.
@@ -301,6 +302,8 @@ impl Frozen {
 /// The last object built in full, as far as patching it goes.
 #[derive(Clone)]
 pub(super) struct Base {
+    sharing: super::Sharing,
+    decisions: Vec<u128>,
     /// Whether the object says which lines its code is of, as a patch of it then does.
     debug: bool,
     entries: Vec<FunctionId>,
@@ -487,6 +490,7 @@ pub(super) struct Patch {
     pub(super) object: Vec<u8>,
     pub(super) bodies: usize,
     pub(super) phases: Phases,
+    pub(super) sharing: super::SharingStats,
 }
 
 /// An object that defines nothing.
@@ -513,17 +517,25 @@ impl Base {
         compiled: &[(FunctionId, String)],
         skipped: &[(FunctionId, CodegenError)],
     ) -> Option<Base> {
+        let sharing = &cg.sharing;
         let decls = cg.module.declarations();
         let debug = cg.debug.is_some();
         let root_mark = |db: &dyn HirDatabase, root| {
-            let compiled = compiled_root(db, root).as_ref().ok()?;
-            Some(Mark::of_function(db, root_serial(db, root), compiled, debug))
+            let compiled = program_root(db, root, sharing).as_ref().ok()?;
+            Some(Mark::of_function(
+                db,
+                program_root_serial(db, root, sharing.clone()),
+                compiled,
+                debug,
+            ))
         };
         let instance_mark =
             |db: &dyn HirDatabase, (instance, env): &(Instance, StoredParamEnvAndCrate)| {
-                let compiled = compiled_instance(db, instance.clone(), env.clone()).as_ref().ok();
+                let compiled =
+                    program_instance(db, instance.clone(), env.clone(), sharing).as_ref().ok();
                 let mark = compiled.map(|it| {
-                    let serial = instance_serial(db, instance.clone(), env.clone());
+                    let serial =
+                        program_instance_serial(db, instance.clone(), env.clone(), sharing.clone());
                     Mark::of_function(db, serial, it, debug)
                 });
                 (mark, body_files(db, instance))
@@ -593,10 +605,11 @@ impl Base {
             }
         };
         for &(root, _) in compiled {
-            note(Node::Root(root), &compiled_root(db, root).as_ref().ok()?.requests);
+            note(Node::Root(root), &program_root(db, root, sharing).as_ref().ok()?.requests);
         }
         for (instance, known) in &instances {
-            if let Ok(compiled) = compiled_instance(db, instance.clone(), known.env.clone()) {
+            if let Ok(compiled) = program_instance(db, instance.clone(), known.env.clone(), sharing)
+            {
                 note(Node::Instance(instance.clone()), &compiled.requests);
             }
         }
@@ -622,7 +635,7 @@ impl Base {
             .rejected
             .iter()
             .filter(|(instance, it)| {
-                compiled_instance(db, (*instance).clone(), it.env.clone()).is_err()
+                program_instance(db, (*instance).clone(), it.env.clone(), sharing).is_err()
             })
             .map(|(instance, it)| (instance.clone(), it.env.clone()))
             .collect();
@@ -630,6 +643,8 @@ impl Base {
         let files: Vec<FileId> =
             compiled.iter().map(|&(root, _)| body_file(db, root.into())).collect();
         Some(Base {
+            sharing: sharing.clone(),
+            decisions: sharing.decisions(db),
             debug,
             rejected,
             entries: entries.to_vec(),
@@ -775,13 +790,18 @@ impl Base {
     pub(super) fn stale(&self, db: &dyn HirDatabase, part: usize, parts: usize) -> Stale {
         let start = stdx::time::Instant::now();
         let mut stale = Stale::default();
+        if self.decisions != self.sharing.decisions(db) {
+            return stale.declined("cfg sharing decisions changed");
+        }
         let every = |len: usize| (part..len).step_by(parts);
         // A check of the skipping below: looks at what no edit can have changed too, and says
         // so if one did.
         let check_all = std::env::var_os("RUSTD_CHECK_ALL").is_some();
         for i in every(self.rejected.len()) {
             let (instance, env) = &self.rejected[i];
-            let compiles = probe(|| compiled_instance(db, instance.clone(), env.clone()).is_ok());
+            let compiles = probe(|| {
+                program_instance(db, instance.clone(), env.clone(), &self.sharing).is_ok()
+            });
             if compiles != Some(false) {
                 return stale.declined("an instance that did not compile is another now");
             }
@@ -796,8 +816,13 @@ impl Base {
             }
             let asked = stdx::time::Instant::now();
             let mark = probe(|| {
-                let compiled = compiled_root(db, root).as_ref().ok()?;
-                Some(Mark::of_function(db, root_serial(db, root), compiled, self.debug))
+                let compiled = program_root(db, root, &self.sharing).as_ref().ok()?;
+                Some(Mark::of_function(
+                    db,
+                    program_root_serial(db, root, self.sharing.clone()),
+                    compiled,
+                    self.debug,
+                ))
             });
             stale.steps.roots_asked += 1;
             stale.steps.slowest = stale.steps.slowest.max(asked.elapsed());
@@ -823,9 +848,15 @@ impl Base {
             }
             let asked = stdx::time::Instant::now();
             let mark = probe(|| {
-                let compiled = compiled_instance(db, instance.clone(), was.env.clone());
+                let compiled =
+                    program_instance(db, instance.clone(), was.env.clone(), &self.sharing);
                 compiled.as_ref().ok().map(|it| {
-                    let serial = instance_serial(db, instance.clone(), was.env.clone());
+                    let serial = program_instance_serial(
+                        db,
+                        instance.clone(),
+                        was.env.clone(),
+                        self.sharing.clone(),
+                    );
                     Mark::of_function(db, serial, it, self.debug)
                 })
             });
@@ -960,9 +991,12 @@ impl Base {
             return true;
         }
         let requests = match parent {
-            Node::Root(root) => compiled_root(db, *root).as_ref().ok().map(|it| &it.requests),
+            Node::Root(root) => {
+                program_root(db, *root, &self.sharing).as_ref().ok().map(|it| &it.requests)
+            }
             Node::Instance(instance) => self.instances.get(instance).and_then(|known| {
-                let compiled = compiled_instance(db, instance.clone(), known.env.clone());
+                let compiled =
+                    program_instance(db, instance.clone(), known.env.clone(), &self.sharing);
                 compiled.as_ref().ok().map(|it| &it.requests)
             }),
             Node::Static(id) => compiled_static(db, *id).as_ref().ok().map(|it| &it.requests),
@@ -999,6 +1033,9 @@ impl Base {
         stale: Vec<Stale>,
     ) -> Result<std::result::Result<Patch, &'static str>> {
         let start = stdx::time::Instant::now();
+        if roots.sharing != self.sharing || self.decisions != self.sharing.decisions(db) {
+            return Ok(Err("cfg sharing decisions changed"));
+        }
         if roots.entries != self.entries {
             return Ok(Err("the roots compiled whether called or not changed"));
         }
@@ -1049,6 +1086,13 @@ impl Base {
             Some(self),
             false,
         )?;
+        cg.sharing = self.sharing.clone();
+        cg.counting_sharing = roots.sharing.clone();
+        if cg.sharing.tentative() {
+            if let Some(entries) = cg.entries.as_mut() {
+                std::sync::Arc::get_mut(entries).expect("a new cache reader").type_ids = false;
+            }
+        }
         cg.phases.compile = verify;
         // What nothing reached any more can be reached again by the code compiled now.
         cg.replaced = unchanged;
@@ -1058,7 +1102,8 @@ impl Base {
         // rustc's copies are the ones the base was built against: what they call is in it.
         for instance in &changed_instances {
             let was = &self.instances[instance];
-            let Ok(compiled) = compiled_instance(db, instance.clone(), was.env.clone()).as_ref()
+            let Ok(compiled) =
+                program_instance(db, instance.clone(), was.env.clone(), &self.sharing).as_ref()
             else {
                 return Ok(Err("an instance of the base no longer compiles"));
             };
@@ -1111,11 +1156,14 @@ impl Base {
                 return Ok(Err("a function now shares an `async` block with one left to rustc"));
             }
         }
-        let (bodies, mut phases) = (cg.bodies, cg.phases);
+        let (bodies, mut phases, sharing) = (cg.bodies, cg.phases, cg.sharing_stats);
+        if cg.sharing_restart {
+            return Ok(Err("a shared type reaches TypeId"));
+        }
         let start = stdx::time::Instant::now();
         let (object, _) = cg.finish()?;
         phases.object = start.elapsed();
-        Ok(Ok(Patch { object, bodies, phases }))
+        Ok(Ok(Patch { object, bodies, phases, sharing }))
     }
 }
 

@@ -24,6 +24,19 @@ fn analysis_twins(
     hir_def::twins::twin_index(db, normal, test).twins.iter().map(|(&t, &n)| (n, t)).collect()
 }
 
+#[salsa::tracked(returns(copy))]
+fn decision_serial(db: &dyn HirDatabase, normal: Crate, test: Crate, both: bool) -> u128 {
+    let twins = hir_def::twins::twin_index(db, normal, test);
+    let eligibility = crate::sharing::pair_eligibility(db, normal, test, both);
+    let mut twins: Vec<_> = twins.twins.iter().map(|pair| super::print_of(&pair)).collect();
+    let mut full: Vec<_> = eligibility.candidates.iter().map(super::print_of).collect();
+    let mut analysis: Vec<_> = eligibility.analysis_shared.iter().map(super::print_of).collect();
+    twins.sort_unstable();
+    full.sort_unstable();
+    analysis.sort_unstable();
+    super::print_of(&(twins, full, analysis, &eligibility.pair_veto))
+}
+
 /// The crate copies present in one program. An empty policy compiles without sharing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Sharing {
@@ -32,6 +45,26 @@ pub struct Sharing {
 }
 
 impl Sharing {
+    pub(super) fn prewarm(&self, db: &dyn HirDatabase) {
+        if self.is_empty() {
+            return;
+        }
+        let tally = super::backend::Tally::global();
+        for &(normal, test, both) in &self.pairs {
+            tally.step(super::Step::TwinIndex, || hir_def::twins::twin_index(db, normal, test));
+            tally.step(super::Step::Eligibility, || {
+                crate::sharing::pair_eligibility(db, normal, test, both)
+            });
+        }
+    }
+
+    pub(super) fn decisions(&self, db: &dyn HirDatabase) -> Vec<u128> {
+        if self.is_empty() {
+            return Vec::new();
+        }
+        self.pairs.iter().map(|&(n, t, both)| decision_serial(db, n, t, both)).collect()
+    }
+
     pub fn new(pairs: Vec<(Crate, Crate, bool)>) -> Self {
         Self { pairs, enabled: true }
     }
@@ -296,11 +329,7 @@ impl Sharing {
     fn link_item(&self, db: &dyn HirDatabase, item: AttrDefId) -> AttrDefId {
         for &(normal, test, both) in &self.pairs {
             if !both && item.module(db).krate(db) == normal {
-                if let Some((&t, _)) = hir_def::twins::twin_index(db, normal, test)
-                    .twins
-                    .iter()
-                    .find(|(_, n)| **n == item)
-                {
+                if let Some(&t) = analysis_twins(db, normal, test, both).get(&item) {
                     return t;
                 }
             }
@@ -312,6 +341,11 @@ impl Sharing {
         if self.is_empty() {
             return instance.clone();
         }
+        super::backend::Tally::global()
+            .step(super::Step::Canonicalize, || self.canonical_instance(db, instance))
+    }
+
+    fn canonical_instance(&self, db: &dyn HirDatabase, instance: &Instance) -> Instance {
         let Some(krate) = self.pairs.first().map(|it| it.0) else { return instance.clone() };
         let args = self.fold(db, krate, instance.args.as_ref());
         // A test-only argument can select an impl absent from N's trait namespace.
@@ -405,9 +439,8 @@ impl Sharing {
         }
         for &(normal, test, both) in &self.pairs {
             if !both && func.krate(db) == normal {
-                let twins = hir_def::twins::twin_index(db, normal, test);
-                if let Some((&AttrDefId::FunctionId(t), _)) =
-                    twins.twins.iter().find(|(_, n)| **n == func.into())
+                if let Some(&AttrDefId::FunctionId(t)) =
+                    analysis_twins(db, normal, test, both).get(&func.into())
                 {
                     return t;
                 }

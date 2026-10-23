@@ -1271,6 +1271,7 @@ pub fn hidden_size() -> usize { graph_sharing::hidden_size() }
         "src/main.rs": 'fn main() { println!("{}", graph_sharing::shared()); }\n',
         "src/lib.rs": '''use std::sync::atomic::{AtomicUsize, Ordering};
 #[inline(never)] pub fn shared() -> u32 { 40 + 2 }
+pub fn share_switch() -> u32 { 17 }
 pub async fn shared_async() -> u32 { 13 }
 #[cfg(test)] const LEASE: u32 = 1;
 #[cfg(not(test))] const LEASE: u32 = 900;
@@ -1369,6 +1370,7 @@ pub fn hidden_size() -> usize { std::mem::size_of_val(&changed()) }
         assert_eq!(super::lease(), 1);
         assert!(super::tested());
         assert_eq!(super::caller(), 9);
+        assert_eq!(super::share_switch(), 17);
         assert_eq!(super::const_operand(), 19);
         assert_eq!(super::analysis_closure(), 9);
         assert_eq!(super::analysis_result(true), Ok(9));
@@ -1476,9 +1478,17 @@ pub fn hidden_size() -> usize { std::mem::size_of_val(&changed()) }
         _, edited = side.cargo("run", "--bin", "graph_sharing")
         fresh = log(before)
         check("CLI shared edit splices one function", edited.returncode == 0 and edited.stdout.strip() == "43" and "spliced: 1 functions redirected" in fresh, edited.stderr[-200:] + fresh[-600:])
+        before = snapshot()
         _, tests = side.cargo("test")
         check("both programs observe shared edit", tests.returncode == 0 and how_built(tests.stderr) == "daemon" and "tests::both_copies" in tests.stdout and "test normal_copy" in tests.stdout, tests.stderr[-300:])
+        fresh = log(before)
+        check("test shared edit patches with sharing", fresh.count("patch:") >= 2 and "spliced:" in fresh and "the whole object was written again" not in fresh, fresh[-900:])
         source = pathlib.Path(ws, "src/lib.rs")
+        source.write_text(source.read_text().replace("share_switch() -> u32 { 17 }", "share_switch() -> u32 { if cfg!(test) { 19 } else { 17 } }").replace("super::share_switch(), 17", "super::share_switch(), 19"))
+        before = snapshot()
+        _, switched = side.cargo("test")
+        fresh = log(before)
+        check("changed sharing decisions rebuild", switched.returncode == 0 and "cfg sharing decisions changed" in fresh, switched.stderr[-300:] + fresh[-900:])
         probe = pathlib.Path(ws, "probe/src/lib.rs")
         probe.write_text(probe.read_text() + '\npub fn boxed() -> Box<dyn std::any::Any> { Box::new(graph_sharing::Shape) }\n')
         source.write_text(source.read_text() + '''

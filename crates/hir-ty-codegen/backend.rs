@@ -268,10 +268,14 @@ pub(super) enum Step {
     StoreRead,
     /// Encoding an entry and adding it to the store.
     StoreWrite,
+    TwinIndex,
+    Eligibility,
+    Canonicalize,
+    Remap,
 }
 
 impl Step {
-    const COUNT: usize = 7;
+    const COUNT: usize = 11;
     const ALL: [(Step, &str); Step::COUNT] = [
         (Step::Infer, "infer"),
         (Step::Mir, "mir"),
@@ -280,6 +284,10 @@ impl Step {
         (Step::Describe, "describe"),
         (Step::StoreRead, "store read"),
         (Step::StoreWrite, "store write"),
+        (Step::TwinIndex, "twin index"),
+        (Step::Eligibility, "eligibility"),
+        (Step::Canonicalize, "canonicalize"),
+        (Step::Remap, "remap"),
     ];
 }
 
