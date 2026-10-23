@@ -485,6 +485,7 @@ impl Entry {
 
 /// The entries of the store that one program was asked about.
 pub(super) struct Entries {
+    pub(super) type_ids: bool,
     store: &'static Store,
     /// Whether the entries asked for are the ones with what a debugger is told.
     debug: bool,
@@ -700,7 +701,15 @@ impl Entries {
         cargo_home: Option<String>,
         library: Option<super::LibrarySources>,
     ) -> Entries {
-        Entries { store, debug, program, cargo_home, library, known: Mutex::default() }
+        Entries {
+            type_ids: true,
+            store,
+            debug,
+            program,
+            cargo_home,
+            library,
+            known: Mutex::default(),
+        }
     }
 
     /// Never use the entry again in this process: it did not fit the object it was read for.
@@ -788,12 +797,17 @@ impl Entries {
     /// Whether there is an entry for `name` and for everything it calls, and what they import
     /// is in the program, as `defines` tells.
     pub(super) fn usable(&self, name: &str, defines: &dyn Fn(&str) -> bool) -> bool {
+        let links = |entry: &Entry| {
+            entry.links(defines)
+                && (self.type_ids
+                    || !entry.funcs.iter().any(|it| matches!(it.target, CachedTarget::TypeId(_))))
+        };
         let Some(key) = Entry::key(name, self.debug, self.program.as_ref()) else { return false };
         let settled = |key: &[u8; KEY]| self.known().usable.get(key).copied();
         if let Some(usable) = settled(&key) {
             return usable;
         }
-        let Some(entry) = self.get_key(name, key).filter(|it| it.links(defines)) else {
+        let Some(entry) = self.get_key(name, key).filter(|it| links(it)) else {
             self.settle(key, false);
             return false;
         };
@@ -835,7 +849,7 @@ impl Entries {
             let found = match settled(&key) {
                 Some(true) => continue,
                 Some(false) => None,
-                None => self.get_key(callee, key).filter(|it| it.links(defines)),
+                None => self.get_key(callee, key).filter(|it| links(it)),
             };
             let Some(entry) = found else {
                 self.settle(key, false);
@@ -966,6 +980,22 @@ mod tests {
             assert!(entries.usable("b", &|_| true));
             let first = entries.get("a").unwrap();
             assert!(Arc::ptr_eq(&first, &entries.get("a").unwrap()));
+        });
+    }
+
+    #[test]
+    fn type_ids_are_recompiled_through_cached_call_chains() {
+        with_entries(|entries| {
+            keep_entry(entries, "plain", Vec::new());
+            keep_entry(entries, "caller", vec![CachedTarget::Named("id".to_owned())]);
+            keep_entry(entries, "id", vec![CachedTarget::TypeId(42)]);
+            assert!(entries.usable("caller", &|_| true));
+            let mut restricted = Entries::new(entries.store, true, None, None, None);
+            restricted.type_ids = false;
+            assert!(restricted.usable("plain", &|_| true));
+            assert!(!restricted.usable("id", &|_| true));
+            assert!(!restricted.usable("caller", &|_| true));
+            assert!(!restricted.usable("missing", &|_| true));
         });
     }
 

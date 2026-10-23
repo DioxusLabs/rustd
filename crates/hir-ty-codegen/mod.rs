@@ -110,6 +110,8 @@ mod llvm;
 mod patch;
 mod promote;
 mod settled;
+mod sharing;
+pub use sharing::Sharing;
 mod stable;
 pub use stable::{block_place, lower_declared};
 mod store;
@@ -523,8 +525,9 @@ pub struct CodegenUnit {
 }
 
 /// The functions a build starts from.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Roots<'a> {
+    pub sharing: Sharing,
     /// Compiled whether or not anything calls them.
     pub entries: &'a [FunctionId],
     /// Compiled once code in the object refers to them. A function not reached keeps rustc's
@@ -552,6 +555,11 @@ impl CodegenUnit {
         denied: &FxHashSet<FunctionId>,
         known: &mut Rejections,
     ) -> Result<CodegenUnit> {
+        let mut sharing = roots.sharing.clone();
+        if !sharing.is_empty() {
+            known.base = None;
+        }
+        let mut sharing_restarts = 0;
         let on_demand: FxHashSet<FunctionId> = roots.on_demand.iter().copied().collect();
         let all = || roots.entries.iter().chain(roots.on_demand).copied();
         let mut declined = None;
@@ -570,8 +578,16 @@ impl CodegenUnit {
             if stale.is_empty() {
                 stale.push(base.stale(db, 0, 1));
             }
-            let patch =
-                base.patch(db, symbols, roots, &on_demand, denied, known, own_statics, stale);
+            let patch = base.patch(
+                db,
+                symbols,
+                roots.clone(),
+                &on_demand,
+                denied,
+                known,
+                own_statics,
+                stale,
+            );
             let patch = match patch {
                 Ok(Ok(patch)) => Some(patch),
                 Ok(Err(why)) => {
@@ -584,6 +600,7 @@ impl CodegenUnit {
                 backend::Tally::global().report();
                 let compiled_now = known.compiled_since_last_build();
                 known.stats = BuildStats {
+                    sharing: SharingStats::default(),
                     bodies: base.bodies,
                     reused: base.bodies.saturating_sub(compiled_now),
                     compiled: compiled_now,
@@ -605,7 +622,8 @@ impl CodegenUnit {
                 return Ok(unit);
             }
         }
-        let patching = known.patching;
+        let needs_patch = known.patching;
+        let patching = needs_patch && sharing.is_empty();
         let used_by_rustc = known.used_by_rustc;
         // FIXME: a rejection outlives an edit that would lift it. Dropping them here costs one
         // full pass per rejected call chain, and they go away with the rustc fallback.
@@ -650,6 +668,13 @@ impl CodegenUnit {
                 None,
                 hydrate,
             )?;
+            cg.sharing = sharing.clone();
+            cg.counting_sharing = roots.sharing.clone();
+            if sharing.tentative() {
+                if let Some(entries) = cg.entries.as_mut() {
+                    std::sync::Arc::get_mut(entries).expect("a new cache reader").type_ids = false;
+                }
+            }
             cg.patching = patching;
             let mut compiled = Vec::new();
             let mut skipped = Vec::new();
@@ -682,9 +707,9 @@ impl CodegenUnit {
                 let told = cg.debug.is_some().then_some(&cg.told);
                 symbols.in_parallel(ours.len(), &|db, symbols, at| {
                     if symbols.function(ours[at]).is_none() {
-                        _ = db.mir_body(ours[at].into());
+                        _ = db.mir_body(sharing.function(db, ours[at]).into());
                     } else if let (Ok(compiled), Some(told)) =
-                        (compiled_root(db, ours[at]).as_ref(), told)
+                        (program_root(db, ours[at], &sharing).as_ref(), told)
                     {
                         told.ahead(db, &mut FxHashMap::default(), compiled);
                     }
@@ -727,6 +752,12 @@ impl CodegenUnit {
                 if next == queue.len() {
                     break;
                 }
+            }
+            if cg.sharing_restart {
+                sharing = sharing.disabled();
+                sharing_restarts += 1;
+                start_over("a shared type reaches TypeId");
+                continue;
             }
             if cg.misfit {
                 start_over("an entry of the store did not fit");
@@ -787,30 +818,18 @@ impl CodegenUnit {
             }
             if failed.is_empty() {
                 let instances = cg.instances.len();
-                if let Some(store) = store::Store::global() {
-                    let mut misses: Vec<_> = cg.names.misses.take().into_iter().collect();
-                    misses.sort_unstable_by_key(|it| std::cmp::Reverse(it.1));
-                    let (mut kept, writer) = (std::mem::take(&mut cg.kept), cg.writer.take());
-                    // The object and the link do not wait for the store to have what was
-                    // kept: whoever reads the store next does.
-                    store.settle_with(move || {
-                        if let Some(mut writer) = writer {
-                            kept.written(writer.finish());
-                        }
-                        store.flush();
-                        let (found, added) = store.take_counts();
-                        if found + added != 0 {
-                            eprintln!("store: {found} functions found, {added} compiled and added");
-                        }
-                        kept.report();
-                        if !misses.is_empty() {
-                            eprintln!("without a stable name: {misses:?}");
-                        }
-                    });
-                }
+                let mut misses: Vec<_> = cg.names.misses.take().into_iter().collect();
+                misses.sort_unstable_by_key(|it| std::cmp::Reverse(it.1));
+                let (mut kept, mut writer) = (std::mem::take(&mut cg.kept), cg.writer.take());
+                let tentative = std::mem::take(&mut cg.tentative);
+                let checks = std::mem::take(&mut cg.tentative_checks);
                 let total = COMPILED.load(std::sync::atomic::Ordering::Relaxed);
                 let compiled_now = total - std::mem::replace(counted, total);
                 *stats = BuildStats {
+                    sharing: SharingStats {
+                        type_id_restarts: sharing_restarts,
+                        ..cg.sharing_stats
+                    },
                     bodies: cg.bodies,
                     reused: cg.bodies.saturating_sub(compiled_now),
                     compiled: compiled_now,
@@ -839,9 +858,39 @@ impl CodegenUnit {
                 let start = stdx::time::Instant::now();
                 let (object, apart) = cg.finish()?;
                 stats.phases.object = start.elapsed();
+                if let Some(store) = store::Store::global() {
+                    for entry in checks {
+                        entry.publish(store, symbols, &mut kept);
+                    }
+                    for entry in tentative {
+                        writer
+                            .get_or_insert_with(|| {
+                                cached::Writer::new(
+                                    store,
+                                    symbols.cargo_home(),
+                                    symbols.library_sources(),
+                                )
+                            })
+                            .keep(entry);
+                    }
+                    store.settle_with(move || {
+                        if let Some(mut writer) = writer {
+                            kept.written(writer.finish());
+                        }
+                        store.flush();
+                        let (found, added) = store.take_counts();
+                        if found + added != 0 {
+                            eprintln!("store: {found} functions found, {added} compiled and added");
+                        }
+                        kept.report();
+                        if !misses.is_empty() {
+                            eprintln!("without a stable name: {misses:?}");
+                        }
+                    });
+                }
                 backend::Tally::global().report();
                 (*theirs, *unknown) = (own_statics.theirs, own_statics.unknown);
-                let patch = if patching { Some(patch::empty_object()?) } else { None };
+                let patch = if needs_patch { Some(patch::empty_object()?) } else { None };
                 return Ok(CodegenUnit {
                     object: Some(object),
                     patch,
@@ -1066,6 +1115,7 @@ impl Rejections {
 /// Measurements of the last build.
 #[derive(Default, Clone, Copy)]
 pub struct BuildStats {
+    pub sharing: SharingStats,
     /// Compiled functions in the object.
     pub bodies: usize,
     /// How many of them were compiled before this build, and how many during it.
@@ -1079,6 +1129,14 @@ pub struct BuildStats {
     pub patched: Option<usize>,
     /// Why the build wrote the whole object again, when a patch was tried.
     pub declined: Option<&'static str>,
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct SharingStats {
+    pub t_compiled: usize,
+    pub redirected: usize,
+    pub analysis_shared_compiled: usize,
+    pub type_id_restarts: usize,
 }
 
 /// Time spent in each step of the last round.
@@ -1151,6 +1209,12 @@ enum Callee<'db> {
 /// Stitches compiled functions into one object: gives every function and data object they
 /// ask for an id in the module, and defines the ones that are ours.
 struct ObjectCodegen<'a, 'db> {
+    sharing: Sharing,
+    counting_sharing: Sharing,
+    sharing_restart: bool,
+    sharing_stats: SharingStats,
+    tentative: Vec<cached::Kept>,
+    tentative_checks: Vec<CacheCheck>,
     db: &'db dyn HirDatabase,
     symbols: &'a dyn SymbolResolver,
     module: ObjectModule,
@@ -1233,6 +1297,48 @@ struct ObjectCodegen<'a, 'db> {
 
 /// Why an entry with a file of its own under what stands for cargo's directory is not kept.
 const OF_CARGO: &str = "a file under what stands for cargo's directory";
+
+struct CacheCheck {
+    key: [u8; store::KEY],
+    entry: Box<cached::Entry>,
+    name: String,
+    check: std::ffi::OsString,
+}
+
+impl CacheCheck {
+    fn publish(
+        mut self,
+        store: &'static store::Store,
+        symbols: &dyn SymbolResolver,
+        kept: &mut Kept,
+    ) {
+        let stored = store.get(&self.key);
+        let mut alone =
+            cached::Writer::alone(store, symbols.cargo_home(), symbols.library_sources());
+        let Some(bytes) = alone.encoded(&mut self.entry) else {
+            let _: Option<()> = kept.unkept(OF_CARGO);
+            return;
+        };
+        match stored {
+            None => {
+                store.insert(&self.key, &bytes);
+                kept.added += 1;
+            }
+            Some(stored) if stored == bytes => kept.same += 1,
+            Some(stored) => {
+                kept.differing += 1;
+                let name = self.name;
+                eprintln!("entry of `{name}` is not what was compiled");
+                if self.check != "1" {
+                    let at = std::path::Path::new(&self.check).join(kept.differing.to_string());
+                    let was = cached::Entry::decode(&stored);
+                    let entry = self.entry;
+                    _ = std::fs::write(at, format!("{name}\n{was:#?}\n{entry:#?}"));
+                }
+            }
+        }
+    }
+}
 
 /// What became of the instances an object was built from, as entries of the store.
 #[derive(Default)]
@@ -1573,6 +1679,36 @@ fn rows_of(db: &dyn HirDatabase, compiled: &CompiledFunction) -> Vec<Row> {
 /// The code of a non-generic function.
 #[salsa::tracked(returns(ref))]
 fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<CompiledFunction> {
+    compile_root(db, func, Sharing::default())
+}
+
+fn program_root<'db>(
+    db: &'db dyn HirDatabase,
+    func: FunctionId,
+    sharing: &Sharing,
+) -> &'db Result<CompiledFunction> {
+    let canonical = sharing.function(db, func);
+    if canonical != func || !sharing.test_crate(func.krate(db)) {
+        compiled_root(db, canonical)
+    } else {
+        shared_root(db, func, sharing.clone())
+    }
+}
+
+#[salsa::tracked(returns(ref))]
+fn shared_root<'db>(
+    db: &'db dyn HirDatabase,
+    func: FunctionId,
+    sharing: Sharing,
+) -> Result<CompiledFunction> {
+    compile_root(db, func, sharing)
+}
+
+fn compile_root<'db>(
+    db: &'db dyn HirDatabase,
+    func: FunctionId,
+    sharing: Sharing,
+) -> Result<CompiledFunction> {
     let (body, env) = root_body(db, func)?;
     if std::env::var("RUSTD_DUMP_MIR")
         .is_ok_and(|want| FunctionSignature::of(db, func).name.as_str() == want)
@@ -1583,7 +1719,7 @@ fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<Comp
     let (abi, variadic) = (signature.abi, signature.is_varargs());
     let args = GenericArgs::new_from_slice(&[]).store();
     let checked = crate_checks_overflow(db, func.krate(db)).unwrap_or(false);
-    compile(db, env, Some(body), track_caller(db, func), checked, |fx| {
+    compile_shared(db, env, sharing, Some(body), track_caller(db, func), checked, |fx| {
         fx.abi = abi;
         fx.variadic = variadic;
         fx.args = Some(args);
@@ -1646,46 +1782,85 @@ fn compiled_instance<'db>(
     instance: Instance,
     env: StoredParamEnvAndCrate,
 ) -> Result<CompiledFunction> {
+    compile_instance(db, instance, env, Sharing::default())
+}
+
+fn program_instance<'db>(
+    db: &'db dyn HirDatabase,
+    instance: Instance,
+    env: StoredParamEnvAndCrate,
+    sharing: &Sharing,
+) -> &'db Result<CompiledFunction> {
+    let canonical = sharing.instance(db, &instance);
+    let env = sharing.env(db, &canonical, &env);
+    if sharing.needs_policy(db, &canonical) {
+        shared_instance(db, canonical, env, sharing.clone())
+    } else {
+        compiled_instance(db, canonical, env)
+    }
+}
+
+#[salsa::tracked(returns(ref))]
+fn shared_instance<'db>(
+    db: &'db dyn HirDatabase,
+    instance: Instance,
+    env: StoredParamEnvAndCrate,
+    sharing: Sharing,
+) -> Result<CompiledFunction> {
+    compile_instance(db, instance, env, sharing)
+}
+
+fn compile_instance<'db>(
+    db: &'db dyn HirDatabase,
+    instance: Instance,
+    env: StoredParamEnvAndCrate,
+    sharing: Sharing,
+) -> Result<CompiledFunction> {
     let stored_env = env.clone();
     let env = env.as_ref(db);
     let ty = || instance.args.as_ref().type_at(0);
-    let body = match instance.def {
-        InstanceDef::DropGlue => {
-            return compile(db, env, None, false, instance.checked, |fx| {
-                let ty = ty();
-                fx.drop_glue(ty)?;
-                if std::env::var_os("RUSTD_DUMP_CLIF").is_some() {
-                    eprintln!("drop glue for {ty:?}\n{}", fx.builder.func.display());
-                }
-                Ok(())
-            });
-        }
-        InstanceDef::CallOnceShim => {
-            let args = instance.args.as_ref();
-            return compile(db, env, None, false, instance.checked, |fx| match args.len() {
-                1 => fx.call_once_shim(ty()),
-                _ => fx.call_once_by_pointer(args),
-            });
-        }
-        InstanceDef::VtableShim(func) => {
-            let args = instance.args.as_ref();
-            return compile(db, env, None, false, instance.checked, |fx| {
-                fx.vtable_shim(func, args)
-            });
-        }
-        InstanceDef::FnPointerShim => {
-            return compile(db, env, None, false, instance.checked, |fx| fx.fn_pointer_shim(ty()));
-        }
-        InstanceDef::ReifyShim { receiver } => {
-            return compile(db, env, None, false, instance.checked, |fx| {
-                fx.reify_shim(ty(), receiver)
-            });
-        }
-        InstanceDef::Fn(_)
-        | InstanceDef::Closure(_)
-        | InstanceDef::Coroutine(_)
-        | InstanceDef::CoroutineByMove(_) => instance_body(db, &instance, stored_env)?,
-    };
+    let body =
+        match instance.def {
+            InstanceDef::DropGlue => {
+                return compile_shared(db, env, sharing, None, false, instance.checked, |fx| {
+                    let ty = ty();
+                    fx.drop_glue(ty)?;
+                    if std::env::var_os("RUSTD_DUMP_CLIF").is_some() {
+                        eprintln!("drop glue for {ty:?}\n{}", fx.builder.func.display());
+                    }
+                    Ok(())
+                });
+            }
+            InstanceDef::CallOnceShim => {
+                let args = instance.args.as_ref();
+                return compile_shared(db, env, sharing, None, false, instance.checked, |fx| {
+                    match args.len() {
+                        1 => fx.call_once_shim(ty()),
+                        _ => fx.call_once_by_pointer(args),
+                    }
+                });
+            }
+            InstanceDef::VtableShim(func) => {
+                let args = instance.args.as_ref();
+                return compile_shared(db, env, sharing, None, false, instance.checked, |fx| {
+                    fx.vtable_shim(func, args)
+                });
+            }
+            InstanceDef::FnPointerShim => {
+                return compile_shared(db, env, sharing, None, false, instance.checked, |fx| {
+                    fx.fn_pointer_shim(ty())
+                });
+            }
+            InstanceDef::ReifyShim { receiver } => {
+                return compile_shared(db, env, sharing, None, false, instance.checked, |fx| {
+                    fx.reify_shim(ty(), receiver)
+                });
+            }
+            InstanceDef::Fn(_)
+            | InstanceDef::Closure(_)
+            | InstanceDef::Coroutine(_)
+            | InstanceDef::CoroutineByMove(_) => instance_body(db, &instance, stored_env)?,
+        };
     let body = &*body;
     let dump = std::env::var("RUSTD_DUMP_MIR").ok();
     let (tracked, abi, variadic) = match instance.def {
@@ -1711,7 +1886,7 @@ fn compiled_instance<'db>(
         }
         _ => None,
     };
-    let compiled = compile(db, env, Some(body), tracked, instance.checked, |fx| {
+    let compiled = compile_shared(db, env, sharing, Some(body), tracked, instance.checked, |fx| {
         fx.abi = abi;
         fx.variadic = variadic;
         fx.args = Some(args);
@@ -2951,8 +3126,21 @@ fn compile<'db>(
     checked: bool,
     fill: impl for<'cx> FnOnce(&mut FunctionCx<'cx, 'db>) -> Result<()>,
 ) -> Result<CompiledFunction> {
+    compile_shared(db, env, Sharing::default(), body, tracked, checked, fill)
+}
+
+fn compile_shared<'db>(
+    db: &'db dyn HirDatabase,
+    env: ParamEnvAndCrate<'db>,
+    sharing: Sharing,
+    body: Option<&'db MirBody<'db>>,
+    tracked: bool,
+    checked: bool,
+    fill: impl for<'cx> FnOnce(&mut FunctionCx<'cx, 'db>) -> Result<()>,
+) -> Result<CompiledFunction> {
     let isa = &**target()?;
     let mut cg = Recorder::new(db, isa, selected_target()?, checked);
+    cg.sharing = sharing;
     let tally = backend::Tally::global();
     /// `RUSTD_PROMOTE=0` leaves every local in its slot of the frame.
     static PROMOTE: LazyLock<bool> =
@@ -3009,7 +3197,7 @@ fn compile<'db>(
         .map(|Named { binding, param, ty, slot, pointer }| Variable {
             binding,
             param,
-            ty,
+            ty: cg.sharing.fold(db, env.krate, ty.as_ref()).store(),
             slot: slot.as_u32(),
             pointer,
         })
@@ -3367,6 +3555,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             store.settled();
         }
         Ok(ObjectCodegen {
+            sharing: Sharing::default(),
+            counting_sharing: Sharing::default(),
+            sharing_restart: false,
+            sharing_stats: SharingStats::default(),
+            tentative: Vec::new(),
+            tentative_checks: Vec::new(),
             db,
             symbols,
             module,
@@ -3498,7 +3692,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// itself is left to rustc. `false` when the body can't be compiled to find them.
     fn want_reachable_from(&mut self, func: FunctionId) -> bool {
         let db = self.db;
-        let Ok(compiled) = compiled_root(db, func).as_ref() else { return false };
+        let Ok(compiled) = program_root(db, func, &self.sharing).as_ref() else { return false };
         self.want_requested(&compiled.requests);
         true
     }
@@ -3516,7 +3710,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     InstanceDef::Fn(func) if instance.args.as_ref().is_empty() => self.want(func),
                     _ if !seen.insert(instance) => {}
                     _ => {
-                        let compiled = compiled_instance(db, instance.clone(), env.clone());
+                        let compiled =
+                            program_instance(db, instance.clone(), env.clone(), &self.sharing);
                         stack.extend(compiled.as_ref().ok().map(|it| &it.requests));
                     }
                 }
@@ -3535,7 +3730,6 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// Puts a non-generic function in the object, exported under its rustc symbol name.
     fn define_function(&mut self, func: FunctionId) -> Result<String> {
         let db = self.db;
-        db.mir_body(func.into()).map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
         let Some(symbol) = self.symbols.function(func) else {
             // FIXME: with a `main` of ours only what it reaches is compiled, and a function
             // left to rustc can still call one private to its object.
@@ -3543,7 +3737,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             return Err(if private { CodegenError::Private } else { CodegenError::NoSymbol });
         };
         let start = stdx::time::Instant::now();
-        let compiled = compiled_root(db, func);
+        let compiled = program_root(db, func, &self.sharing);
+        self.count_sharing(func, self.sharing.function(db, func) != func);
         let took = start.elapsed();
         self.phases.compile += took;
         let compiled = compiled.as_ref().map_err(Clone::clone)?;
@@ -3554,9 +3749,33 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let name = super::type_name::rustc_debug_function(db, func, &[])
             .unwrap_or_else(|| FunctionSignature::of(db, func).name.as_str().to_owned());
         let declared = self.declaration_at(func);
-        let rows = self.debug.as_ref().map(|_| root_rows(db, func));
-        self.describe(id, compiled, rows, FunctionDebug::new(name, symbol.clone()), declared);
+        let rows = self.debug.as_ref().map(|_| rows_of(db, compiled));
+        self.describe(
+            id,
+            compiled,
+            rows.as_ref(),
+            FunctionDebug::new(name, symbol.clone()),
+            declared,
+        );
         Ok(symbol)
+    }
+
+    fn count_sharing(&mut self, func: FunctionId, redirected: bool) {
+        let db = self.db;
+        if self.counting_sharing.test_crate(func.krate(db)) {
+            self.sharing_stats.redirected += usize::from(redirected);
+            self.sharing_stats.t_compiled += usize::from(!redirected);
+            self.sharing_stats.analysis_shared_compiled +=
+                usize::from(!redirected && self.counting_sharing.analysis_shared(db, func));
+            if std::env::var_os("RUSTD_CFG_TWINS").is_some() {
+                eprintln!(
+                    "cfg codegen body: {}: T compiled {}, redirected {}",
+                    FunctionSignature::of(db, func).name.as_str(),
+                    usize::from(!redirected),
+                    usize::from(redirected)
+                );
+            }
+        }
     }
 
     /// Puts the `main` the C runtime calls in the object.
@@ -3604,10 +3823,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     let told = self.debug.is_some().then_some(&self.told);
                     self.symbols.in_parallel(wave.len(), &|db, _, at| {
                         let (instance, env, _) = &wave[at];
-                        let compiled = compiled_instance(db, instance.clone(), env.clone());
+                        let compiled =
+                            program_instance(db, instance.clone(), env.clone(), &self.sharing);
                         if let (Ok(compiled), Some(told)) = (compiled.as_ref(), told) {
                             told.ahead(db, &mut FxHashMap::default(), compiled);
-                            instance_rows(db, instance.clone(), env.clone());
+                            rows_of(db, compiled);
                         }
                     });
                     self.phases.compile += start.elapsed();
@@ -3684,6 +3904,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let (rejected, hydrate) = (self.rejected, self.hydrate);
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
         let (entries, owned) = (self.entries.clone(), &self.own_statics.crates.clone());
+        let sharing = self.sharing.clone();
         let entries = entries.as_deref();
         let told = self.debug.is_some().then(|| self.told.clone());
         let told = told.as_ref();
@@ -3724,18 +3945,16 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 let (mut found, mut called) = (Vec::new(), Vec::new());
                 let compiled = match &job {
                     // One without a symbol is left to rustc, and so is what only it calls.
-                    either::Either::Left(root) => symbols.function(*root).and_then(|_| {
-                        if told.is_some() {
-                            root_rows(db, *root);
-                        }
-                        compiled_root(db, *root).as_ref().ok()
-                    }),
+                    either::Either::Left(root) => symbols
+                        .function(*root)
+                        .and_then(|_| program_root(db, *root, &sharing).as_ref().ok()),
                     either::Either::Right((instance, env)) => {
-                        let compiled = compiled_instance(db, instance.clone(), env.clone());
+                        let compiled =
+                            program_instance(db, instance.clone(), env.clone(), &sharing);
                         let compiled = compiled.as_ref().ok();
                         if let (Some(compiled), Some(told)) = (compiled, told) {
                             told.ahead(db, &mut types, compiled);
-                            instance_rows(db, instance.clone(), env.clone());
+                            rows_of(db, compiled);
                         }
                         compiled
                     }
@@ -3796,7 +4015,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         id: FuncId,
     ) -> Result<()> {
         let start = stdx::time::Instant::now();
-        let compiled = compiled_instance(self.db, instance.clone(), env.clone());
+        let compiled = program_instance(self.db, instance.clone(), env.clone(), &self.sharing);
+        if let Some(owner) = home::written_in(self.db, instance) {
+            self.count_sharing(owner, self.sharing.instance(self.db, instance).def != instance.def);
+        }
         let took = start.elapsed();
         self.phases.compile += took;
         let compiled = compiled.as_ref().map_err(Clone::clone)?;
@@ -3837,9 +4059,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             _ => None,
         };
         let known = known.unwrap_or_else(|| name.clone());
-        let rows =
-            self.debug.as_ref().map(|_| instance_rows(self.db, instance.clone(), env.clone()));
-        let debug = self.describe(id, compiled, rows, FunctionDebug::new(known, name), declared);
+        let rows = self.debug.as_ref().map(|_| rows_of(self.db, compiled));
+        let debug =
+            self.describe(id, compiled, rows.as_ref(), FunctionDebug::new(known, name), declared);
         let tally = backend::Tally::global();
         tally.step(Step::StoreWrite, || self.keep(instance, compiled, &ids, debug));
         Ok(())
@@ -3946,6 +4168,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     }
 
     fn stable_name(&mut self, instance: &Instance) -> Option<StableName> {
+        let canonical = self.sharing.instance(self.db, instance);
+        let instance = &canonical;
         if let Some(known) = self.stable_names.get(instance) {
             return known.clone();
         }
@@ -3983,39 +4207,21 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let sets = || debug.iter().flat_map(|it| &it.types).cloned().collect::<Vec<_>>();
         if check.is_none() && store.has(&key) {
             let kept = cached::Kept::Types(sets());
-            return self.writer(store).keep(kept);
+            return self.keep_tentative(store, kept);
         }
         let Some(entry) = self.entry(instance, compiled, ids, debug) else {
             self.kept.unnamed_requests += 1;
             return;
         };
-        let mut entry = Box::new(entry);
+        let entry = Box::new(entry);
         let Some(check) = check else {
-            return self.writer(store).keep(cached::Kept::Entry { key, entry });
+            return self.keep_tentative(store, cached::Kept::Entry { key, entry });
         };
-        // The entry as it would be written is set against the one that is there.
-        let stored = store.get(&key);
-        let mut alone =
-            cached::Writer::alone(store, self.symbols.cargo_home(), self.symbols.library_sources());
-        let Some(bytes) = alone.encoded(&mut entry) else {
-            let _: Option<()> = self.kept.unkept(OF_CARGO);
-            return;
-        };
-        match stored {
-            None => {
-                store.insert(&key, &bytes);
-                self.kept.added += 1;
-            }
-            Some(stored) if stored == bytes => self.kept.same += 1,
-            Some(stored) => {
-                self.kept.differing += 1;
-                eprintln!("entry of `{name}` is not what was compiled");
-                if check != "1" {
-                    let at = std::path::Path::new(&check).join(self.kept.differing.to_string());
-                    let was = cached::Entry::decode(&stored);
-                    _ = std::fs::write(at, format!("{name}\n{was:#?}\n{entry:#?}"));
-                }
-            }
+        let entry = CacheCheck { key, entry, name: name.to_string(), check };
+        if self.sharing.tentative() {
+            self.tentative_checks.push(entry);
+        } else {
+            entry.publish(store, self.symbols, &mut self.kept);
         }
     }
 
@@ -4024,6 +4230,14 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         self.writer.get_or_insert_with(|| {
             cached::Writer::new(store, symbols.cargo_home(), symbols.library_sources())
         })
+    }
+
+    fn keep_tentative(&mut self, store: &'static store::Store, kept: cached::Kept) {
+        if self.sharing.tentative() {
+            self.tentative.push(kept);
+        } else {
+            self.writer(store).keep(kept);
+        }
     }
 
     /// Whether the instance is compiled with the flags of the crate its function is written
@@ -4139,6 +4353,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         for (request, &id) in compiled.requests.funcs.iter().zip(&ids.funcs) {
             let decl = self.module.declarations().get_function_decl(id);
             let target = if let Some(&hash) = self.type_ids.get(&id) {
+                if let FuncTarget::Instance(callee, _) = &request.target
+                    && let InstanceDef::Fn(func) = callee.def
+                    && let Some(of) = self.type_id_argument(func, callee.args.as_ref())
+                    && self.sharing.link_type(self.db, of) != of
+                {
+                    return self.kept.unkept("program-specific TypeId");
+                }
                 CachedTarget::TypeId(hash)
             } else if decl.linkage == Linkage::Import {
                 // rustc's copy of a function of the checkout is of the checkout as rustc
@@ -4548,7 +4769,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 };
                 self.import(&symbol, &request.sig)
             }
-            FuncTarget::Instance(instance, env) => self.callee(instance, env, &request.sig),
+            FuncTarget::Instance(instance, env) => {
+                let instance = self.sharing.link_instance(self.db, instance);
+                self.callee(&instance, env, &request.sig)
+            }
             FuncTarget::Asm(text) => self.assembly(text, &request.sig),
         }
     }
@@ -4582,7 +4806,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 self.vtables.insert(key, id);
                 Ok(id)
             }
-            DataRequest::Static(id) => self.static_data(*id),
+            DataRequest::Static(id) => self.static_data(self.sharing.link_static(self.db, *id)),
             DataRequest::Location(at) => self.location(*at),
             DataRequest::Declaration(func) => {
                 let found = self.declaration_at(*func);
@@ -4806,6 +5030,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let instance = &self.settled(instance)?;
         let (def, args) = (instance.def, instance.args.as_ref());
         if let InstanceDef::Fn(func) = def
+            && let Some(of) = self.type_id_argument(func, args)
+            && self.sharing.contains_unified(self.db, of)
+        {
+            self.sharing_restart = true;
+            unsupported!("a shared type reaches TypeId");
+        }
+        if let InstanceDef::Fn(func) = def
             && args.iter().all(|arg| arg.region().is_some())
             && let Some(symbol) = self.symbols.function(func)
             && self.as_its_crate_compiles(instance)
@@ -4863,8 +5094,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         // A `TypeId` is a hash only rustc can compute, and the two compilers have to agree on
         // it for `downcast` to work between their code. So take rustc's.
         if let InstanceDef::Fn(func) = def
-            && let Some(of) = self.type_id_of(func, args)
+            && let Some(of) = self.type_id_argument(func, args)
         {
+            let of = self.sharing.link_type(self.db, of);
             let mut hasher =
                 type_id::TypeIdHasher::new(self.db, self.symbols, &self.own_statics.crates);
             if let Some(hash) = hasher.type_id(of) {
@@ -5036,7 +5268,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         let mut callers: FxHashMap<&Instance, Vec<usize>> = FxHashMap::default();
         for (at, (instance, env)) in self.envs.iter().enumerate() {
-            let Ok(compiled) = compiled_instance(self.db, instance.clone(), env.clone()).as_ref()
+            let Ok(compiled) =
+                program_instance(self.db, instance.clone(), env.clone(), &self.sharing).as_ref()
             else {
                 continue;
             };
@@ -5192,10 +5425,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     /// The `TypeId::of` that returns `hash`.
     fn type_id_shim(&mut self, sig: &Signature, hash: u128) -> Result<FuncId> {
-        if let Some(&id) = self.type_id_shims.get(&hash) {
+        if let Some(&id) = self.type_id_shims.get(&hash)
+            && self.module.declarations().get_function_decl(id).signature == *sig
+        {
             return Ok(id);
         }
-        let name = format!("rustd::type_id::h{}", self.type_id_shims.len());
+        let name = format!("rustd::type_id::h{}", self.type_ids.len());
         let id = self
             .module
             .declare_function(&name, Linkage::Local, sig)
@@ -5210,7 +5445,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let words = [hash as u64, (hash >> 64) as u64].map(|it| it as i64);
         let returned = match *sig.returns.as_slice() {
             [] => {
-                let &[out] = builder.block_params(block) else {
+                let Some(&out) = builder.block_params(block).first() else {
                     unsupported!("a `TypeId` returned as `{sig}`");
                 };
                 for (word, offset) in words.into_iter().zip([0, 8]) {
@@ -5236,6 +5471,25 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         self.type_id_shims.insert(hash, id);
         self.type_ids.insert(id, hash);
         Ok(id)
+    }
+
+    fn type_id_argument(&self, func: FunctionId, args: GenericArgs<'db>) -> Option<Ty<'db>> {
+        if let Some(ty) = self.type_id_of(func, args) {
+            return Some(ty);
+        }
+        if FunctionSignature::of(self.db, func).name.as_str() != "type_id" {
+            return None;
+        }
+        let ItemContainerId::ImplId(id) = func.lookup(self.db).container else {
+            return (self.symbols.item(func.into()).as_deref()
+                == Some("core::intrinsics::type_id"))
+            .then(|| args.as_slice().first().and_then(|arg| arg.ty()))
+            .flatten();
+        };
+        let trait_ref = self.db.impl_trait(id)?.skip_binder();
+        (self.symbols.item(trait_ref.def_id.0.into()).as_deref() == Some("core::any::Any"))
+            .then(|| args.as_slice().first().and_then(|arg| arg.ty()))
+            .flatten()
     }
 
     /// The `T` of `TypeId::of::<T>`, when `func` is that function.
@@ -6093,13 +6347,20 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn layout(&self, ty: Ty<'db>) -> Result<Arc<Layout>> {
+        let canonical = self.cg.sharing.fold(self.cg.db, self.env.krate, ty);
+        let env = if canonical == ty {
+            self.env
+        } else {
+            self.cg.sharing.type_env(self.cg.db, canonical, self.env)
+        };
+        let ty = canonical;
         if let Some(layout) = self.layouts.borrow().get(&ty) {
             return Ok(layout.clone());
         }
         let layout = self
             .cg
             .db
-            .layout_of_ty(ty.store(), self.env.store())
+            .layout_of_ty(ty.store(), env.store())
             .map_err(|e| CodegenError::Frontend(format!("layout of {ty:?}: {e:?}")))?;
         if let Some(log) = &self.cg.layouts {
             log.borrow_mut().entry(ty).or_insert((layout.size.bytes(), layout.align.abi.bytes()));

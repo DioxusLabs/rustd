@@ -15,11 +15,11 @@ use crate::next_solver::TyKind;
 use crate::{db::HirDatabase, traits::StoredParamEnvAndCrate};
 
 use super::{
-    CodegenError, Instance, InstanceDef, compiled_instance, compiled_root, compiled_static,
+    CodegenError, Instance, InstanceDef, compiled_static,
     fragment::{DataRequest, FuncTarget, Requests},
-    instance_serial, is_thread_local,
+    is_thread_local,
     patch::Mark,
-    print_of, root_serial, static_serial,
+    print_of, static_serial,
 };
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -53,6 +53,7 @@ impl Node {
 
 #[derive(Default)]
 struct Graph {
+    sharing: super::Sharing,
     homes: super::home::Homes,
     ids: FxHashMap<Node, usize>,
     /// The print of each node's own code and of the source locations it reports.
@@ -122,12 +123,14 @@ impl Graph {
             return Vec::new();
         }
         let compiled: Result<(u128, &Requests), &CodegenError> = match &node {
-            Node::Root(func) => {
-                compiled_root(db, *func).as_ref().map(|it| (root_serial(db, *func), &it.requests))
-            }
-            Node::Instance(instance, env) => compiled_instance(db, instance.clone(), env.clone())
+            Node::Root(func) => super::program_root(db, *func, &self.sharing)
                 .as_ref()
-                .map(|it| (instance_serial(db, instance.clone(), env.clone()), &it.requests)),
+                .map(|it| (print_of(it), &it.requests)),
+            Node::Instance(instance, env) => {
+                super::program_instance(db, instance.clone(), env.clone(), &self.sharing)
+                    .as_ref()
+                    .map(|it| (print_of(it), &it.requests))
+            }
             Node::Static(id) => {
                 compiled_static(db, *id).as_ref().map(|it| (static_serial(db, *id), &it.requests))
             }
@@ -261,12 +264,14 @@ impl Bits {
 /// things reached that did not compile.
 pub fn reached(
     db: &dyn HirDatabase,
-    edited: FxHashSet<Crate>,
+    sharing: super::Sharing,
+    mut edited: FxHashSet<Crate>,
     tests: &[FunctionId],
     always: &[FunctionId],
     kept: &[StaticId],
 ) -> (Vec<Reached>, Option<u128>, Vec<String>) {
-    let mut graph = Graph { edited, ..Graph::default() };
+    sharing.edited_crates(&mut edited);
+    let mut graph = Graph { sharing, edited, ..Graph::default() };
     let tests: Vec<usize> = tests.iter().map(|&it| graph.node(db, Node::Root(it))).collect();
     let mut ambient: Vec<usize> = always.iter().map(|&it| graph.node(db, Node::Root(it))).collect();
     ambient.extend(kept.iter().map(|&it| graph.node(db, Node::Static(it))));

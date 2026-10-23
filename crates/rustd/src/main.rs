@@ -47,8 +47,8 @@ use std::{
 use anyhow::{Context, bail};
 use hir::{AsAssocItem, AssocItemContainer, Crate, Module, ModuleDef, db::HirDatabase};
 use hir_def::{
-    AssocItemId, DefWithBodyId, FunctionId, ItemContainerId, Lookup, ModuleDefId, StaticId,
-    expr_store::Body, item_scope::ItemScope,
+    AssocItemId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup, ModuleDefId,
+    StaticId, expr_store::Body, item_scope::ItemScope,
 };
 use hir_ty::db::InternedClosureId;
 use hir_ty::mir::codegen::{
@@ -2657,6 +2657,39 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
     Ok(crates.len())
 }
 
+fn program_sharing(db: &RootDatabase, args: &Args) -> hir_ty::mir::codegen::Sharing {
+    let roots: Vec<_> = args
+        .crates()
+        .flat_map(|name| crates_named(db, name, args).unwrap_or_default())
+        .map(ide_db::base_db::Crate::from)
+        .collect();
+    let present: FxHashSet<_> = roots
+        .iter()
+        .copied()
+        .chain(roots.iter().flat_map(|&krate| krate.transitive_deps(db)))
+        .collect();
+    let mut pairs = Vec::new();
+    for &test in args.members.iter() {
+        if !is_tested(db, test) || !present.contains(&test) {
+            continue;
+        }
+        let mut normal = args.members.iter().copied().filter(|&krate| {
+            !is_tested(db, krate)
+                && !doctest::is_documented(db, krate)
+                && krate.root_file_id(db) == test.root_file_id(db)
+        });
+        if let Some(normal) = normal.next().filter(|_| normal.next().is_none()) {
+            pairs.push((normal, test, present.contains(&normal)));
+        }
+    }
+    let sharing = hir_ty::mir::codegen::Sharing::new(pairs);
+    if std::env::var_os("RUSTD_CFG_SHARING").is_some_and(|it| it == "0") {
+        sharing.disabled()
+    } else {
+        sharing
+    }
+}
+
 fn dump_twins(db: &RootDatabase, args: &Args) {
     if std::env::var_os("RUSTD_CFG_TWINS").is_none() {
         return;
@@ -3217,6 +3250,7 @@ fn build(
     // The program's `main` is called by one rustc wrote, when rustc built the crate.
     let own = |main: &FunctionId| resolver.own_crate_id(hir_def::HasModule::krate(main, db));
     let roots = Roots {
+        sharing: program_sharing(db, args),
         entries: &entries,
         on_demand: &on_demand,
         start: main.filter(|it| own(it).is_some()),
@@ -3368,6 +3402,7 @@ fn build(
         for (i, &(func, _)) in unit.compiled.iter().enumerate() {
             let single = hir::attach_db(db, || {
                 let roots = Roots {
+                    sharing: program_sharing(db, args),
                     entries: &[func],
                     on_demand: &[],
                     start: None,
@@ -4849,6 +4884,7 @@ fn lower_until(
             }));
         }
     }
+    functions.retain(|f| !is_tested(db, f.krate(db)));
     let count = functions.len();
     let unnamed = hir_ty::mir::codegen::Unnamed::new(functions);
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
@@ -6884,6 +6920,13 @@ fn report_stats(stats: &hir_ty::mir::codegen::BuildStats) {
         "stats: {} of {} functions compiled, {} reused",
         stats.compiled, stats.bodies, stats.reused
     );
+    eprintln!(
+        "cfg codegen: T bodies compiled {}, redirected to N {}, analysis-shared compiled {}, TypeId restarts {}",
+        stats.sharing.t_compiled,
+        stats.sharing.redirected,
+        stats.sharing.analysis_shared_compiled,
+        stats.sharing.type_id_restarts
+    );
     if let Some(patched) = stats.patched {
         eprintln!("patch: {patched} functions");
     }
@@ -6999,8 +7042,14 @@ impl Tests {
         }
         let tests = Tests::named(db, listed, args);
         let roots: Vec<FunctionId> = tests.iter().map(|it| it.0).collect();
-        let (reached, _, unknown) =
-            hir_ty::mir::codegen::reached(db, edited, &roots, &always, &kept);
+        let (reached, _, unknown) = hir_ty::mir::codegen::reached(
+            db,
+            program_sharing(db, args),
+            edited,
+            &roots,
+            &always,
+            &kept,
+        );
         if !unknown.is_empty() {
             eprintln!("reached: not known: {}", unknown.join("; "));
         }

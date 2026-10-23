@@ -1219,6 +1219,200 @@ pub fn tls_value() -> u32 { TLS.with(|value| value.get()) }
             check(f"{label} diagnostics", ran.returncode == 0 and expected in fresh, f"exit {ran.returncode}, expected {expected}")
     finally:
         side.cargo("stop")
+    return checks + test_graph_sharing(work)
+
+
+def test_graph_sharing(work):
+    ws = os.path.realpath(os.path.join(work, "graph-sharing"))
+    files = {
+        "Cargo.toml": '[package]\nname = "graph_sharing"\nversion = "0.1.0"\nedition = "2021"\n[workspace]\nmembers = ["probe"]\n[dev-dependencies]\nprobe = { path = "probe" }\n',
+        "probe/Cargo.toml": '[package]\nname = "probe"\nversion = "0.1.0"\nedition = "2021"\n[dependencies]\ngraph_sharing = { path = ".." }\n',
+        "probe/src/lib.rs": '''pub fn normal() { assert_eq!(graph_sharing::lease(), 900); assert!(!graph_sharing::tested()); assert_eq!(graph_sharing::caller(), 7); }
+pub fn shared() -> u32 { graph_sharing::shared() }
+pub fn pointer() -> usize { graph_sharing::shared as usize }
+pub fn bump() -> usize { graph_sharing::bump() }
+pub fn read() -> usize { graph_sharing::read() }
+pub fn hidden_size() -> usize { graph_sharing::hidden_size() }
+''',
+        "src/main.rs": 'fn main() { println!("{}", graph_sharing::shared()); }\n',
+        "src/lib.rs": '''use std::sync::atomic::{AtomicUsize, Ordering};
+#[inline(never)] pub fn shared() -> u32 { 40 + 2 }
+#[cfg(test)] const LEASE: u32 = 1;
+#[cfg(not(test))] const LEASE: u32 = 900;
+pub fn lease() -> u32 { LEASE }
+pub fn tested() -> bool { cfg!(test) }
+pub fn different() -> u32 { if cfg!(test) { 9 } else { 7 } }
+pub fn caller() -> u32 { different() }
+static STATE: AtomicUsize = AtomicUsize::new(0);
+pub fn bump() -> usize { STATE.fetch_add(1, Ordering::SeqCst) }
+pub fn read() -> usize { STATE.load(Ordering::SeqCst) }
+pub fn static_generic<T: std::fmt::Debug>(value: T) -> String {
+    let _ = STATE.load(Ordering::SeqCst);
+    format!("{:?}", value)
+}
+pub struct Batch(pub [u8; 1]);
+impl IntoIterator for Batch {
+    type Item = u8;
+    type IntoIter = std::array::IntoIter<u8, 1>;
+    fn into_iter(self) -> Self::IntoIter { self.0.into_iter() }
+}
+pub struct Shape;
+impl std::fmt::Debug for Shape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("shape") }
+}
+pub trait Calc { fn calc(&self) -> u32; }
+impl Calc for Shape { fn calc(&self) -> u32 { 3 } }
+pub fn generic<T: Calc>(value: T) -> u32 { value.calc() }
+pub fn closure() -> u32 { let value = || shared(); value() }
+pub fn changed() -> impl Iterator<Item = u8> {
+    #[cfg(test)] { [0u8; 128].into_iter() }
+    #[cfg(not(test))] { [0u8; 1].into_iter() }
+}
+pub fn count() -> usize { changed().count() }
+pub fn hidden_size() -> usize { std::mem::size_of_val(&changed()) }
+#[cfg(test)] mod tests {
+    struct Only;
+    impl super::Calc for Only { fn calc(&self) -> u32 { 11 } }
+    #[test] fn both_copies() {
+        assert_eq!(super::lease(), 1);
+        assert!(super::tested());
+        assert_eq!(super::caller(), 9);
+        probe::normal();
+        assert_eq!(super::shared(), 42);
+        assert_eq!(probe::shared(), 42);
+        assert_eq!(super::generic(super::Shape), 3);
+        assert_eq!(super::generic(Only), 11);
+        let object: &dyn super::Calc = &super::Shape;
+        assert_eq!(object.calc(), 3);
+        let debug: &dyn std::fmt::Debug = &super::Shape;
+        assert_eq!(format!("{:?}", debug), "shape");
+        assert_eq!(super::static_generic(super::Shape), "shape");
+        let mut flattened = vec![super::Batch([3])].into_iter().flatten();
+        assert_eq!(flattened.next(), Some(3));
+        assert_eq!(flattened.next(), None);
+        assert_eq!(super::closure(), 42);
+        assert_ne!(super::shared as usize, probe::pointer());
+        assert_eq!(super::bump(), 0);
+        assert_eq!(probe::read(), 0);
+        assert_eq!(probe::bump(), 0);
+        assert_eq!(super::read(), 1);
+        assert_eq!(super::count(), 128);
+        assert_ne!(super::hidden_size(), probe::hidden_size());
+    }
+}
+''',
+        "tests/integration.rs": '''#[test] fn normal_copy() {
+    assert_eq!(graph_sharing::shared(), 42);
+    assert_eq!(graph_sharing::lease(), 900);
+    assert!(!graph_sharing::tested());
+    assert_eq!(graph_sharing::caller(), 7);
+    assert_eq!(graph_sharing::count(), 1);
+}
+''',
+    }
+    for file, text in files.items():
+        path = pathlib.Path(ws, file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    side = Side(ws, dict(base_env(os.path.join(work, "home-graph-sharing")), RUSTD_CFG_TWINS="items", RUSTD_CACHE_CHECK="1"), True)
+    checks = []
+
+    def check(name, held, detail):
+        checks.append((f"cfg sharing: {name}", bool(held), detail))
+        print(f"  {'ok ' if held else 'NOT'} cfg sharing: {name}  {detail}", flush=True)
+
+    logs = pathlib.Path(side.env["RUSTD_HOME"])
+    def snapshot():
+        return {path: path.read_text(errors="replace") for path in logs.glob("**/log")}
+
+    def log(before=None):
+        return "\n".join(text[len((before or {}).get(path, "")):] for path, text in snapshot().items())
+
+    try:
+        _, cold = side.cargo("test")
+        check("cold runtime", cold.returncode == 0, cold.stderr[-300:])
+        wait_warm(side, ws)
+        _, warm = side.cargo("test")
+        check("both copies, statics and opaque layout", warm.returncode == 0 and how_built(warm.stderr) == "daemon" and "tests::both_copies" in warm.stdout and "test normal_copy" in warm.stdout, warm.stderr[-300:])
+        text = log()
+        shared = re.findall(r"cfg codegen body: shared: T compiled (\d+), redirected (\d+)", text)
+        check("shared function has no T compilation", bool(shared) and all(t == "0" and n == "1" for t, n in shared), str(shared))
+        check("opaque callers stay analysis-shared", "cfg body: graph_sharing::count: analysis-shared" in text and "cfg body: graph_sharing::hidden_size: analysis-shared" in text, "count, hidden_size")
+        _, built = side.cargo("run", "--bin", "graph_sharing")
+        check("CLI before edit", built.returncode == 0 and built.stdout.strip() == "42", built.stderr[-200:])
+        rewrite(os.path.join(ws, "src/lib.rs"), "40 + 2", "41 + 2")
+        for file in ("src/lib.rs", "tests/integration.rs"):
+            path = pathlib.Path(ws, file)
+            path.write_text(path.read_text().replace(", 42)", ", 43)"))
+        before = snapshot()
+        _, edited = side.cargo("run", "--bin", "graph_sharing")
+        fresh = log(before)
+        check("CLI shared edit splices one function", edited.returncode == 0 and edited.stdout.strip() == "43" and "spliced: 1 functions redirected" in fresh, edited.stderr[-200:] + fresh[-600:])
+        _, tests = side.cargo("test")
+        check("both programs observe shared edit", tests.returncode == 0 and how_built(tests.stderr) == "daemon" and "tests::both_copies" in tests.stdout and "test normal_copy" in tests.stdout, tests.stderr[-300:])
+        source = pathlib.Path(ws, "src/lib.rs")
+        probe = pathlib.Path(ws, "probe/src/lib.rs")
+        probe.write_text(probe.read_text() + '\npub fn boxed() -> Box<dyn std::any::Any> { Box::new(graph_sharing::Shape) }\n')
+        source.write_text(source.read_text() + '''
+#[cfg(test)] mod identity {
+    #[test] fn cross_copy_downcast() {
+        assert!(probe::boxed().downcast::<super::Shape>().is_err());
+        let value: Box<dyn std::any::Any> = Box::new(super::Shape);
+        assert!(value.downcast::<super::Shape>().is_ok());
+    }
+}
+''')
+        before = snapshot()
+        _, identity = side.cargo("test")
+        fresh = log(before)
+        check("cross-copy TypeId restarts unshared", identity.returncode == 0 and "identity::cross_copy_downcast" in identity.stdout and "TypeId restarts 1" in fresh, identity.stderr[-400:] + fresh[-600:])
+    finally:
+        side.cargo("stop")
+    disabled = Side(ws, dict(base_env(os.path.join(work, "home-sharing-disabled")), RUSTD_CFG_TWINS="items", RUSTD_CFG_SHARING="0"), True)
+    try:
+        disabled.cargo("test")
+        wait_warm(disabled, ws)
+        _, result = disabled.cargo("test")
+        text = "\n".join(path.read_text(errors="replace") for path in pathlib.Path(disabled.env["RUSTD_HOME"]).glob("**/log"))
+        check("sharing switch keeps T compilation", result.returncode == 0 and how_built(result.stderr) == "daemon" and "cfg codegen body: shared: T compiled 1, redirected 0" in text and "TypeId restarts 1" not in text, result.stderr[-300:])
+    finally:
+        disabled.cargo("stop")
+
+    single_ws = os.path.join(work, "sharing-single")
+    os.makedirs(os.path.join(single_ws, "src"))
+    pathlib.Path(single_ws, "Cargo.toml").write_text('[package]\nname="sharing_single"\nversion="0.1.0"\nedition="2021"\n')
+    pathlib.Path(single_ws, "src/lib.rs").write_text('''use std::sync::atomic::{AtomicUsize, Ordering};
+pub struct Token;
+pub struct Batch(Vec<u8>);
+impl IntoIterator for Batch {
+    type Item = u8;
+    type IntoIter = std::vec::IntoIter<u8>;
+    fn into_iter(self) -> Self::IntoIter { self.0.into_iter() }
+}
+static STATE: AtomicUsize = AtomicUsize::new(0);
+pub fn bump() -> usize { STATE.fetch_add(1, Ordering::SeqCst) }
+pub fn boxed() -> Box<dyn std::any::Any> { Box::new(Token) }
+#[test] fn one_copy() {
+    let mut flattened = vec![Batch(vec![3])].into_iter().flatten();
+    assert_eq!(flattened.next(), Some(3));
+    assert_eq!(flattened.next(), None);
+    assert_eq!(bump(), 0);
+    assert_eq!(STATE.load(Ordering::SeqCst), 1);
+    let value: Box<dyn std::any::Any> = Box::new(Token);
+    assert!(value.is::<Token>());
+    assert!(value.downcast::<Token>().is_ok());
+    assert!(boxed().downcast::<Token>().is_ok());
+}
+''')
+    single = Side(single_ws, dict(base_env(os.path.join(work, "home-sharing-single")), RUSTD_CFG_TWINS="items"), True)
+    try:
+        single.cargo("test")
+        wait_warm(single, single_ws)
+        _, result = single.cargo("test")
+        text = "\n".join(path.read_text(errors="replace") for path in pathlib.Path(single.env["RUSTD_HOME"]).glob("**/log"))
+        check("one copy retains static and TypeId identity", result.returncode == 0 and how_built(result.stderr) == "daemon" and "cfg codegen body: bump: T compiled 0, redirected 1" in text and "TypeId restarts 1" not in text, result.stderr[-300:])
+    finally:
+        single.cargo("stop")
     return checks
 
 

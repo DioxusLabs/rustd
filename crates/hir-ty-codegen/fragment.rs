@@ -253,6 +253,7 @@ pub(super) const INLINED: u32 = u32::MAX;
 
 /// Collects the requests of one function while its IR is built.
 pub(super) struct Recorder<'db> {
+    pub(super) sharing: super::Sharing,
     pub(super) db: &'db dyn HirDatabase,
     pub(super) isa: &'static dyn TargetIsa,
     /// What `isa` generates code for.
@@ -300,6 +301,7 @@ impl<'db> Recorder<'db> {
         checked: bool,
     ) -> Self {
         Recorder {
+            sharing: super::Sharing::default(),
             db,
             isa,
             target,
