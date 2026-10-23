@@ -66,6 +66,8 @@ pub struct Eligibility {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct References {
     items: FxHashSet<AttrDefId>,
+    type_items: FxHashSet<AttrDefId>,
+    signature_types: FxHashSet<AttrDefId>,
     unknown: bool,
     generic_unresolved: bool,
 }
@@ -78,6 +80,7 @@ struct Collector<'db> {
     seen: FxHashSet<Ty<'db>>,
     traits: FxHashSet<TraitRef<'db>>,
     coroutines: FxHashSet<crate::db::InternedCoroutineId<'db>>,
+    type_depth: usize,
 }
 
 struct CandidateArgs<'a, 'db> {
@@ -311,8 +314,10 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Collector<'db> {
         if !self.seen.insert(ty) {
             return;
         }
+        self.type_depth += 1;
         match ty.kind() {
             TyKind::Adt(adt, args) => {
+                self.result.type_items.insert(adt.def_id().into());
                 self.result.items.insert(adt.def_id().into());
                 self.bounds(adt.def_id().into(), args);
             }
@@ -373,9 +378,23 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Collector<'db> {
             _ => (),
         }
         ty.super_visit_with(self);
+        self.type_depth -= 1;
     }
 
     fn visit_const(&mut self, konst: Const<'db>) {
+        if self.type_depth != 0
+            && let ConstKind::Unevaluated(uv) = konst.kind()
+        {
+            match uv.def.0 {
+                GeneralConstId::ConstId(id) => {
+                    self.result.type_items.insert(id.into());
+                }
+                GeneralConstId::StaticId(id) => {
+                    self.result.type_items.insert(id.into());
+                }
+                GeneralConstId::AnonConstId(_) => self.result.unknown = true,
+            }
+        }
         match konst.kind() {
             ConstKind::Unevaluated(uv) => match uv.def.0 {
                 GeneralConstId::ConstId(id) => {
@@ -409,6 +428,7 @@ fn references(db: &dyn HirDatabase, item: AttrDefId, initializer: bool) -> Refer
         seen: FxHashSet::default(),
         traits: FxHashSet::default(),
         coroutines: FxHashSet::default(),
+        type_depth: 0,
     };
     env.param_env.visit_with(&mut c);
     if let Some(def) = generic(item) {
@@ -484,6 +504,7 @@ fn references(db: &dyn HirDatabase, item: AttrDefId, initializer: bool) -> Refer
                     .values()
                     .map(|(id, _)| {
                         c.result.items.insert((*id).into());
+                        c.result.type_items.insert((*id).into());
                         (*id).into()
                     })
                     .collect(),
@@ -524,6 +545,7 @@ fn references(db: &dyn HirDatabase, item: AttrDefId, initializer: bool) -> Refer
         }
         _ => (),
     }
+    c.result.signature_types = c.result.type_items.clone();
     if let Some(owner) = body(db, item).filter(|_| initializer) {
         let lowered = Body::of(db, owner);
         let infer = InferenceResult::of(db, owner);
@@ -842,22 +864,94 @@ pub fn pair_safety(db: &dyn HirDatabase, normal: Crate, test: Crate) -> Vec<&'st
     veto
 }
 
-fn same_static_type(
+fn same_signature(
     db: &dyn HirDatabase,
     normal: Crate,
-    n: hir_def::StaticId,
-    t: hir_def::StaticId,
+    n: AttrDefId,
+    t: AttrDefId,
     twins: &FxHashMap<AttrDefId, AttrDefId>,
 ) -> bool {
     struct MapTypes<'a, 'db> {
         interner: DbInterner<'db>,
         twins: &'a FxHashMap<AttrDefId, AttrDefId>,
+        generics: FxHashMap<GenericDefId, GenericDefId>,
     }
     impl<'db> TypeFolder<DbInterner<'db>> for MapTypes<'_, 'db> {
         fn cx(&self) -> DbInterner<'db> {
             self.interner
         }
+        fn fold_region(
+            &mut self,
+            region: crate::next_solver::Region<'db>,
+        ) -> crate::next_solver::Region<'db> {
+            use crate::next_solver::{BoundRegionKind, Region, RegionKind};
+            match region.kind() {
+                RegionKind::ReEarlyParam(mut param) => {
+                    if let Some(&parent) = self.generics.get(&param.id.parent) {
+                        param.id.parent = parent;
+                    }
+                    Region::new_early_param(self.interner, param)
+                }
+                RegionKind::ReBound(index, mut bound) => {
+                    if matches!(bound.kind, BoundRegionKind::Named(_)) {
+                        bound.kind = BoundRegionKind::Anon;
+                    }
+                    Region::new(self.interner, RegionKind::ReBound(index, bound))
+                }
+                _ => region,
+            }
+        }
+        fn fold_const(&mut self, value: Const<'db>) -> Const<'db> {
+            if let ConstKind::Param(mut p) = value.kind()
+                && let Some(&parent) = self.generics.get(&p.id.parent())
+            {
+                p.id = hir_def::ConstParamId::from_unchecked(hir_def::TypeOrConstParamId {
+                    parent,
+                    local_id: p.id.local_id(),
+                });
+                return Const::new_param(self.interner, p);
+            }
+            value.super_fold_with(self)
+        }
         fn fold_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
+            if let TyKind::Param(p) = ty.kind()
+                && let Some(&parent) = self.generics.get(&p.id.parent())
+            {
+                let id = hir_def::TypeParamId::from_unchecked(hir_def::TypeOrConstParamId {
+                    parent,
+                    local_id: p.id.local_id(),
+                });
+                return Ty::new_param(self.interner, id, p.index);
+            }
+            if let TyKind::Alias(alias) = ty.kind()
+                && let AliasTyKind::Opaque { def_id } = alias.kind
+            {
+                let loc = match def_id.0.loc(self.interner.db()) {
+                    crate::ImplTraitId::ReturnTypeImplTrait(f, idx) => {
+                        self.twins.get(&f.into()).and_then(|id| match id {
+                            AttrDefId::FunctionId(f) => {
+                                Some(crate::ImplTraitId::ReturnTypeImplTrait(*f, idx))
+                            }
+                            _ => None,
+                        })
+                    }
+                    crate::ImplTraitId::TypeAliasImplTrait(a, idx) => {
+                        self.twins.get(&a.into()).and_then(|id| match id {
+                            AttrDefId::TypeAliasId(a) => {
+                                Some(crate::ImplTraitId::TypeAliasImplTrait(*a, idx))
+                            }
+                            _ => None,
+                        })
+                    }
+                };
+                if let Some(loc) = loc {
+                    return Ty::new_opaque(
+                        self.interner,
+                        crate::db::InternedOpaqueTyId::new(self.interner.db(), loc),
+                        alias.args.fold_with(self),
+                    );
+                }
+            }
             if let TyKind::Adt(adt, args) = ty.kind()
                 && let Some(AttrDefId::AdtId(n)) = self.twins.get(&adt.def_id().into())
             {
@@ -867,9 +961,94 @@ fn same_static_type(
         }
     }
     let interner = DbInterner::new_with(db, normal);
-    let n = db.type_for_static(n).skip_binder();
-    let t = db.type_for_static(t).skip_binder().fold_with(&mut MapTypes { interner, twins });
-    !n.references_error() && !t.references_error() && !n.has_non_region_infer() && n == t
+    let generics = twins.iter().filter_map(|(&t, &n)| Some((generic(t)?, generic(n)?))).collect();
+    let mut mapper = MapTypes { interner, twins, generics };
+    match (n, t) {
+        (AttrDefId::FunctionId(n), AttrDefId::FunctionId(t)) => {
+            let reads = hir_def::twins::item_cfg_reads(db, n.into());
+            if reads.unknown || reads.differs_from(t.krate(db).cfg_options(db)) {
+                return false;
+            }
+            let generics_match =
+                GenericParams::of(db, n.into()).len() == GenericParams::of(db, t.into()).len();
+            let n = db.callable_item_signature(n.into()).skip_binder().fold_with(&mut mapper);
+            let t = db.callable_item_signature(t.into()).skip_binder().fold_with(&mut mapper);
+            generics_match && !n.has_non_region_error() && !t.has_non_region_error() && n == t
+        }
+        (AttrDefId::StaticId(n), AttrDefId::StaticId(t)) => {
+            let n = db.type_for_static(n).skip_binder().fold_with(&mut mapper);
+            let t = db.type_for_static(t).skip_binder().fold_with(&mut mapper);
+            !n.has_non_region_error()
+                && !t.has_non_region_error()
+                && !n.has_non_region_infer()
+                && n == t
+        }
+        (AttrDefId::ConstId(n), AttrDefId::ConstId(t)) => {
+            let n = db.type_for_const(n).skip_binder().fold_with(&mut mapper);
+            let t = db.type_for_const(t).skip_binder().fold_with(&mut mapper);
+            !n.has_non_region_error()
+                && !t.has_non_region_error()
+                && !n.has_non_region_infer()
+                && n == t
+        }
+        (AttrDefId::TypeAliasId(n), AttrDefId::TypeAliasId(t)) => {
+            let n = db.ty(TyDefId::TypeAliasId(n)).skip_binder().fold_with(&mut mapper);
+            let t = db.ty(TyDefId::TypeAliasId(t)).skip_binder().fold_with(&mut mapper);
+            !n.has_non_region_error() && !t.has_non_region_error() && n == t
+        }
+        (AttrDefId::ImplId(n), AttrDefId::ImplId(t)) => {
+            let n_self = db.impl_self_ty(n).skip_binder().fold_with(&mut mapper);
+            let t_self = db.impl_self_ty(t).skip_binder().fold_with(&mut mapper);
+            !n_self.has_non_region_error()
+                && !t_self.has_non_region_error()
+                && n_self == t_self
+                && match (db.impl_trait(n), db.impl_trait(t)) {
+                    (None, None) => true,
+                    (Some(n), Some(t)) => {
+                        let n = n.skip_binder();
+                        let t = t.skip_binder();
+                        let id = match twins.get(&t.def_id.0.into()) {
+                            Some(AttrDefId::TraitId(id)) => *id,
+                            _ => t.def_id.0,
+                        };
+                        n == TraitRef::new_from_args(
+                            interner,
+                            id.into(),
+                            t.args.fold_with(&mut mapper),
+                        )
+                    }
+                    _ => false,
+                }
+        }
+        _ => true,
+    }
+}
+
+fn baked_type_values_match(db: &dyn HirDatabase, n: AttrDefId, t: AttrDefId) -> bool {
+    struct Values<'db>(Vec<Const<'db>>);
+    impl<'db> TypeVisitor<DbInterner<'db>> for Values<'db> {
+        type Result = ();
+        fn visit_const(&mut self, value: Const<'db>) {
+            if matches!(value.kind(), ConstKind::Value(_)) {
+                self.0.push(value);
+            }
+            value.super_visit_with(self);
+        }
+    }
+    let (Some(n), Some(t)) = (body(db, n), body(db, t)) else { return true };
+    let (n, t) = (InferenceResult::of(db, n), InferenceResult::of(db, t));
+    let values = |infer: &InferenceResult<'_>| {
+        infer
+            .type_of_expr
+            .iter()
+            .map(|(id, ty)| {
+                let mut values = Values(Vec::new());
+                ty.as_ref().visit_with(&mut values);
+                (id, values.0)
+            })
+            .collect::<Vec<_>>()
+    };
+    values(n) == values(t)
 }
 
 #[salsa::tracked(returns(ref))]
@@ -897,10 +1076,12 @@ pub fn pair_eligibility(
         .iter()
         .filter_map(|(&n, &t)| {
             let (AttrDefId::StaticId(n), AttrDefId::StaticId(t)) = (n, t) else { return None };
-            same_static_type(db, normal, n, t, &twins.twins).then_some(AttrDefId::from(n))
+            same_signature(db, normal, n.into(), t.into(), &twins.twins)
+                .then_some(AttrDefId::from(n))
         })
         .collect();
     let mut own = FxHashMap::default();
+    let mut all_refs = FxHashMap::default();
     for (&item, &node) in &nodes {
         let refs = references(db, item, !per_copy.contains(&item));
         let reason = if let Some(&t) = matched.get(&item) {
@@ -931,8 +1112,50 @@ pub fn pair_eligibility(
                 own.entry(node).or_insert(Rejection::Transitive);
             }
         }
+        all_refs.insert(item, refs);
     }
     let rejected = reverse_closure(&graph, own.keys().copied());
+    let compatible: FxHashSet<_> = matched
+        .iter()
+        .filter_map(|(&n, &t)| same_signature(db, normal, n, t, &twins.twins).then_some(n))
+        .collect();
+    let mut layout_graph = DiGraph::<AttrDefId, ()>::new();
+    for &item in graph.node_weights() {
+        layout_graph.add_node(item);
+    }
+    for (&item, refs) in &all_refs {
+        let targets = if matches!(item, AttrDefId::EnumVariantId(_)) {
+            &refs.items
+        } else if matches!(item, AttrDefId::FunctionId(_)) {
+            &refs.signature_types
+        } else {
+            &refs.type_items
+        };
+        for target in targets {
+            if let Some(&target) = nodes.get(target) {
+                layout_graph.add_edge(nodes[&item], target, ());
+            }
+        }
+    }
+    let layout_bad = reverse_closure(
+        &layout_graph,
+        nodes.iter().filter_map(|(&item, &node)| {
+            let bad = !compatible.contains(&item)
+                || match item {
+                    AttrDefId::ConstId(_) => rejected.contains(&node),
+                    AttrDefId::EnumVariantId(_) => {
+                        own.contains_key(&node)
+                            || all_refs[&item].items.iter().any(|target| {
+                                matches!(target, AttrDefId::ConstId(_) | AttrDefId::FunctionId(_))
+                                    && nodes.get(target).is_some_and(|node| rejected.contains(node))
+                            })
+                    }
+                    AttrDefId::AdtId(_) | AttrDefId::TypeAliasId(_) => own.contains_key(&node),
+                    _ => false,
+                };
+            bad.then_some(node)
+        }),
+    );
     let static_closure = reverse_closure(
         &graph,
         nodes.iter().filter_map(|(item, &node)| {
@@ -948,7 +1171,20 @@ pub fn pair_eligibility(
             .or_else(|| {
                 if let Some(reason) = own.get(&node).copied() {
                     Some(reason)
-                } else if rejected.contains(&node) {
+                } else if rejected.contains(&node)
+                    && (all_refs[&n].items.iter().any(|target| {
+                        target.module(db).krate(db) == normal
+                            && (!compatible.contains(target)
+                                || (all_refs[&n].type_items.contains(target)
+                                    || !matches!(
+                                        target,
+                                        AttrDefId::ConstId(_) | AttrDefId::EnumVariantId(_)
+                                    ))
+                                    && nodes
+                                        .get(target)
+                                        .is_none_or(|node| layout_bad.contains(node)))
+                    }) || !baked_type_values_match(db, n, t))
+                {
                     Some(Rejection::Transitive)
                 } else {
                     None
@@ -956,7 +1192,7 @@ pub fn pair_eligibility(
             });
         if let Some(reason) = reason {
             result.rejected.insert(t, reason);
-        } else if static_closure.contains(&node) {
+        } else if rejected.contains(&node) || static_closure.contains(&node) {
             result.analysis_shared.insert(t);
         } else {
             result.candidates.insert(t);

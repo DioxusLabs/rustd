@@ -51,6 +51,7 @@ impl Eq for CfgOptions {}
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CfgReads {
     pub atoms: BTreeMap<CfgAtom, bool>,
+    pub predicates: Vec<(CfgExpr, bool)>,
     pub read_all: Option<HashableCfgOptions>,
     pub unknown: bool,
 }
@@ -61,6 +62,13 @@ impl CfgReads {
         for (atom, answer) in &other.atoms {
             if self.atoms.insert(atom.clone(), *answer).is_some_and(|old| old != *answer) {
                 self.unknown = true;
+            }
+        }
+        for (predicate, answer) in &other.predicates {
+            if let Some((_, old)) = self.predicates.iter().find(|(p, _)| p == predicate) {
+                self.unknown |= old != answer;
+            } else {
+                self.predicates.push((predicate.clone(), *answer));
             }
         }
         if let Some(all) = &other.read_all {
@@ -77,6 +85,9 @@ impl CfgReads {
 
     pub fn differs_from(&self, options: &CfgOptions) -> bool {
         self.atoms.iter().any(|(atom, answer)| options.check_atom(atom) != *answer)
+            || self.predicates.iter().any(|(predicate, answer)| {
+                predicate.fold(&|atom| options.enabled.contains(atom)) != Some(*answer)
+            })
             || self.read_all.as_ref().is_some_and(|all| *all != options.to_hashable())
     }
 }
@@ -120,13 +131,26 @@ impl CfgOptions {
     }
 
     pub fn check(&self, cfg: &CfgExpr) -> Option<bool> {
-        let result = cfg.fold(&|atom| self.check_atom(atom));
-        if result.is_none()
-            && let Some(reads) = &self.reads
-        {
-            reads.0.lock().unwrap().unknown = true;
+        let result = cfg.fold(&|atom| self.enabled.contains(atom));
+        if let Some(reads) = &self.reads {
+            let mut reads = reads.0.lock().unwrap();
+            if let Some(result) = result {
+                if !reads
+                    .predicates
+                    .iter()
+                    .any(|(predicate, answer)| predicate == cfg && *answer == result)
+                {
+                    reads.predicates.push((cfg.clone(), result));
+                }
+            } else {
+                reads.unknown = true;
+            }
         }
         result
+    }
+
+    pub fn without_recording(&self) -> Self {
+        Self { enabled: self.enabled.clone(), reads: None }
     }
 
     pub fn check_atom(&self, cfg: &CfgAtom) -> bool {

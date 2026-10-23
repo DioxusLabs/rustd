@@ -24,13 +24,14 @@ fn cfg_read_recording() {
         ]))),
         Some(false)
     );
-    assert_eq!(reads.finish().atoms.len(), 1);
-    assert!(!reads.finish().atoms[&test]);
-    assert!(!reads.finish().atoms.contains_key(&feature));
-    assert!(!recorded.check_atom(&feature));
-    assert!(!reads.finish().atoms[&feature]);
+    assert!(reads.finish().atoms.is_empty());
+    assert_eq!(reads.finish().predicates.len(), 1);
     let mut changed = options.clone();
     changed.insert_atom(Symbol::intern("test"));
+    changed.insert_key_value(Symbol::intern("feature"), Symbol::intern("x"));
+    assert!(!reads.finish().agrees_with(&changed));
+    assert!(!recorded.check_atom(&feature));
+    assert!(!reads.finish().atoms[&feature]);
     assert!(!reads.finish().agrees_with(&changed));
     assert!(reads.finish().agrees_with(&options));
     let (_, empty) = options.recording();
@@ -41,6 +42,28 @@ fn cfg_read_recording() {
     assert!(reads.finish().unknown);
     assert!(!reads.finish().agrees_with(&options));
     assert!(empty.finish().atoms.is_empty());
+}
+
+#[test]
+fn predicate_results_and_diagnostics() {
+    let mut options = CfgOptions::default();
+    options.insert_key_value(Symbol::intern("feature"), Symbol::intern("x"));
+    let (recorded, reads) = options.recording();
+    let predicate = CfgExpr::Any(Box::new([
+        CfgExpr::Atom(CfgAtom::Flag(Symbol::intern("test"))),
+        CfgExpr::Atom(CfgAtom::KeyValue {
+            key: Symbol::intern("feature"),
+            value: Symbol::intern("x"),
+        }),
+    ]));
+    assert_eq!(recorded.check(&predicate), Some(true));
+    recorded.without_recording().to_hashable();
+    assert!(reads.finish().read_all.is_none());
+    let mut test = options.clone();
+    test.insert_atom(Symbol::intern("test"));
+    assert!(reads.finish().agrees_with(&test));
+    assert!(!reads.finish().agrees_with(&CfgOptions::default()));
+    assert!(reads.finish().atoms.is_empty());
 }
 
 #[track_caller]

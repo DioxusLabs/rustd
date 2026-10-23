@@ -119,6 +119,8 @@ fn observe_attrs_with(
                             | "non_exhaustive"
                             | "automatically_derived"
                             | "derive"
+                            | "macro_export"
+                            | "macro_use"
                             | "unsafe"
                     )
                 }) && !helper(&meta)
@@ -992,12 +994,23 @@ fn expr() { let _ = [#[cfg(test)] 1]; }
         assert_eq!(index.cfg_differing, 0);
         let item = *index.twins.values().next().unwrap();
         let reads = item_cfg_reads(&db, item);
-        assert_eq!(reads.atoms.len(), 1);
-        assert!(
-            !reads.atoms
-                [&cfg::CfgAtom::KeyValue { key: sym::feature, value: intern::Symbol::intern("x") }]
+        assert!(reads.atoms.is_empty());
+        assert_eq!(reads.predicates.len(), 1);
+        assert!(!reads.predicates[0].1);
+    }
+
+    #[test]
+    fn exported_macro_expansion_twins() {
+        let (db, normal, test) = pair(
+            r#"
+#[macro_export] macro_rules! value { () => { { const NAME: u32 = 1; NAME } } }
+fn caller() -> u32 { value!() }
+"#,
         );
-        assert!(!reads.atoms.contains_key(&cfg::CfgAtom::Flag(sym::test)));
+        let index = twin_index(&db, normal, test);
+        assert!(index.unmatched.is_empty());
+        assert!(index.unknown_items.is_empty());
+        assert!(index.twins.keys().any(|id| matches!(id, AttrDefId::ConstId(_))));
     }
 
     #[test]

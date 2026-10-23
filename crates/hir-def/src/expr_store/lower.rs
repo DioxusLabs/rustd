@@ -3446,11 +3446,10 @@ impl<'db> ExprCollector<'db> {
         match enabled {
             Ok(()) => true,
             Err(cfg) => {
-                _ = self.cfg_options.to_hashable();
                 self.store.diagnostics.push(ExpressionStoreDiagnostics::InactiveCode {
                     node: self.expander.in_file(SyntaxNodePtr::new(owner.syntax())),
                     cfg,
-                    opts: self.cfg_options.clone(),
+                    opts: self.cfg_options.without_recording(),
                 });
                 false
             }
