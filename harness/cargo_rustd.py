@@ -1606,7 +1606,7 @@ pub fn total() -> u64 {{ {total} }}
                 pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "let enabled = x != 0;\n    enabled"))
                 _, edited = side.cargo("test", "--lib")
                 fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
-                count = sum(map(int, re.findall(r"backend: cranelift compiled (\d+)", fresh)))
+                count = sum(map(int, re.findall(r"backend: (?:cranelift|llvm) compiled (\d+) functions,", fresh)))
                 counts[mode, prime] = count
                 name = f"cfg sharing: {mode} {prime}-prime body edit splices"
                 held = (built.returncode == edited.returncode == 0 and how_built(edited.stderr) == "daemon"

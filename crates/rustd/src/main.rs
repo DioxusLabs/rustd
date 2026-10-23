@@ -2657,6 +2657,19 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
     Ok(crates.len())
 }
 
+fn normal_twin(
+    db: &RootDatabase,
+    args: &Args,
+    test: ide_db::base_db::Crate,
+) -> Option<ide_db::base_db::Crate> {
+    let mut normal = args.members.iter().copied().filter(|&krate| {
+        !is_tested(db, krate)
+            && !doctest::is_documented(db, krate)
+            && krate.root_file_id(db) == test.root_file_id(db)
+    });
+    normal.next().filter(|_| normal.next().is_none())
+}
+
 fn program_sharing(db: &RootDatabase, args: &Args) -> hir_ty::mir::codegen::Sharing {
     let roots: Vec<_> = args
         .crates()
@@ -2673,12 +2686,7 @@ fn program_sharing(db: &RootDatabase, args: &Args) -> hir_ty::mir::codegen::Shar
         if !is_tested(db, test) || !present.contains(&test) {
             continue;
         }
-        let mut normal = args.members.iter().copied().filter(|&krate| {
-            !is_tested(db, krate)
-                && !doctest::is_documented(db, krate)
-                && krate.root_file_id(db) == test.root_file_id(db)
-        });
-        if let Some(normal) = normal.next().filter(|_| normal.next().is_none()) {
+        if let Some(normal) = normal_twin(db, args, test) {
             pairs.push((normal, test, present.contains(&normal)));
         }
     }
@@ -2710,12 +2718,7 @@ fn dump_twins(db: &RootDatabase, args: &Args) {
         .iter()
         .filter(|&&krate| is_tested(db, krate) && roots.contains(&krate.root_file_id(db)))
     {
-        let mut normal = args.members.iter().copied().filter(|&krate| {
-            !is_tested(db, krate)
-                && !doctest::is_documented(db, krate)
-                && krate.root_file_id(db) == test.root_file_id(db)
-        });
-        let Some(normal) = normal.next().filter(|_| normal.next().is_none()) else { continue };
+        let Some(normal) = normal_twin(db, args, test) else { continue };
         let index = hir_def::twins::twin_index(db, normal, test);
         let name = hir::Crate::from(test)
             .display_name(db)
@@ -2735,7 +2738,6 @@ fn dump_twins(db: &RootDatabase, args: &Args) {
             index.function_bodies.unmatched,
             index.function_bodies.unknown
         );
-        let start = Instant::now();
         let both = present.contains(&normal) && present.contains(&test);
         let eligibility = hir_ty::sharing::pair_eligibility(db, normal, test, both);
         let bodies = |items: &FxHashSet<hir_def::AttrDefId>| {
@@ -2755,23 +2757,15 @@ fn dump_twins(db: &RootDatabase, args: &Args) {
         };
         let enabled = eligibility.pair_veto.is_empty();
         eprintln!(
-            "cfg eligibility: {name}: fully-shared items {}, bodies {}; analysis-shared items {}, bodies {}; candidates fully-shared items {}, bodies {}, analysis-shared items {}, bodies {}; rejected bodies: cfg-differing {}, transitive {}, generic-unresolved {}, unknown {}; statics {}, test-only statics {}; pair veto: {veto}; both copies {both}; analysis {:.3}s, RSS {} MB",
-            if enabled { eligibility.candidates.len() } else { 0 },
+            "cfg eligibility: {name}: fully-shared bodies {}; analysis-shared bodies {}; rejected bodies: cfg-differing {}, transitive {}, generic-unresolved {}, unknown {}; statics {}, test-only statics {}; pair veto: {veto}; both copies {both}; TypeId: deferred to codegen",
             if enabled { bodies(&eligibility.candidates) } else { 0 },
-            if enabled { eligibility.analysis_shared.len() } else { 0 },
             if enabled { bodies(&eligibility.analysis_shared) } else { 0 },
-            eligibility.candidates.len(),
-            bodies(&eligibility.candidates),
-            eligibility.analysis_shared.len(),
-            bodies(&eligibility.analysis_shared),
             rejected(hir_ty::sharing::Rejection::CfgDiffering),
             rejected(hir_ty::sharing::Rejection::Transitive),
             rejected(hir_ty::sharing::Rejection::GenericUnresolved),
             rejected(hir_ty::sharing::Rejection::Unknown),
             eligibility.statics,
             eligibility.test_only_statics,
-            start.elapsed().as_secs_f64(),
-            memory::resident().unwrap_or(0),
         );
         if std::env::var("RUSTD_CFG_TWINS").is_ok_and(|value| value == "items") {
             for &item in &index.function_items {
@@ -2796,10 +2790,6 @@ fn dump_twins(db: &RootDatabase, args: &Args) {
                 );
             }
         }
-        eprintln!(
-            "cfg TypeId: {name}: program {}, both copies {both}; TypeId: deferred to codegen",
-            args.out.display()
-        );
     }
 }
 

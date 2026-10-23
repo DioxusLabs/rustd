@@ -304,7 +304,6 @@ impl Frozen {
 pub(super) struct Base {
     sharing: super::Sharing,
     decisions: Vec<u128>,
-    decision_entries: Vec<(String, u128)>,
     /// Whether the object says which lines its code is of, as a patch of it then does.
     debug: bool,
     entries: Vec<FunctionId>,
@@ -646,11 +645,6 @@ impl Base {
         Some(Base {
             sharing: sharing.clone(),
             decisions: sharing.decisions(db),
-            decision_entries: if std::env::var_os("RUSTD_STATS").is_some() {
-                sharing.decision_entries(db)
-            } else {
-                Vec::new()
-            },
             debug,
             rejected,
             entries: entries.to_vec(),
@@ -690,29 +684,7 @@ impl Base {
     }
 
     fn decisions_changed(&self, db: &dyn HirDatabase) -> bool {
-        let decisions = self.sharing.decisions(db);
-        if self.decisions == decisions {
-            return false;
-        }
-        if std::env::var_os("RUSTD_STATS").is_some() {
-            eprintln!("patch decisions: {:?} -> {decisions:?}", self.decisions);
-            let before: std::collections::BTreeMap<_, _> =
-                self.decision_entries.iter().cloned().collect();
-            let after: std::collections::BTreeMap<_, _> =
-                self.sharing.decision_entries(db).into_iter().collect();
-            let keys: std::collections::BTreeSet<_> = before.keys().chain(after.keys()).collect();
-            let changed: Vec<_> =
-                keys.into_iter().filter(|key| before.get(*key) != after.get(*key)).collect();
-            eprintln!("patch decisions: {} entries changed", changed.len());
-            for key in changed.into_iter().take(20) {
-                eprintln!(
-                    "patch decision entry: {key}: {:?} -> {:?}",
-                    before.get(key),
-                    after.get(key)
-                );
-            }
-        }
-        true
+        self.decisions != self.sharing.decisions(db)
     }
 
     /// Notes that a file changed: one of `crates`, or with `None` one we can't place.

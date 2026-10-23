@@ -2317,12 +2317,7 @@ fn program_instance_body<'db>(
             remap::monomorphized(db, sharing, &mapped, &instance.args, &env)
         })
         .map(Cow::Owned)
-        .map_err(|e| {
-            if std::env::var_os("RUSTD_CFG_SHARING_TRACE").is_some() {
-                eprintln!("sharing mono error: {instance:?}, env {:?}: {e:?}", env.krate);
-            }
-            CodegenError::Frontend(format!("mir: {e:?}"))
-        })
+        .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))
 }
 
 /// The types a body takes and returns, which is all its callers have to know about it. Asked
@@ -4012,7 +4007,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             self.sharing_stats.t_compiled += usize::from(!redirected);
             let analysis = !redirected && self.sharing.analysis_source(db, func).is_some();
             self.sharing_stats.analysis_shared_compiled += usize::from(analysis);
-            if std::env::var_os("RUSTD_CFG_TWINS").is_some() {
+            if std::env::var("RUSTD_CFG_TWINS").is_ok_and(|value| value == "items") {
                 eprintln!(
                     "cfg codegen body: {}: T compiled {}, redirected {}, analysis-shared {}",
                     FunctionSignature::of(db, func).name.as_str(),
@@ -12292,29 +12287,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         >,
         GenericArgs<'db>,
     ) {
-        let env = self.env;
-        let result = self.cg.db.lookup_impl_method(env, func, args);
-        if result.0 == either::Either::Left(func)
-            && matches!(func.loc(self.cg.db).container, ItemContainerId::TraitId(_))
-            && std::env::var_os("RUSTD_CFG_SHARING_TRACE").is_some()
-        {
-            eprintln!(
-                "sharing lookup unresolved: {:?} {args:?}, body env {:?}, lookup env {:?}, test env {}, self crate {:?}",
-                FunctionSignature::of(self.cg.db, func).name,
-                self.env.krate,
-                env.krate,
-                self.cg.sharing.test_crate(env.krate),
-                args.iter().next().and_then(|arg| arg.ty()).and_then(|ty| {
-                    match ty.kind() {
-                        TyKind::Adt(adt, _) => {
-                            Some((adt.def_id(), adt.def_id().module(self.cg.db).krate(self.cg.db)))
-                        }
-                        _ => None,
-                    }
-                })
-            );
-        }
-        result
+        self.cg.db.lookup_impl_method(self.env, func, args)
     }
 
     /// Calls `func` with arguments that live at the given addresses.

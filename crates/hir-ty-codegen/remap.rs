@@ -1,18 +1,17 @@
 use hir_def::{AdtId, AttrDefId, FunctionId, HasModule, VariantId};
+use rustc_type_ir::Interner;
+use triomphe::Arc;
 
-use super::CodegenError;
 use super::{
-    AggregateKind, MirBody, Operand, OperandKind, ProjectionElem, Result, Rvalue, Sharing,
-    StatementKind, TerminatorKind,
+    AggregateKind, CodegenError, MirBody, Operand, OperandKind, ProjectionElem, Result, Rvalue,
+    Sharing, StatementKind, TerminatorKind,
 };
-use crate::layout::{Layout, LayoutError, LayoutProvider};
-use crate::next_solver::{StoredGenericArgs, StoredTy};
-use crate::traits::StoredParamEnvAndCrate;
 use crate::{
     db::HirDatabase,
-    next_solver::{Allocation, AllocationData},
+    layout::{Layout, LayoutError, LayoutProvider},
+    next_solver::{Allocation, AllocationData, StoredGenericArgs, StoredTy},
+    traits::StoredParamEnvAndCrate,
 };
-use triomphe::Arc;
 
 pub(super) fn monomorphized<'db>(
     db: &'db dyn HirDatabase,
@@ -21,7 +20,6 @@ pub(super) fn monomorphized<'db>(
     args: &StoredGenericArgs,
     env: &StoredParamEnvAndCrate,
 ) -> std::result::Result<MirBody<'db>, super::super::MirLowerError<'db>> {
-    use rustc_type_ir::Interner;
     let interner = crate::next_solver::DbInterner::new_with(db, env.krate);
     crate::mir::monomorphization::monomorphized_with(db, body, args, env, &|id, args| {
         if let crate::ImplTraitId::ReturnTypeImplTrait(func, index) = id.loc(db)
@@ -91,12 +89,7 @@ impl<'db> LayoutProvider<'db> for ProgramLayout<'_, 'db> {
             env,
             self.sharing,
         )
-        .map_err(|e| {
-            if std::env::var_os("RUSTD_CFG_SHARING_TRACE").is_some() {
-                eprintln!("sharing coroutine layout error: {id:?}: {e:?}");
-            }
-            LayoutError::Unknown
-        })
+        .map_err(|_| LayoutError::Unknown)
     }
 }
 

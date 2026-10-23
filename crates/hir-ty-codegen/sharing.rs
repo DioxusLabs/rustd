@@ -15,11 +15,10 @@ use crate::{
 use super::{Instance, InstanceDef};
 
 #[salsa::tracked(returns(ref))]
-fn analysis_twins(
+fn reverse_twins(
     db: &dyn HirDatabase,
     normal: Crate,
     test: Crate,
-    _both: bool,
 ) -> rustc_hash::FxHashMap<AttrDefId, AttrDefId> {
     hir_def::twins::twin_index(db, normal, test).twins.iter().map(|(&t, &n)| (n, t)).collect()
 }
@@ -63,29 +62,6 @@ impl Sharing {
             return Vec::new();
         }
         self.pairs.iter().map(|&(n, t, both)| decision_serial(db, n, t, both)).collect()
-    }
-
-    pub(super) fn decision_entries(&self, db: &dyn HirDatabase) -> Vec<(String, u128)> {
-        let mut entries = Vec::new();
-        if self.is_empty() {
-            return entries;
-        }
-        for &(normal, test, both) in &self.pairs {
-            let twins = hir_def::twins::twin_index(db, normal, test);
-            let eligibility = crate::sharing::pair_eligibility(db, normal, test, both);
-            for (t, n) in &twins.twins {
-                entries.push((format!("{test:?} twin {t:?}"), super::print_of(n)));
-            }
-            for item in &eligibility.candidates {
-                entries.push((format!("{test:?} fully-shared {item:?}"), 1));
-            }
-            for item in &eligibility.analysis_shared {
-                entries.push((format!("{test:?} analysis-shared {item:?}"), 1));
-            }
-            entries.push((format!("{test:?} veto"), super::print_of(&eligibility.pair_veto)));
-        }
-        entries.sort_unstable();
-        entries
     }
 
     pub fn new(pairs: Vec<(Crate, Crate, bool)>) -> Self {
@@ -215,9 +191,9 @@ impl Sharing {
         item: AttrDefId,
     ) -> AttrDefId {
         let normal = source.krate(db);
-        for &(n, t, both) in &self.pairs {
+        for &(n, t, _) in &self.pairs {
             if n == normal && item.module(db).krate(db) == n {
-                return analysis_twins(db, n, t, both).get(&item).copied().unwrap_or(item);
+                return reverse_twins(db, n, t).get(&item).copied().unwrap_or(item);
             }
         }
         item
@@ -352,7 +328,7 @@ impl Sharing {
     fn link_item(&self, db: &dyn HirDatabase, item: AttrDefId) -> AttrDefId {
         for &(normal, test, both) in &self.pairs {
             if !both && item.module(db).krate(db) == normal {
-                if let Some(&t) = analysis_twins(db, normal, test, both).get(&item) {
+                if let Some(&t) = reverse_twins(db, normal, test).get(&item) {
                     return t;
                 }
             }
@@ -463,7 +439,7 @@ impl Sharing {
         for &(normal, test, both) in &self.pairs {
             if !both && func.krate(db) == normal {
                 if let Some(&AttrDefId::FunctionId(t)) =
-                    analysis_twins(db, normal, test, both).get(&func.into())
+                    reverse_twins(db, normal, test).get(&func.into())
                 {
                     return t;
                 }
@@ -488,9 +464,9 @@ impl<'db> Canonical<'_, 'db> {
             return item;
         }
         if let Some(normal) = self.analysis {
-            for &(n, t, both) in &self.sharing.pairs {
+            for &(n, t, _) in &self.sharing.pairs {
                 if n == normal && item.module(self.db).krate(self.db) == n {
-                    return analysis_twins(self.db, n, t, both).get(&item).copied().unwrap_or(item);
+                    return reverse_twins(self.db, n, t).get(&item).copied().unwrap_or(item);
                 }
             }
             return item;
