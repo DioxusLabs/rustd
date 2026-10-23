@@ -318,9 +318,11 @@ impl Sharing {
 
     pub(super) fn prewarm(&self, db: &dyn HirDatabase) {
         if self.local() {
-            for &(normal, test, _) in &self.pairs {
-                crate::sharing::local_pair_safety(db, normal, test);
-            }
+            super::backend::Tally::global().step(super::Step::LocalSafety, || {
+                for &(normal, test, _) in &self.pairs {
+                    crate::sharing::local_pair_safety(db, normal, test);
+                }
+            });
             return;
         }
         if self.is_empty() || self.snapshot.is_some() {
