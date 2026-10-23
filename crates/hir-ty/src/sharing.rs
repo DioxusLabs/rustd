@@ -1,11 +1,11 @@
-//! Diagnostic eligibility, without changing semantic or compilation identities.
+//! Eligibility for sharing analysis and codegen between normal and test crates.
 //!
 //! The reference inventory follows rustc's `MirNeighborCollector` in
 //! <https://github.com/rust-lang/rust/blob/1.93.0/compiler/rustc_monomorphize/src/collector.rs>:
 //! function operands, constants, statics, drops and unsizing can introduce code dependencies.
 //! Concrete calls use the selected impl; unresolved dispatch and vtables retain
-//! local impls whose instantiated trait arguments can unify. PairSafety must hold
-//! before using either diagnostic sharing class.
+//! local impls whose instantiated trait arguments can unify. `pair_safety` must hold
+//! before using either sharing class.
 //! ADT impl compatibility follows freshened impl-header comparison in
 //! <https://github.com/rust-lang/rust/blob/1.93.0/compiler/rustc_trait_selection/src/traits/coherence.rs>:
 //! retain possible overlaps without proving where-clauses.

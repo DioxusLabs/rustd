@@ -1,6 +1,6 @@
 //! Compute the binary representation of a type
 
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
 use hir_def::{
     AdtId, LocalFieldId, StructId,
@@ -15,7 +15,7 @@ use rustc_abi::{
 };
 use rustc_index::{IndexVec, bit_set::BitMatrix};
 use rustc_type_ir::{
-    FloatTy, IntTy, TypeVisitableExt as _, UintTy,
+    CoroutineArgs, FloatTy, IntTy, TypeVisitableExt as _, UintTy,
     inherent::{GenericArgs as _, IntoKind},
 };
 use triomphe::Arc;
@@ -23,10 +23,11 @@ use triomphe::Arc;
 use crate::{
     ParamEnvAndCrate,
     consteval::try_const_usize,
-    db::HirDatabase,
+    db::{HirDatabase, InternedCoroutineId},
+    mir::MirBody,
     next_solver::{
-        Const, ConstKind, DbInterner, GenericArgs, PatternKind, StoredTy, Ty, TyKind, TypingMode,
-        ValueConst,
+        Const, ConstKind, DbInterner, GenericArgs, PatternKind, StoredGenericArgs, StoredTy, Ty,
+        TyKind, TypingMode, ValueConst,
         infer::{DbInternerInferExt, traits::ObligationCause},
     },
     traits::StoredParamEnvAndCrate,
@@ -80,29 +81,29 @@ pub(crate) trait LayoutProvider<'db> {
     fn adt(
         &self,
         def: AdtId,
-        args: crate::next_solver::StoredGenericArgs,
+        args: StoredGenericArgs,
         env: StoredParamEnvAndCrate,
     ) -> Result<Arc<Layout>, LayoutError> {
         self.db().layout_of_adt(def, args, env)
     }
     fn coroutine(
         &self,
-        id: crate::db::InternedCoroutineId<'db>,
-        args: crate::next_solver::StoredGenericArgs,
+        id: InternedCoroutineId<'db>,
+        args: StoredGenericArgs,
         env: StoredParamEnvAndCrate,
         by_move: bool,
-    ) -> Result<std::borrow::Cow<'db, crate::mir::MirBody<'db>>, LayoutError> {
+    ) -> Result<Cow<'db, MirBody<'db>>, LayoutError> {
         let body = if by_move {
             self.db().monomorphized_mir_body_for_coroutine_by_move(id, args, env)
         } else {
             self.db().monomorphized_mir_body_for_coroutine(id, args, env)
         };
-        body.map(std::borrow::Cow::Borrowed).map_err(|_| LayoutError::Unknown)
+        body.map(Cow::Borrowed).map_err(|_| LayoutError::Unknown)
     }
     fn coroutine_is_by_move(
         &self,
-        id: crate::db::InternedCoroutineId<'db>,
-        args: rustc_type_ir::CoroutineArgs<DbInterner<'db>>,
+        id: InternedCoroutineId<'db>,
+        args: CoroutineArgs<DbInterner<'db>>,
     ) -> bool {
         crate::mir::is_by_move_coroutine(self.db(), id, args)
     }
