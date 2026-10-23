@@ -566,7 +566,6 @@ struct Snapshot {
     topology: Arc<Topology>,
     nodes: Arc<FxHashMap<super::patch::Node, Vec<usize>>>,
     bodies: Arc<FxHashMap<base_db::FileId, Vec<(FunctionId, crate::sharing::BodyItems)>>>,
-    nested: Arc<FxHashSet<base_db::FileId>>,
     edges: Arc<Vec<Edges>>,
     own: Vec<Option<u128>>,
     components: Vec<Option<u128>>,
@@ -668,31 +667,9 @@ impl Snapshot {
         let topology = Arc::new(reach_topology(db, input).clone());
         let mut nodes: FxHashMap<_, Vec<usize>> = FxHashMap::default();
         let mut functions: FxHashSet<FunctionId> = FxHashSet::default();
-        let mut nested = FxHashSet::default();
         let mut edges = Vec::new();
         let mut own = Vec::new();
         for (id, node) in topology.graph.nodes.iter().enumerate() {
-            let local = match node {
-                Node::Root(func) => func.module(db).block(db).is_some(),
-                Node::Instance(instance, _) => super::home::written_in(db, instance)
-                    .is_some_and(|func| func.module(db).block(db).is_some()),
-                Node::Static(statik) => statik.module(db).block(db).is_some(),
-            };
-            if local {
-                match node {
-                    Node::Root(func) => {
-                        nested.insert(super::home::body_file(db, (*func).into()));
-                    }
-                    Node::Instance(instance, _) => {
-                        if let Some(func) = super::home::written_in(db, instance) {
-                            nested.insert(super::home::body_file(db, func.into()));
-                        }
-                    }
-                    Node::Static(statik) => {
-                        nested.insert(super::home::body_file(db, (*statik).into()));
-                    }
-                }
-            }
             if let Some(func) = match node {
                 Node::Root(func) => Some(*func),
                 Node::Instance(instance, _) => super::home::written_in(db, instance),
@@ -755,7 +732,6 @@ impl Snapshot {
             topology,
             nodes: Arc::new(nodes),
             bodies: Arc::new(bodies),
-            nested: Arc::new(nested),
             edges: Arc::new(edges),
             own,
             components,
@@ -781,9 +757,6 @@ impl Snapshot {
             return Err("patch candidates unavailable");
         }
         for file in files {
-            if self.nested.contains(file) {
-                return Err("changed file contains nested items");
-            }
             if self
                 .bodies
                 .get(file)

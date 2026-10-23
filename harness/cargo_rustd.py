@@ -1676,6 +1676,17 @@ pub fn total() -> u64 {{ {total} }}
                 held = new_callee_edit.returncode == 0 and "reach fast path: unchanged edges" in fresh
                 checks.append((name, held, fresh[-700:]))
                 print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                nested_feature = feature.replace("impl Flag {", "const _: () = { impl Flag {").replace("enabled(x) } }", "enabled(x) } } };")
+                pathlib.Path(ws, "src/features.rs").write_text(nested_feature)
+                _, nested_prime = side.cargo("test", "--lib")
+                before = logs()
+                pathlib.Path(ws, "src/features.rs").write_text(nested_feature.replace("x != 0", "x != 2"))
+                _, nested_edit = side.cargo("test", "--lib")
+                fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                name = f"cfg sharing: {mode} {prime}-prime unrelated nested impl permits verified reach fast path"
+                held = nested_prime.returncode == nested_edit.returncode == 0 and "reach fast path: unchanged edges" in fresh and "reach full path" not in fresh
+                checks.append((name, held, fresh[-700:]))
+                print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
                 if mode == "on":
                     before = logs()
                     pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "let _ = cfg!(test); identity(x) != 0"))
