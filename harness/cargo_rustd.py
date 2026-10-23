@@ -1558,6 +1558,73 @@ pub fn flatten() -> Option<u8> {
         check("one-copy analysis Flatten uses N impl environment", result.returncode == 0 and "cfg codegen body: flatten: T compiled 1, redirected 0, analysis-shared 1" in text and "cfg analysis query: mir flatten: test true" not in text and "cfg analysis query: infer flatten: test true" not in text, result.stderr[-300:])
     finally:
         single.cargo("stop")
+    return checks + test_graph_sharing_incremental(work)
+
+
+def test_graph_sharing_incremental(work):
+    checks, counts = [], {}
+    for mode in ("on", "off"):
+        ws = os.path.realpath(os.path.join(work, "sharing-incremental-" + mode))
+        functions = "\n".join(f"pub fn f{i}<T: Copy>(x: T) -> (T, u64) {{ (x, if enabled(1) {{ {i} }} else {{ 0 }}) }}" for i in range(400))
+        total = "+".join(f"f{i}(1u64).1" for i in range(400))
+        feature = "pub fn enabled(x: u64) -> bool { x != 0 }\n" + functions + "\n"
+        files = {
+            "Cargo.toml": '[package]\nname="sharing_incremental"\nversion="0.1.0"\nedition="2021"\n[workspace]\nmembers=["probe"]\n[dev-dependencies]\nprobe={path="probe"}\n',
+            "probe/Cargo.toml": '[package]\nname="probe"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nsharing_incremental={path=".."}\n',
+            "probe/src/lib.rs": 'pub fn total() -> u64 { sharing_incremental::total() }\npub fn different() -> u64 { sharing_incremental::different() }\n',
+            "src/features.rs": feature,
+            "src/lib.rs": f'''mod features;
+pub use features::*;
+pub fn total() -> u64 {{ {total} }}
+#[cfg(not(test))] pub fn different() -> u64 {{ 2 }}
+#[cfg(test)] pub fn different() -> u64 {{ 1 }}
+#[cfg(test)] mod tests {{
+    #[test] fn copies() {{
+        assert_eq!(super::total(), 79800);
+        assert_eq!(super::total(), probe::total());
+        assert_eq!(super::different(), 1);
+        assert_eq!(probe::different(), 2);
+    }}
+}}
+''',
+        }
+        for name, text in files.items():
+            path = pathlib.Path(ws, name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        store = os.path.join(work, "store-sharing-incremental-" + mode)
+        for prime in ("cold", "retained"):
+            env = dict(base_env(os.path.join(work, f"hi-{mode}-{prime[0]}")), RUSTD_CACHE=store,
+                       RUSTD_STATS="1", RUSTD_CFG_SHARING="1" if mode == "on" else "0")
+            side = Side(ws, env, True)
+            def logs():
+                return {path: path.read_text(errors="replace") for path in pathlib.Path(env["RUSTD_HOME"]).glob("**/log")}
+            try:
+                _, built = side.cargo("test", "--lib")
+                wait_warm(side, ws)
+                before = logs()
+                pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "let enabled = x != 0;\n    enabled"))
+                _, edited = side.cargo("test", "--lib")
+                fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                count = sum(map(int, re.findall(r"backend: cranelift compiled (\d+)", fresh)))
+                counts[mode, prime] = count
+                name = f"cfg sharing: {mode} {prime}-prime body edit splices"
+                held = (built.returncode == edited.returncode == 0 and how_built(edited.stderr) == "daemon"
+                        and "spliced:" in fresh and "the whole object was written again" not in fresh
+                        and "cfg sharing decisions changed" not in fresh and "patch discard:" not in fresh)
+                detail = f"{count} backend functions; {fresh[-700:]}"
+                checks.append((name, held, detail))
+                print(f"  {'ok ' if held else 'NOT'} {name}  {detail}", flush=True)
+            finally:
+                side.cargo("stop")
+                pathlib.Path(ws, "src/features.rs").write_text(feature)
+    for prime in ("cold", "retained"):
+        name = f"cfg sharing: {prime}-prime edit backend count <= off + 2"
+        on, off = counts["on", prime], counts["off", prime]
+        held = 0 < on <= off + 2
+        detail = f"on {on}, off {off}"
+        checks.append((name, held, detail))
+        print(f"  {'ok ' if held else 'NOT'} {name}  {detail}", flush=True)
     return checks
 
 

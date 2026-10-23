@@ -65,6 +65,29 @@ impl Sharing {
         self.pairs.iter().map(|&(n, t, both)| decision_serial(db, n, t, both)).collect()
     }
 
+    pub(super) fn decision_entries(&self, db: &dyn HirDatabase) -> Vec<(String, u128)> {
+        let mut entries = Vec::new();
+        if self.is_empty() {
+            return entries;
+        }
+        for &(normal, test, both) in &self.pairs {
+            let twins = hir_def::twins::twin_index(db, normal, test);
+            let eligibility = crate::sharing::pair_eligibility(db, normal, test, both);
+            for (t, n) in &twins.twins {
+                entries.push((format!("{test:?} twin {t:?}"), super::print_of(n)));
+            }
+            for item in &eligibility.candidates {
+                entries.push((format!("{test:?} fully-shared {item:?}"), 1));
+            }
+            for item in &eligibility.analysis_shared {
+                entries.push((format!("{test:?} analysis-shared {item:?}"), 1));
+            }
+            entries.push((format!("{test:?} veto"), super::print_of(&eligibility.pair_veto)));
+        }
+        entries.sort_unstable();
+        entries
+    }
+
     pub fn new(pairs: Vec<(Crate, Crate, bool)>) -> Self {
         Self { pairs, enabled: true }
     }

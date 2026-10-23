@@ -593,10 +593,15 @@ impl CodegenUnit {
         let on_demand: FxHashSet<FunctionId> = roots.on_demand.iter().copied().collect();
         let all = || roots.entries.iter().chain(roots.on_demand).copied();
         let mut declined = None;
-        // Code of the checkout comes from the store in the first build alone: what a patch is
-        // of has to be compiled here, to tell what an edit changes.
-        let hydrate = known.base.is_none();
-        if let Some(base) = known.base.take().filter(|it| !it.outdated()) {
+        // A patch base needs the checkout's instance identities and dependency edges,
+        // which opaque store entries do not preserve.
+        let hydrate = !known.patching && known.base.is_none();
+        if let Some(base) = known.base.take().filter(|it| {
+            if it.outdated() && std::env::var_os("RUSTD_STATS").is_some() {
+                eprintln!("patch discard: cached checkout code invalidated by edit");
+            }
+            !it.outdated()
+        }) {
             let own_statics = OwnStatics::new(
                 db,
                 all().map(|root| root.krate(db)).collect(),
@@ -621,10 +626,18 @@ impl CodegenUnit {
             let patch = match patch {
                 Ok(Ok(patch)) => Some(patch),
                 Ok(Err(why)) => {
+                    if std::env::var_os("RUSTD_STATS").is_some() {
+                        eprintln!("patch decline: {why}");
+                    }
                     declined = Some(why);
                     None
                 }
-                Err(_) => None,
+                Err(error) => {
+                    if std::env::var_os("RUSTD_STATS").is_some() {
+                        eprintln!("patch decline: {error}");
+                    }
+                    None
+                }
             };
             if let Some(patch) = patch {
                 backend::Tally::global().report();
@@ -884,6 +897,9 @@ impl CodegenUnit {
                 };
                 if patching {
                     *base = patch::Base::record(db, &cg, roots.entries, &compiled, &skipped);
+                    if base.is_none() && std::env::var_os("RUSTD_STATS").is_some() {
+                        eprintln!("patch discard: could not record base");
+                    }
                 }
                 if let Some(path) = std::env::var_os("RUSTD_LAYOUTS") {
                     let lines = cg
