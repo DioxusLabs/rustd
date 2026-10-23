@@ -3,9 +3,9 @@
 //! The reference inventory follows rustc's `MirNeighborCollector` in
 //! <https://github.com/rust-lang/rust/blob/1.93.0/compiler/rustc_monomorphize/src/collector.rs>:
 //! function operands, constants, statics, drops and unsizing can introduce code dependencies.
-//! At definition level, trait dispatch and vtables conservatively reach every local impl
-//! of the trait, instead of rustc's instance-selected methods. Drop likewise reaches local
-//! destructors. PairSafety must hold before using either diagnostic sharing class.
+//! Concrete calls use the selected impl; unresolved dispatch and vtables retain
+//! local impls whose instantiated trait arguments can unify. PairSafety must hold
+//! before using either diagnostic sharing class.
 //! Textual macro escape follows `define_macro` and module visitation in
 //! `rustc_resolve/src/build_reduced_graph.rs` at the same rustc tag.
 
@@ -17,7 +17,7 @@ use hir_def::{
     ItemContainerId, Lookup, ModuleDefId, TraitId, VariantId,
     attrs::AttrFlags,
     expr_store::Body,
-    hir::{Expr, Pat},
+    hir::{Expr, Pat, generics::GenericParams},
     resolver::{HasResolver, ValueNs},
     signatures::{ConstSignature, FunctionSignature, ImplSignature, TypeAliasSignature},
     twins::{crate_items, scope_pairs, twin_index},
@@ -25,16 +25,21 @@ use hir_def::{
 use hir_expand::mod_path::{ModPath, PathKind};
 use petgraph::{algo::kosaraju_scc, graph::DiGraph};
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_type_ir::{TypeSuperVisitable, TypeVisitable, TypeVisitor, inherent::IntoKind};
+use rustc_type_ir::{
+    TypeFoldable, TypeFolder, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable,
+    TypeVisitableExt, TypeVisitor, inherent::IntoKind,
+};
 
 use crate::{
-    InferenceResult, TyDefId,
+    InferenceResult, Span, TyDefId,
     db::{GeneralConstId, HirDatabase},
+    lower::GenericPredicates,
     method_resolution::CandidateId,
     mir::{Operand, OperandKind, Rvalue, StatementKind, TerminatorKind},
     next_solver::{
         AliasTyKind, ClauseKind, Const, ConstKind, DbInterner, ExistentialPredicate, GenericArgs,
-        Ty, TyKind, TypingMode, infer::DbInternerInferExt,
+        TraitRef, Ty, TyKind, TypingMode,
+        infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
     },
     traits::ParamEnvAndCrate,
 };
@@ -71,8 +76,47 @@ struct Collector<'db> {
     env: ParamEnvAndCrate<'db>,
     result: References,
     seen: FxHashSet<Ty<'db>>,
-    traits: FxHashSet<TraitId>,
+    traits: FxHashSet<TraitRef<'db>>,
     coroutines: FxHashSet<crate::db::InternedCoroutineId<'db>>,
+}
+
+struct CandidateArgs<'a, 'db> {
+    infcx: &'a InferCtxt<'db>,
+    types: FxHashMap<Ty<'db>, Ty<'db>>,
+    consts: FxHashMap<Const<'db>, Const<'db>>,
+}
+
+impl<'db> TypeFolder<DbInterner<'db>> for CandidateArgs<'_, 'db> {
+    fn cx(&self) -> DbInterner<'db> {
+        self.infcx.interner
+    }
+
+    fn fold_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
+        if matches!(
+            ty.kind(),
+            TyKind::Param(_)
+                | TyKind::Alias(_)
+                | TyKind::Dynamic(..)
+                | TyKind::Error(_)
+                | TyKind::Bound(..)
+                | TyKind::Placeholder(_)
+        ) {
+            *self.types.entry(ty).or_insert_with(|| self.infcx.next_ty_var(Span::Dummy))
+        } else {
+            ty.super_fold_with(self)
+        }
+    }
+
+    fn fold_const(&mut self, value: Const<'db>) -> Const<'db> {
+        if matches!(
+            value.kind(),
+            ConstKind::Param(_) | ConstKind::Unevaluated(_) | ConstKind::Error(_)
+        ) {
+            *self.consts.entry(value).or_insert_with(|| self.infcx.next_const_var(Span::Dummy))
+        } else {
+            value.super_fold_with(self)
+        }
+    }
 }
 
 fn generic(item: AttrDefId) -> Option<GenericDefId> {
@@ -115,33 +159,106 @@ fn local_trait_impls(db: &dyn HirDatabase, krate: Crate) -> FxHashMap<TraitId, V
 }
 
 impl<'db> Collector<'db> {
-    fn trait_impls(&mut self, id: TraitId) {
-        if !self.traits.insert(id) {
+    fn trait_impls(&mut self, trait_ref: TraitRef<'db>) {
+        if !self.traits.insert(trait_ref) {
             return;
         }
+        let id = trait_ref.def_id.0;
         self.result.items.insert(id.into());
+        let infcx =
+            DbInterner::new_with(self.db, self.krate).infer_ctxt().build(TypingMode::PostAnalysis);
+        let trait_ref = rustc_type_ir::fold_regions(infcx.interner, trait_ref, |_, _| {
+            crate::next_solver::Region::new_erased(infcx.interner)
+        });
+        let trait_ref = if trait_ref.has_escaping_bound_vars() {
+            trait_ref
+        } else {
+            infcx
+                .at(&ObligationCause::dummy(), self.env.param_env)
+                .deeply_normalize(trait_ref)
+                .unwrap_or(trait_ref)
+        };
+        if !trait_ref.has_escaping_bound_vars()
+            && let Some((selected, _)) =
+                crate::method_resolution::find_matching_impl(&infcx, self.env.param_env, trait_ref)
+        {
+            if let crate::next_solver::AnyImplId::ImplId(id) = selected {
+                self.result.items.insert(id.into());
+            }
+            return;
+        }
         if let Some(impls) = local_trait_impls(self.db, self.krate).get(&id) {
-            self.result.items.extend(impls.iter().copied().map(AttrDefId::from));
+            for &id in impls {
+                let (applicable, unresolved) = infcx.probe(|_| {
+                    let args = infcx.fresh_args_for_item(Span::Dummy, id.into());
+                    let candidate = self
+                        .db
+                        .impl_trait(id)
+                        .unwrap()
+                        .instantiate(infcx.interner, args)
+                        .skip_norm_wip();
+                    if trait_ref.has_escaping_bound_vars() || candidate.has_escaping_bound_vars() {
+                        return (true, true);
+                    }
+                    let mut folder = CandidateArgs {
+                        infcx: &infcx,
+                        types: FxHashMap::default(),
+                        consts: FxHashMap::default(),
+                    };
+                    let target = trait_ref.fold_with(&mut folder);
+                    let unresolved = !folder.types.is_empty()
+                        || !folder.consts.is_empty()
+                        || target.has_non_region_infer();
+                    let candidate = candidate.fold_with(&mut folder);
+                    let applicable = infcx
+                        .at(&ObligationCause::dummy(), self.env.param_env)
+                        .eq(target, candidate)
+                        .is_ok();
+                    (applicable, unresolved)
+                });
+                if applicable && unresolved {
+                    self.result.items.insert(id.into());
+                } else if applicable {
+                    self.result.generic_unresolved = true;
+                }
+            }
         }
     }
 
-    fn bounds(&mut self, def: GenericDefId) {
-        let env = self.db.trait_environment(def);
-        for clause in env.clauses().iter() {
+    fn bounds(&mut self, def: GenericDefId, args: GenericArgs<'db>) {
+        let interner = DbInterner::new_with(self.db, self.krate);
+        for clause in
+            GenericPredicates::query_all(self.db, def).iter_instantiated(interner, args.as_slice())
+        {
+            let clause = clause.skip_norm_wip();
             if let ClauseKind::Trait(pred) = clause.kind().skip_binder() {
-                self.trait_impls(pred.trait_ref.def_id.0);
+                self.trait_impls(pred.trait_ref);
             }
+            clause.visit_with(self);
         }
-        env.visit_with(self);
     }
 
     fn function(&mut self, func: FunctionId, args: GenericArgs<'db>) {
         args.visit_with(self);
-        self.bounds(func.into());
-        let (resolved, _) = self.db.lookup_impl_method(self.env, func, args);
+        let interner = DbInterner::new_with(self.db, self.krate);
+        let args = rustc_type_ir::fold_regions(interner, args, |_, _| {
+            crate::next_solver::Region::new_erased(interner)
+        });
+        let (resolved, _) = if args.has_escaping_bound_vars() {
+            (either::Either::Left(func), args)
+        } else {
+            self.db.lookup_impl_method(self.env, func, args)
+        };
+        self.bounds(func.into(), args);
         let either::Either::Left(resolved) = resolved else {
             if let ItemContainerId::TraitId(id) = func.lookup(self.db).container {
-                self.trait_impls(id);
+                let interner = DbInterner::new_with(self.db, self.krate);
+                let count = GenericParams::of(self.db, id.into()).len();
+                self.trait_impls(TraitRef::new_from_args(
+                    interner,
+                    id.into(),
+                    GenericArgs::new_from_slice(&args[..count]),
+                ));
             } else {
                 self.result.generic_unresolved = true;
             }
@@ -152,7 +269,15 @@ impl<'db> Collector<'db> {
             ItemContainerId::ImplId(id) => {
                 self.result.items.insert(id.into());
             }
-            ItemContainerId::TraitId(id) => self.trait_impls(id),
+            ItemContainerId::TraitId(id) => {
+                let interner = DbInterner::new_with(self.db, self.krate);
+                let count = GenericParams::of(self.db, id.into()).len();
+                self.trait_impls(TraitRef::new_from_args(
+                    interner,
+                    id.into(),
+                    GenericArgs::new_from_slice(&args[..count]),
+                ));
+            }
             _ => (),
         }
     }
@@ -187,9 +312,9 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Collector<'db> {
             return;
         }
         match ty.kind() {
-            TyKind::Adt(adt, _) => {
+            TyKind::Adt(adt, args) => {
                 self.result.items.insert(adt.def_id().into());
-                self.bounds(adt.def_id().into());
+                self.bounds(adt.def_id().into(), args);
             }
             TyKind::FnDef(def, args) => match def.0 {
                 CallableDefId::FunctionId(id) => self.function(id, args),
@@ -202,7 +327,11 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Collector<'db> {
             },
             TyKind::Alias(alias) => match alias.kind {
                 AliasTyKind::Projection { def_id } => match def_id.0.lookup(self.db).container {
-                    ItemContainerId::TraitId(id) => self.trait_impls(id),
+                    ItemContainerId::TraitId(_) => {
+                        self.trait_impls(
+                            alias.trait_ref(DbInterner::new_with(self.db, self.krate)),
+                        );
+                    }
                     ItemContainerId::ImplId(id) => {
                         self.result.items.insert(id.into());
                     }
@@ -212,7 +341,7 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Collector<'db> {
                     if let Some(bounds) = ty.impl_trait_bounds(self.db) {
                         for clause in bounds {
                             if let ClauseKind::Trait(pred) = clause.kind().skip_binder() {
-                                self.trait_impls(pred.trait_ref.def_id.0);
+                                self.trait_impls(pred.trait_ref);
                             }
                             clause.visit_with(self);
                         }
@@ -223,13 +352,16 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Collector<'db> {
                 _ => self.result.generic_unresolved = true,
             },
             TyKind::Dynamic(bounds, _) => {
-                use rustc_type_ir::inherent::BoundExistentialPredicates;
-                if let Some(id) = bounds.principal_def_id() {
-                    self.trait_impls(id.0);
-                }
                 for bound in bounds.iter() {
-                    if let ExistentialPredicate::AutoTrait(id) = bound.skip_binder() {
-                        self.trait_impls(id.0);
+                    let interner = DbInterner::new_with(self.db, self.krate);
+                    match bound.skip_binder() {
+                        ExistentialPredicate::Trait(tr) => {
+                            self.trait_impls(tr.with_self_ty(interner, ty))
+                        }
+                        ExistentialPredicate::AutoTrait(id) => {
+                            self.trait_impls(TraitRef::new(interner, id, [ty]))
+                        }
+                        ExistentialPredicate::Projection(_) => (),
                     }
                 }
             }
@@ -262,7 +394,7 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Collector<'db> {
 }
 
 #[salsa::tracked(returns(ref))]
-fn references(db: &dyn HirDatabase, item: AttrDefId) -> References {
+fn references(db: &dyn HirDatabase, item: AttrDefId, initializer: bool) -> References {
     let krate = item.module(db).krate(db);
     let env = ParamEnvAndCrate {
         param_env: generic(item)
@@ -280,7 +412,9 @@ fn references(db: &dyn HirDatabase, item: AttrDefId) -> References {
     };
     env.param_env.visit_with(&mut c);
     if let Some(def) = generic(item) {
-        c.bounds(def);
+        let interner = DbInterner::new_with(db, krate);
+        use rustc_type_ir::inherent::GenericArgs as _;
+        c.bounds(def, GenericArgs::identity_for_item(interner, def.into()));
         let defaults = db.generic_defaults(def);
         for index in 0..crate::generics::generics(db, def).len(false) {
             if let Some(default) = defaults.get(index) {
@@ -317,7 +451,13 @@ fn references(db: &dyn HirDatabase, item: AttrDefId) -> References {
             if let ItemContainerId::TraitId(trait_id) = id.lookup(db).container
                 && TypeAliasSignature::of(db, id).ty.is_none()
             {
-                c.trait_impls(trait_id);
+                let interner = DbInterner::new_with(db, krate);
+                use rustc_type_ir::inherent::GenericArgs as _;
+                c.trait_impls(TraitRef::new_from_args(
+                    interner,
+                    trait_id.into(),
+                    GenericArgs::identity_for_item(interner, trait_id.into()),
+                ));
             } else {
                 db.ty(TyDefId::TypeAliasId(id)).skip_binder().visit_with(&mut c);
             }
@@ -384,7 +524,7 @@ fn references(db: &dyn HirDatabase, item: AttrDefId) -> References {
         }
         _ => (),
     }
-    if let Some(owner) = body(db, item) {
+    if let Some(owner) = body(db, item).filter(|_| initializer) {
         let lowered = Body::of(db, owner);
         let infer = InferenceResult::of(db, owner);
         c.result.unknown |= infer.has_errors;
@@ -487,7 +627,11 @@ fn references(db: &dyn HirDatabase, item: AttrDefId) -> References {
                                     .is_empty()
                                     && let Some(id) = hir_def::lang_item::lang_items(db, krate).Drop
                                 {
-                                    c.trait_impls(id);
+                                    c.trait_impls(TraitRef::new(
+                                        infcx.interner,
+                                        id.into(),
+                                        [mir.locals[place.local].ty.as_ref()],
+                                    ));
                                 }
                             }
                             match &term.kind {
@@ -698,6 +842,36 @@ pub fn pair_safety(db: &dyn HirDatabase, normal: Crate, test: Crate) -> Vec<&'st
     veto
 }
 
+fn same_static_type(
+    db: &dyn HirDatabase,
+    normal: Crate,
+    n: hir_def::StaticId,
+    t: hir_def::StaticId,
+    twins: &FxHashMap<AttrDefId, AttrDefId>,
+) -> bool {
+    struct MapTypes<'a, 'db> {
+        interner: DbInterner<'db>,
+        twins: &'a FxHashMap<AttrDefId, AttrDefId>,
+    }
+    impl<'db> TypeFolder<DbInterner<'db>> for MapTypes<'_, 'db> {
+        fn cx(&self) -> DbInterner<'db> {
+            self.interner
+        }
+        fn fold_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
+            if let TyKind::Adt(adt, args) = ty.kind()
+                && let Some(AttrDefId::AdtId(n)) = self.twins.get(&adt.def_id().into())
+            {
+                return Ty::new_adt(self.interner, *n, args.fold_with(self));
+            }
+            ty.super_fold_with(self)
+        }
+    }
+    let interner = DbInterner::new_with(db, normal);
+    let n = db.type_for_static(n).skip_binder();
+    let t = db.type_for_static(t).skip_binder().fold_with(&mut MapTypes { interner, twins });
+    !n.references_error() && !t.references_error() && !n.has_non_region_infer() && n == t
+}
+
 #[salsa::tracked(returns(ref))]
 pub fn pair_eligibility(
     db: &dyn HirDatabase,
@@ -719,13 +893,20 @@ pub fn pair_eligibility(
     let nodes: FxHashMap<_, _> =
         crate_items(db, normal).items.iter().map(|&item| (item, graph.add_node(item))).collect();
     let matched: FxHashMap<_, _> = twins.twins.iter().map(|(&t, &n)| (n, t)).collect();
+    let per_copy: FxHashSet<_> = matched
+        .iter()
+        .filter_map(|(&n, &t)| {
+            let (AttrDefId::StaticId(n), AttrDefId::StaticId(t)) = (n, t) else { return None };
+            same_static_type(db, normal, n, t, &twins.twins).then_some(AttrDefId::from(n))
+        })
+        .collect();
     let mut own = FxHashMap::default();
     for (&item, &node) in &nodes {
-        let refs = references(db, item);
+        let refs = references(db, item, !per_copy.contains(&item));
         let reason = if let Some(&t) = matched.get(&item) {
-            if twins.cfg_differing_items.contains(&t) {
+            if !per_copy.contains(&item) && twins.cfg_differing_items.contains(&t) {
                 Some(Rejection::CfgDiffering)
-            } else if twins.unknown_items.contains(&t) {
+            } else if !per_copy.contains(&item) && twins.unknown_items.contains(&t) {
                 Some(Rejection::Unknown)
             } else if refs.generic_unresolved {
                 Some(Rejection::GenericUnresolved)

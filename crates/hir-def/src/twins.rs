@@ -11,6 +11,8 @@
 //! expansion marks are mapped as in rustc_span/src/hygiene.rs; unmappable marks reject a twin.
 //! Derive placeholders accompany the original fragment in `fully_expand_fragment`;
 //! derives append items rather than rewrite their input ADT.
+//! Inert derive helpers follow the resolved DeriveHelper bindings constructed by
+//! rustc_resolve/src/macros.rs at the same tag; their owning expansion is still compared.
 
 use std::ops::ControlFlow;
 
@@ -64,6 +66,15 @@ pub(crate) fn observe_attrs(
     options: &CfgOptions,
     reads: &mut CfgReads,
 ) -> bool {
+    observe_attrs_with(owner, options, reads, |_| false)
+}
+
+fn observe_attrs_with(
+    owner: &ast::AnyHasAttrs,
+    options: &CfgOptions,
+    reads: &mut CfgReads,
+    helper: impl Fn(&ast::Meta) -> bool,
+) -> bool {
     use ast::HasAttrs as _;
     for attr in owner.attrs() {
         if attr.meta().is_none()
@@ -110,7 +121,8 @@ pub(crate) fn observe_attrs(
                             | "derive"
                             | "unsafe"
                     )
-                }) {
+                }) && !helper(&meta)
+                {
                     reads.unknown = true;
                 }
             }
@@ -126,8 +138,24 @@ pub fn item_cfg_reads(db: &dyn SourceDatabase, item: AttrDefId) -> CfgReads {
     let krate = item.module(db).krate(db);
     let (options, recorder) = krate.cfg_options(db).recording();
     let mut reads = CfgReads::default();
+    let observe = |owner: &ast::AnyHasAttrs, reads: &mut CfgReads| {
+        observe_attrs_with(owner, &options, reads, |meta| {
+            let Some(name) = meta.path().and_then(|path| path.as_single_name_ref()) else {
+                return false;
+            };
+            let Some(adt) = owner.syntax().ancestors().find_map(ast::Adt::cast) else {
+                return false;
+            };
+            let Some(id) = ast_id(db, item) else { return false };
+            let map = id.file_id.ast_id_map(db);
+            let adt_id = hir_expand::AstId::new(id.file_id, map.ast_id(&adt));
+            item.module(db).def_map(db).derive_helpers_in_scope(adt_id).is_some_and(|helpers| {
+                helpers.iter().any(|(helper, _, _)| helper.symbol().as_str() == name.text())
+            })
+        })
+    };
     if let Some(attrs) = crate::attrs::parse_extra_crate_attrs(db, krate) {
-        observe_attrs(&ast::AnyHasAttrs::new(attrs), &options, &mut reads);
+        observe(&ast::AnyHasAttrs::new(attrs), &mut reads);
     }
     let Some(id) = ast_id(db, item) else {
         reads.unknown = true;
@@ -153,7 +181,7 @@ pub fn item_cfg_reads(db: &dyn SourceDatabase, item: AttrDefId) -> CfgReads {
     }
     for ancestor in syntax.ancestors() {
         if let Some(owner) = ast::AnyHasAttrs::cast(ancestor) {
-            observe_attrs(&owner, &options, &mut reads);
+            observe(&owner, &mut reads);
         }
     }
     let mut module = Some(item.module(db));
@@ -162,13 +190,13 @@ pub fn item_cfg_reads(db: &dyn SourceDatabase, item: AttrDefId) -> CfgReads {
         if let Some(source) = data.declaration_source(db) {
             for ancestor in source.value.syntax().ancestors() {
                 if let Some(owner) = ast::AnyHasAttrs::cast(ancestor) {
-                    observe_attrs(&owner, &options, &mut reads);
+                    observe(&owner, &mut reads);
                 }
             }
         }
         let source = data.definition_source(db);
         if let crate::nameres::ModuleSource::SourceFile(file) = source.value {
-            observe_attrs(&ast::AnyHasAttrs::new(file), &options, &mut reads);
+            observe(&ast::AnyHasAttrs::new(file), &mut reads);
         }
         module = id.containing_module(db);
     }
@@ -188,7 +216,7 @@ pub fn item_cfg_reads(db: &dyn SourceDatabase, item: AttrDefId) -> CfgReads {
                 walk.skip_subtree();
             } else if child != syntax
                 && let Some(owner) = ast::AnyHasAttrs::cast(child)
-                && !observe_attrs(&owner, &options, &mut reads)
+                && !observe(&owner, &mut reads)
             {
                 walk.skip_subtree();
             }
@@ -1096,6 +1124,33 @@ struct S;
         assert_eq!(index.function_bodies.unknown, 0);
         assert_eq!(index.function_bodies.twins, 2);
         assert_eq!(index.unknown, 0);
+    }
+
+    #[test]
+    fn resolved_default_helper_is_not_unknown() {
+        let (db, normal, test) = pair(
+            r#"
+//- minicore: derive, default
+//- /lib.rs crate:main
+#[derive(Default)]
+enum Choice { #[default] First, Second }
+"#,
+        );
+        let index = twin_index(&db, normal, test);
+        assert_eq!(index.unknown, 0);
+        assert_eq!(index.cfg_differing, 0);
+        assert!(index.unmatched.is_empty());
+    }
+
+    #[test]
+    fn unresolved_helper_spelling_stays_unknown() {
+        let (db, normal, test) = pair(
+            r#"
+enum Choice { #[default] First, Second }
+"#,
+        );
+        let index = twin_index(&db, normal, test);
+        assert_eq!(index.unknown, 2);
     }
 
     #[test]
