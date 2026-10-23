@@ -12,7 +12,11 @@
 //! Textual macro escape follows `define_macro` and module visitation in
 //! `rustc_resolve/src/build_reduced_graph.rs` at the same rustc tag.
 
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
+};
 
 use base_db::Crate;
 use hir_def::{
@@ -55,6 +59,44 @@ pub enum Rejection {
     Transitive,
     GenericUnresolved,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalRejection {
+    CfgDiffering,
+    Unknown,
+    PairSafety,
+    MissingTwin,
+    Signature,
+    ImplMismatch,
+    BakedValue,
+}
+
+impl LocalRejection {
+    pub fn class(self) -> &'static str {
+        match self {
+            Self::CfgDiffering => "cfg-differing",
+            Self::Unknown => "unknown",
+            Self::PairSafety => "separate(pair-safety)",
+            Self::MissingTwin => "separate(missing-twin)",
+            Self::Signature => "separate(signature)",
+            Self::ImplMismatch => "separate(impl-mismatch)",
+            Self::BakedValue => "separate(baked-value)",
+        }
+    }
+}
+
+static LOCAL_TIMES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+fn local_time<T>(phase: usize, work: impl FnOnce() -> T) -> T {
+    let start = Instant::now();
+    let result = work();
+    LOCAL_TIMES[phase].fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    result
+}
+
+pub fn take_local_times() -> [Duration; 3] {
+    LOCAL_TIMES.each_ref().map(|time| Duration::from_nanos(time.swap(0, Ordering::Relaxed)))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -123,7 +165,23 @@ impl BodySharingFacts {
 
 #[cfg(test)]
 mod body_fact_tests {
-    use super::{BodyItems, BodySharingFacts, References};
+    use super::{
+        BodyItems, BodySharingFacts, LocalRejection, References, Rejection, local_own_reason,
+    };
+
+    #[test]
+    fn local_sharing_rejects_only_body_local_facts() {
+        assert_eq!(local_own_reason(None), None);
+        assert_eq!(local_own_reason(Some(Rejection::GenericUnresolved)), None);
+        assert_eq!(local_own_reason(Some(Rejection::Transitive)), None);
+        assert_eq!(
+            local_own_reason(Some(Rejection::CfgDiffering)),
+            Some(LocalRejection::CfgDiffering)
+        );
+        assert_eq!(local_own_reason(Some(Rejection::Unknown)), Some(LocalRejection::Unknown));
+        assert_eq!(LocalRejection::BakedValue.class(), "separate(baked-value)");
+        assert_eq!(LocalRejection::MissingTwin.class(), "separate(missing-twin)");
+    }
 
     #[test]
     fn identifies_changed_fields_without_position_data() {
@@ -1453,6 +1511,99 @@ fn eligibility_facts(
         impls,
         impl_mismatch,
     }
+}
+
+fn local_references(db: &dyn HirDatabase, refs: ReferenceFacts) -> impl Iterator<Item = AttrDefId> {
+    refs.items(db).iter().chain(refs.type_items(db)).chain(refs.signature_types(db)).copied()
+}
+
+fn local_own_reason(reason: Option<Rejection>) -> Option<LocalRejection> {
+    match reason {
+        Some(Rejection::CfgDiffering) => Some(LocalRejection::CfgDiffering),
+        Some(Rejection::Unknown) => Some(LocalRejection::Unknown),
+        _ => None,
+    }
+}
+
+fn local_facts(
+    db: &dyn HirDatabase,
+    normal: Crate,
+    test: Crate,
+    item: AttrDefId,
+) -> Result<ReferenceFacts, LocalRejection> {
+    let facts = eligibility_facts(db, normal, test, item);
+    if let Some(reason) = local_own_reason(facts.reason) {
+        return Err(reason);
+    }
+    if facts.twin.is_none() {
+        return Err(LocalRejection::MissingTwin);
+    }
+    if !facts.compatible {
+        return Err(LocalRejection::Signature);
+    }
+    if facts.impl_mismatch {
+        return Err(LocalRejection::ImplMismatch);
+    }
+    for referenced in local_references(db, facts.references) {
+        if referenced.module(db).krate(db) != normal {
+            continue;
+        }
+        let twin = local_time(2, || normal_twins(db, normal, test).get(&referenced).copied())
+            .ok_or(LocalRejection::MissingTwin)?;
+        if !same_signature(db, normal, referenced, twin) {
+            return Err(LocalRejection::Signature);
+        }
+        if eligibility_facts(db, normal, test, referenced).impl_mismatch {
+            return Err(LocalRejection::ImplMismatch);
+        }
+    }
+    Ok(facts.references)
+}
+
+#[salsa::tracked(returns(copy), cycle_result = local_value_cycle)]
+fn local_value_stable(db: &dyn HirDatabase, normal: Crate, test: Crate, item: AttrDefId) -> bool {
+    let Ok(refs) = local_facts(db, normal, test, item) else { return false };
+    local_references(db, refs).chain(refs.baked_items(db).iter().copied()).all(|referenced| {
+        referenced.module(db).krate(db) != normal
+            || local_value_stable(db, normal, test, referenced)
+    })
+}
+
+fn local_value_cycle(
+    _db: &dyn HirDatabase,
+    _: salsa::Id,
+    _normal: Crate,
+    _test: Crate,
+    _item: AttrDefId,
+) -> bool {
+    false
+}
+
+#[salsa::tracked(returns(copy))]
+pub fn local_analysis(
+    db: &dyn HirDatabase,
+    normal: Crate,
+    test: Crate,
+    function: FunctionId,
+) -> Option<LocalRejection> {
+    local_time(0, || {
+        if !local_time(1, || pair_safety(db, normal, test).is_empty()) {
+            return Some(LocalRejection::PairSafety);
+        }
+        let source =
+            local_time(2, || twin_index(db, normal, test).twins.get(&function.into()).copied());
+        let Some(source) = source else { return Some(LocalRejection::MissingTwin) };
+        let refs = match local_facts(db, normal, test, source) {
+            Ok(refs) => refs,
+            Err(reason) => return Some(reason),
+        };
+        for &item in refs.baked_items(db) {
+            if item.module(db).krate(db) == normal && !local_value_stable(db, normal, test, item) {
+                return Some(LocalRejection::BakedValue);
+            }
+        }
+        None
+    })
 }
 
 #[salsa::tracked(returns(ref))]
