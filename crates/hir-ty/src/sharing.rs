@@ -155,12 +155,22 @@ fn body(db: &dyn HirDatabase, item: AttrDefId) -> Option<DefWithBodyId> {
 }
 
 #[salsa::tracked(returns(ref))]
+fn local_impls(db: &dyn HirDatabase, krate: Crate) -> FxHashSet<ImplId> {
+    crate_items(db, krate)
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            AttrDefId::ImplId(id) => Some(*id),
+            _ => None,
+        })
+        .collect()
+}
+
+#[salsa::tracked(returns(ref))]
 fn local_trait_impls(db: &dyn HirDatabase, krate: Crate) -> FxHashMap<TraitId, Vec<ImplId>> {
     let mut result: FxHashMap<TraitId, Vec<ImplId>> = FxHashMap::default();
-    for &item in &crate_items(db, krate).items {
-        if let AttrDefId::ImplId(id) = item
-            && let Some(tr) = db.impl_trait(id)
-        {
+    for &id in local_impls(db, krate) {
+        if let Some(tr) = db.impl_trait(id) {
             result.entry(tr.skip_binder().def_id.0).or_default().push(id);
         }
     }
@@ -183,8 +193,7 @@ fn applicable_adt_impls(db: &dyn HirDatabase, adt: AdtId) -> FxHashSet<ImplId> {
     let krate = adt.module(db).krate(db);
     let mut infcx = DbInterner::new_with(db, krate).infer_ctxt().build(TypingMode::PostAnalysis);
     let mut result = FxHashSet::default();
-    for &item in &crate_items(db, krate).items {
-        let AttrDefId::ImplId(id) = item else { continue };
+    for &id in local_impls(db, krate) {
         let mut mentions = MentionsAdt { adt, found: false };
         db.impl_self_ty(id).skip_binder().visit_with(&mut mentions);
         if let Some(trait_ref) = db.impl_trait(id) {
