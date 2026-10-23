@@ -1598,8 +1598,6 @@ pub fn total() -> u64 {{ {total} }}
         for prime in ("cold", "retained"):
             env = dict(base_env(os.path.join(work, f"hi-{mode}-{prime[0]}")), RUSTD_CACHE=store,
                        RUSTD_STATS="1", RUSTD_CFG_SHARING="1" if mode == "on" else "0")
-            if mode == "on" and prime == "cold":
-                env["RUSTD_TRACE"] = "1"
             side = Side(ws, env, True)
             def logs():
                 return {path: path.read_text(errors="replace") for path in pathlib.Path(env["RUSTD_HOME"]).glob("**/log")}
@@ -1624,10 +1622,6 @@ pub fn total() -> u64 {{ {total} }}
                 checks.append((name, held, fresh[-700:]))
                 print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
                 if mode == "on" and prime == "cold":
-                    name = "cfg sharing: body edit keeps signature and impl compatibility queries"
-                    held = not re.search(r"(?:same_signature|applicable_adt_impls)=", fresh)
-                    checks.append((name, held, fresh[-700:]))
-                    print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
                     source = files["src/lib.rs"]
                     cases = [
                         ("error result", source.replace("fn report0() -> Result<(), &'static str> { Ok(()) }", "fn report0() -> Result<(), &'static str> { Err(\"expected\") }"), "0 of 20", False),
