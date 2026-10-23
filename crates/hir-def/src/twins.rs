@@ -32,6 +32,7 @@ use crate::{
     expr_store::Body,
     item_scope::ItemScope,
     nameres::{DefMap, crate_def_map},
+    signatures::FunctionSignature,
 };
 
 /// Source position used for twin matching and textual macro escape checks.
@@ -283,12 +284,13 @@ fn call_key(db: &dyn SourceDatabase, call: MacroCallId, depth: usize) -> Option<
     Some(CallKey { site: ast_key(db, id, depth)?, kind })
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SourceKey {
     id: AstKey,
     containers: Vec<AstKey>,
 }
 
+#[salsa::tracked(returns(clone))]
 fn source_key(db: &dyn SourceDatabase, item: AttrDefId) -> Option<SourceKey> {
     let id = ast_id(db, item)?;
     let syntax = node(db, id);
@@ -414,31 +416,40 @@ pub fn crate_items(db: &dyn SourceDatabase, krate: Crate) -> CrateItems {
             break;
         }
         for owner in pending {
-            items.body_calls.insert(
-                owner,
-                Body::with_source_map(db, owner)
-                    .1
-                    .macro_calls()
-                    .map(|(_, call)| call)
-                    .filter(|call| {
-                        !matches!(
-                            call.loc(db).def.kind,
-                            MacroDefKind::BuiltIn(
-                                _,
-                                hir_expand::builtin::BuiltinFnLikeExpander::Cfg
-                            )
-                        )
-                    })
-                    .collect(),
-            );
-            for (_, map) in Body::of(db, owner).blocks(db) {
-                collect(db, map, &mut items);
-            }
+            let inventory = body_inventory(db, owner);
+            items.body_calls.extend(inventory.body_calls.clone());
+            items.items.extend(&inventory.items);
+            items.scopes.extend(&inventory.scopes);
+            items.definitions.extend(inventory.definitions.iter().map(|(&k, &v)| (k, v)));
         }
     }
     items
 }
 
+#[salsa::tracked(returns(ref))]
+fn body_inventory(db: &dyn SourceDatabase, owner: DefWithBodyId) -> CrateItems {
+    let mut items = CrateItems::default();
+    items.body_calls.insert(
+        owner,
+        Body::with_source_map(db, owner)
+            .1
+            .macro_calls()
+            .map(|(_, call)| call)
+            .filter(|call| {
+                !matches!(
+                    call.loc(db).def.kind,
+                    MacroDefKind::BuiltIn(_, hir_expand::builtin::BuiltinFnLikeExpander::Cfg)
+                )
+            })
+            .collect(),
+    );
+    for (_, map) in Body::of(db, owner).blocks(db) {
+        collect(db, map, &mut items);
+    }
+    items
+}
+
+#[salsa::tracked(returns(clone))]
 pub fn scope_pairs(
     db: &dyn SourceDatabase,
     normal: Crate,
@@ -478,7 +489,7 @@ struct CallMatcher<'a> {
     db: &'a dyn SourceDatabase,
     normal: Crate,
     test: Crate,
-    definitions: FxHashMap<MacroDefId, AttrDefId>,
+    definitions: &'a FxHashMap<MacroDefId, AttrDefId>,
     calls: FxHashMap<(MacroCallId, MacroCallId), bool>,
     active: FxHashSet<(MacroCallId, MacroCallId)>,
     pending: Vec<(MacroCallId, MacroCallId)>,
@@ -513,21 +524,7 @@ impl CallMatcher<'_> {
     }
 
     fn origins(&mut self, n: AttrDefId, t: AttrDefId) -> bool {
-        let files = |item| {
-            let mut files: Vec<_> =
-                ast_id(self.db, item).into_iter().map(|id| id.file_id).collect();
-            let mut module = Some(item.module(self.db));
-            while let Some(id) = module {
-                if let Some(declaration) =
-                    id.def_map(self.db).module(self.db, id).origin.declaration()
-                {
-                    files.push(declaration.file_id);
-                }
-                module = id.containing_module(self.db);
-            }
-            files
-        };
-        let (n, t) = (files(n), files(t));
+        let (n, t) = (origin_files(self.db, n), origin_files(self.db, t));
         !n.is_empty() && n.len() == t.len() && n.into_iter().zip(t).all(|(n, t)| self.files(n, t))
     }
 
@@ -701,6 +698,7 @@ pub fn gated_off(db: &dyn SourceDatabase, item: AttrDefId, options: &CfgOptions)
     false
 }
 
+#[salsa::tracked(returns(clone))]
 fn expansion_input_reads(db: &dyn SourceDatabase, call: MacroCallId) -> CfgReads {
     let loc = call.loc(db);
     let (options, recorder) = loc.krate.cfg_options(db).recording();
@@ -732,6 +730,7 @@ fn expansion_input_reads(db: &dyn SourceDatabase, call: MacroCallId) -> CfgReads
     reads
 }
 
+#[salsa::tracked(returns(clone))]
 fn origin_reads(db: &dyn SourceDatabase, item: AttrDefId) -> CfgReads {
     let mut reads = reads(db, item).clone();
     let mut file = ast_id(db, item).map(|id| id.file_id);
@@ -746,10 +745,17 @@ fn origin_reads(db: &dyn SourceDatabase, item: AttrDefId) -> CfgReads {
 }
 
 fn function_body(db: &dyn SourceDatabase, item: AttrDefId) -> bool {
-    matches!(item, AttrDefId::FunctionId(_))
-        && ast_id(db, item)
-            .and_then(|id| ast::Fn::cast(node(db, id)))
-            .is_some_and(|f| f.body().is_some())
+    matches!(item, AttrDefId::FunctionId(id) if FunctionSignature::of(db, id).has_body())
+}
+
+#[salsa::tracked(returns(copy))]
+fn item_gated_off(db: &dyn SourceDatabase, item: AttrDefId, normal: Crate) -> bool {
+    gated_off(db, item, normal.cfg_options(db))
+}
+
+#[salsa::tracked(returns(copy))]
+fn item_kind(db: &dyn SourceDatabase, item: AttrDefId) -> Option<syntax::SyntaxKind> {
+    ast_id(db, item).map(|id| node(db, id).kind())
 }
 
 fn reads(db: &dyn SourceDatabase, item: AttrDefId) -> &CfgReads {
@@ -760,99 +766,177 @@ fn reads(db: &dyn SourceDatabase, item: AttrDefId) -> &CfgReads {
 }
 
 #[salsa::tracked(returns(ref))]
+fn items_by_source(db: &dyn SourceDatabase, normal: Crate) -> FxHashMap<SourceKey, Vec<AttrDefId>> {
+    let mut result = FxHashMap::default();
+    for &item in &crate_items(db, normal).items {
+        if let Some(key) = source_key(db, item) {
+            result.entry(key).or_insert_with(Vec::new).push(item);
+        }
+    }
+    result
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ItemTwin {
+    twin: Option<AttrDefId>,
+    is_body: usize,
+    test_only: bool,
+    differs: usize,
+    unknown: usize,
+}
+
+#[salsa::tracked(returns(ref))]
+fn pair_definitions(
+    db: &dyn SourceDatabase,
+    normal: Crate,
+    test: Crate,
+) -> FxHashMap<MacroDefId, AttrDefId> {
+    crate_items(db, normal)
+        .definitions
+        .iter()
+        .chain(&crate_items(db, test).definitions)
+        .map(|(&k, &v)| (k, v))
+        .collect()
+}
+
+fn origin_files(db: &dyn SourceDatabase, item: AttrDefId) -> Vec<HirFileId> {
+    let mut files: Vec<_> = ast_id(db, item).into_iter().map(|id| id.file_id).collect();
+    let mut module = Some(item.module(db));
+    while let Some(id) = module {
+        if let Some(declaration) = id.def_map(db).module(db, id).origin.declaration() {
+            files.push(declaration.file_id);
+        }
+        module = id.containing_module(db);
+    }
+    files
+}
+
+#[salsa::tracked(returns(copy))]
+fn macro_calls_match(
+    db: &dyn SourceDatabase,
+    normal: Crate,
+    test: Crate,
+    n: MacroCallId,
+    t: MacroCallId,
+) -> bool {
+    CallMatcher {
+        db,
+        normal,
+        test,
+        definitions: pair_definitions(db, normal, test),
+        calls: FxHashMap::default(),
+        active: FxHashSet::default(),
+        pending: Vec::new(),
+    }
+    .call(n, t)
+}
+
+#[salsa::tracked(returns(copy))]
+fn item_origins_match(
+    db: &dyn SourceDatabase,
+    normal: Crate,
+    test: Crate,
+    n: AttrDefId,
+    t: AttrDefId,
+) -> bool {
+    let (n, t) = (origin_files(db, n), origin_files(db, t));
+    !n.is_empty()
+        && n.len() == t.len()
+        && n.into_iter().zip(t).all(|(n, t)| match (n.macro_file(), t.macro_file()) {
+            (Some(n), Some(t)) => macro_calls_match(db, normal, test, n, t),
+            (None, None) => n == t,
+            _ => false,
+        })
+}
+
+#[salsa::tracked(returns(ref))]
+fn item_twin(db: &dyn SourceDatabase, normal: Crate, test: Crate, item: AttrDefId) -> ItemTwin {
+    let mut result =
+        ItemTwin { is_body: usize::from(function_body(db, item)), ..ItemTwin::default() };
+    if item_gated_off(db, item, normal) {
+        result.test_only = true;
+        return result;
+    }
+    let normal_items = crate_items(db, normal);
+    let test_items = crate_items(db, test);
+    let twin = source_key(db, item)
+        .and_then(|key| items_by_source(db, normal).get(&key))
+        .filter(|items| items.len() == 1)
+        .map(|items| items[0])
+        .filter(|&twin| {
+            item_kind(db, twin).is_some()
+                && item_kind(db, twin) == item_kind(db, item)
+                && item_origins_match(db, normal, test, twin, item)
+        });
+    let Some(twin) = twin else {
+        return result;
+    };
+    result.twin = Some(twin);
+    let (mut n, mut t) = (origin_reads(db, twin), origin_reads(db, item));
+    let mut macros_known = true;
+    if let (Some(no), Some(to)) = (body(twin), body(item)) {
+        let nc = &normal_items.body_calls[&no];
+        let tc = &test_items.body_calls[&to];
+        let mut keyed = FxHashMap::default();
+        for &call in nc {
+            if let Some(key) = call_key(db, call, 0) {
+                keyed.entry(key).or_insert_with(Vec::new).push(call);
+            }
+            n.merge(&expansion_input_reads(db, call));
+        }
+        macros_known &= nc.len() == tc.len();
+        for &call in tc {
+            t.merge(&expansion_input_reads(db, call));
+            macros_known &= call_key(db, call, 0)
+                .and_then(|key| keyed.get(&key))
+                .filter(|calls| calls.len() == 1)
+                .is_some_and(|calls| macro_calls_match(db, normal, test, calls[0], call));
+        }
+    }
+    result.differs =
+        usize::from(n.differs_from(test.cfg_options(db)) || t.differs_from(normal.cfg_options(db)));
+    result.unknown = usize::from(n.unknown || t.unknown || !macros_known);
+    result
+}
+
+#[salsa::tracked(returns(ref))]
 pub fn twin_index(db: &dyn SourceDatabase, normal: Crate, test: Crate) -> TwinIndex {
     let mut result = TwinIndex::default();
     if normal == test || normal.root_file_id(db) != test.root_file_id(db) {
         return result;
     }
-    let normal_items = crate_items(db, normal);
-    let test_items = crate_items(db, test);
-    let mut matcher = CallMatcher {
-        db,
-        normal,
-        test,
-        definitions: normal_items
-            .definitions
-            .iter()
-            .chain(&test_items.definitions)
-            .map(|(&k, &v)| (k, v))
-            .collect(),
-        calls: FxHashMap::default(),
-        active: FxHashSet::default(),
-        pending: Vec::new(),
-    };
-    let mut by_source = FxHashMap::default();
-    for &item in &normal_items.items {
-        if let Some(key) = source_key(db, item) {
-            by_source.entry(key).or_insert_with(Vec::new).push(item);
-        }
-    }
     let mut matched = FxHashSet::default();
-    for &item in &test_items.items {
-        let is_body = usize::from(function_body(db, item));
+    for &item in &crate_items(db, test).items {
+        let facts = item_twin(db, normal, test, item);
+        let is_body = facts.is_body;
         if is_body != 0 {
             result.function_items.insert(item);
         }
-        if gated_off(db, item, normal.cfg_options(db)) {
+        if facts.test_only {
             result.test_only.insert(item);
             result.function_bodies.test_only += is_body;
             continue;
         }
-        let twin = source_key(db, item)
-            .and_then(|key| by_source.get(&key))
-            .filter(|items| items.len() == 1)
-            .map(|items| items[0])
-            .filter(|&twin| {
-                let (Some(n), Some(t)) = (ast_id(db, twin), ast_id(db, item)) else {
-                    return false;
-                };
-                node(db, n).kind() == node(db, t).kind() && matcher.origins(twin, item)
-            });
-        let Some(twin) = twin else {
+        let Some(twin) = facts.twin else {
             result.unmatched.insert(item);
             result.function_bodies.unmatched += is_body;
             continue;
         };
         matched.insert(twin);
         result.twins.insert(item, twin);
-        let (mut n, mut t) = (origin_reads(db, twin), origin_reads(db, item));
-        let mut macros_known = true;
-        if let (Some(no), Some(to)) = (body(twin), body(item)) {
-            let nc = &normal_items.body_calls[&no];
-            let tc = &test_items.body_calls[&to];
-            let mut keyed = FxHashMap::default();
-            for &call in nc {
-                if let Some(key) = call_key(db, call, 0) {
-                    keyed.entry(key).or_insert_with(Vec::new).push(call);
-                }
-                n.merge(&expansion_input_reads(db, call));
-            }
-            macros_known &= nc.len() == tc.len();
-            for &call in tc {
-                t.merge(&expansion_input_reads(db, call));
-                macros_known &= call_key(db, call, 0)
-                    .and_then(|key| keyed.get(&key))
-                    .filter(|calls| calls.len() == 1)
-                    .is_some_and(|calls| matcher.call(calls[0], call));
-            }
-        }
-        let differs = usize::from(
-            n.differs_from(test.cfg_options(db)) || t.differs_from(normal.cfg_options(db)),
-        );
-        let unknown = usize::from(n.unknown || t.unknown || !macros_known);
-        if differs != 0 {
+        if facts.differs != 0 {
             result.cfg_differing_items.insert(item);
         }
-        if unknown != 0 {
+        if facts.unknown != 0 {
             result.unknown_items.insert(item);
         }
-        result.cfg_differing += differs;
-        result.unknown += unknown;
+        result.cfg_differing += facts.differs;
+        result.unknown += facts.unknown;
         result.function_bodies.twins += is_body;
-        result.function_bodies.cfg_differing += is_body * differs;
-        result.function_bodies.unknown += is_body * unknown;
+        result.function_bodies.cfg_differing += is_body * facts.differs;
+        result.function_bodies.unknown += is_body * facts.unknown;
     }
-    result.normal_only = normal_items.items.len() - matched.len();
+    result.normal_only = crate_items(db, normal).items.len() - matched.len();
     result
 }
 
@@ -1035,6 +1119,23 @@ type Sized = [u8; { cfg!(test) as usize }];
         assert_eq!(index.unknown, 7);
         assert!(index.twins.iter().any(|(t, n)| ast_id(&db, *t).unwrap().file_id.is_macro()
             && ast_id(&db, *n).unwrap().file_id.is_macro()));
+    }
+
+    #[test]
+    fn body_only_edit_backdates_twins() {
+        let (mut db, normal, test) = pair(
+            r#"
+fn edited() -> bool { false }
+fn untouched() { macro_rules! nested { () => {} } nested!(); }
+"#,
+        );
+        assert_eq!(twin_index(&db, normal, test).function_bodies.twins, 2);
+        let file = normal.root_file_id(&db).file_id(&db);
+        db.set_file_text(file, "fn edited() -> bool {\n true }\nfn untouched() { macro_rules! nested { () => {} } nested!(); }");
+        let executed = db.log_executed(|| {
+            assert_eq!(twin_index(&db, normal, test).function_bodies.twins, 2);
+        });
+        assert!(!executed.iter().any(|query| query == "twin_index"), "{executed:?}");
     }
 
     #[test]

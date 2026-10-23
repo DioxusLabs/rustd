@@ -865,53 +865,77 @@ fn macro_escapes(db: &dyn HirDatabase, normal: Crate, test: Crate, item: AttrDef
 #[salsa::tracked(returns(ref))]
 pub fn pair_safety(db: &dyn HirDatabase, normal: Crate, test: Crate) -> Vec<&'static str> {
     let mut veto = FxHashSet::default();
-    let twins = twin_index(db, normal, test);
-    let nitems = crate_items(db, normal);
     let titems = crate_items(db, test);
     for (&def, &item) in &titems.definitions {
         if matches!(def.kind, hir_expand::MacroDefKind::Declarative(..))
             && item.module(db).krate(db) == test
-            && hir_def::twins::gated_off(db, item, normal.cfg_options(db))
-            && macro_escapes(db, normal, test, item)
+            && test_macro_escapes(db, normal, test, item)
         {
             veto.insert("cfg-test-macro-rules");
         }
     }
     for (n, t) in scope_pairs(db, normal, test) {
-        let ns = n.def_map(db).module(db, n).scope(db);
-        let ts = t.def_map(db).module(db, t).scope(db);
-        for (name, entry) in ts.entries() {
-            let own = ns.get(name);
-            let resolved = n.resolver(db).resolve_module_path_in_items(
-                db,
-                &ModPath::from_segments(PathKind::Plain, [name.clone()]),
-            );
-            for (target, prior, found) in [
-                (
-                    entry.types.map(|i| i.def),
-                    own.types.filter(|i| i.import.is_none()).map(|i| i.def),
-                    resolved.types.map(|i| i.def),
-                ),
-                (
-                    entry.values.map(|i| i.def),
-                    own.values.filter(|i| i.import.is_none()).map(|i| i.def),
-                    resolved.values.map(|i| i.def),
-                ),
-                (
-                    entry.macros.map(|i| i.def.into()),
-                    own.macros.filter(|i| i.import.is_none()).map(|i| i.def.into()),
-                    resolved.macros.map(|i| i.def.into()),
-                ),
-            ] {
-                if let (Some(target), None, Some(found)) = (target, prior, found) {
-                    let mapped = module_def(target).and_then(|id| twins.twins.get(&id).copied());
-                    if target != found && (mapped.is_none() || mapped != module_def(found)) {
-                        veto.insert("namespace-shadowing");
-                    }
+        if namespace_shadowed(db, normal, test, n, t) {
+            veto.insert("namespace-shadowing");
+        }
+    }
+    veto.extend(impl_safety(db, normal, test));
+    let mut veto: Vec<_> = veto.into_iter().collect();
+    veto.sort_unstable();
+    veto
+}
+
+#[salsa::tracked(returns(copy))]
+fn namespace_shadowed(
+    db: &dyn HirDatabase,
+    normal: Crate,
+    test: Crate,
+    n: hir_def::ModuleId,
+    t: hir_def::ModuleId,
+) -> bool {
+    let twins = twin_index(db, normal, test);
+    let ns = n.def_map(db).module(db, n).scope(db);
+    let ts = t.def_map(db).module(db, t).scope(db);
+    for (name, entry) in ts.entries() {
+        let own = ns.get(name);
+        let resolved = n.resolver(db).resolve_module_path_in_items(
+            db,
+            &ModPath::from_segments(PathKind::Plain, [name.clone()]),
+        );
+        for (target, prior, found) in [
+            (
+                entry.types.map(|i| i.def),
+                own.types.filter(|i| i.import.is_none()).map(|i| i.def),
+                resolved.types.map(|i| i.def),
+            ),
+            (
+                entry.values.map(|i| i.def),
+                own.values.filter(|i| i.import.is_none()).map(|i| i.def),
+                resolved.values.map(|i| i.def),
+            ),
+            (
+                entry.macros.map(|i| i.def.into()),
+                own.macros.filter(|i| i.import.is_none()).map(|i| i.def.into()),
+                resolved.macros.map(|i| i.def.into()),
+            ),
+        ] {
+            if let (Some(target), None, Some(found)) = (target, prior, found) {
+                let mapped = module_def(target).and_then(|id| twins.twins.get(&id).copied());
+                if target != found && (mapped.is_none() || mapped != module_def(found)) {
+                    return true;
                 }
             }
         }
     }
+    false
+}
+
+#[salsa::tracked(returns(clone))]
+fn impl_safety(db: &dyn HirDatabase, normal: Crate, test: Crate) -> Vec<&'static str> {
+    let mut veto = FxHashSet::default();
+    let twins = twin_index(db, normal, test);
+    let nitems = crate_items(db, normal);
+    let titems = crate_items(db, test);
     for &item in &titems.items {
         let AttrDefId::ImplId(id) = item else { continue };
         if twins.twins.contains_key(&item) {
@@ -965,6 +989,12 @@ pub fn pair_safety(db: &dyn HirDatabase, normal: Crate, test: Crate) -> Vec<&'st
     let mut veto: Vec<_> = veto.into_iter().collect();
     veto.sort_unstable();
     veto
+}
+
+#[salsa::tracked(returns(copy))]
+fn test_macro_escapes(db: &dyn HirDatabase, normal: Crate, test: Crate, item: AttrDefId) -> bool {
+    hir_def::twins::gated_off(db, item, normal.cfg_options(db))
+        && macro_escapes(db, normal, test, item)
 }
 
 #[salsa::tracked(returns(ref))]
