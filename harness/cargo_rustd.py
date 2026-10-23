@@ -1034,7 +1034,7 @@ def incremental(work):
 def test_graph(work):
     ws = os.path.realpath(os.path.join(work, "test-graph"))
     files = {
-        "Cargo.toml": '[package]\nname = "test_graph"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\nmembers = ["probe"]\n\n[dev-dependencies]\nprobe = { path = "probe" }\n',
+        "Cargo.toml": '[package]\nname = "test_graph"\nversion = "0.1.0"\nedition = "2021"\n\n[features]\ndefault = ["test-support"]\ntest-support = []\n\n[workspace]\nmembers = ["probe"]\n\n[dev-dependencies]\nprobe = { path = "probe" }\n',
         "probe/Cargo.toml": '[package]\nname = "probe"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\ntest_graph = { path = ".." }\n',
         "probe/src/lib.rs": 'pub fn tested() -> bool { test_graph::tested() }\n',
         "src/lib.rs": '''pub fn tested() -> bool { cfg!(test) }
@@ -1139,6 +1139,23 @@ mod tests {
         check("positive program defers TypeId", ran.returncode == 0 and "both copies true; TypeId: deferred to codegen" in fresh, f"exit {ran.returncode}, expected deferred TypeId with both copies")
         integration.write_text(integration_source)
         variants = [
+            ("predicate result", """
+#[cfg(any(test, feature = "test-support"))] pub fn predicate_gate() {}
+pub fn predicate_caller() { predicate_gate(); }
+""", "cfg body: test_graph::predicate_caller: fully-shared"),
+            ("rejected function remapping", """
+pub fn different_function() -> u32 { if cfg!(test) { 9 } else { 7 } }
+pub fn call_different_function() -> u32 { different_function() }
+""", "cfg body: test_graph::call_different_function: analysis-shared"),
+            ("baked const length", """
+pub const DIFFERENT_LENGTH: usize = if cfg!(test) { 9 } else { 7 };
+pub fn baked_length() -> usize { let value = [0u8; DIFFERENT_LENGTH]; value.len() }
+""", "cfg body: test_graph::baked_length: transitive"),
+            ("baked rejection stops at call boundary", """
+pub const DIFFERENT_LENGTH: usize = if cfg!(test) { 9 } else { 7 };
+pub fn baked_length() -> usize { let value = [0u8; DIFFERENT_LENGTH]; value.len() }
+pub fn call_baked_length() -> usize { baked_length() }
+""", "cfg body: test_graph::call_baked_length: analysis-shared"),
             ("concrete impl precision", """
 #[derive(Debug, Clone)]
 pub struct Changed { #[cfg(test)] extra: u32 }
