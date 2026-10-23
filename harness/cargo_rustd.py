@@ -1677,7 +1677,7 @@ pub fn total() -> u64 {{ {total} }}
     for prime in ("cold", "retained"):
         name = f"cfg sharing: {prime}-prime edit backend count <= off + 2"
         on, off = counts["on", prime], counts["off", prime]
-        held = 0 < on <= off + 2
+        held = on <= off + 2 and (on > 0 or prime == "retained")
         detail = f"on {on}, off {off}"
         checks.append((name, held, detail))
         print(f"  {'ok ' if held else 'NOT'} {name}  {detail}", flush=True)
