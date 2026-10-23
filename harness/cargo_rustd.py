@@ -1652,10 +1652,11 @@ pub fn total() -> u64 {{ {total} }}
                 held = bool(paths) and all("; program=" in line for line in paths)
                 checks.append((name, held, str(paths)))
                 print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
-                for query, limit in [("reach_topology", 0), ("reach_component_print", 2), ("reach_root_code", 1), ("loaded_crates", 0)] + ([("twin_index", 0), ("pair_safety", 0), ("pair_eligibility", 0), ("decision_serial", 0), ("applicable_adt_impls", 0), ("local_trait_impls", 0)] if mode == "on" else []):
+                for query, limit in [("reach_topology", 0), ("reach_component_print", 2), ("reach_root_code", 1), ("loaded_crates", 0)] + ([("twin_index", 0), ("pair_safety", 0), ("pair_eligibility", 0), ("decision_serial", 0), ("applicable_adt_impls", 0), ("local_trait_impls", 0)] if mode == "on" else [("pair_eligibility", 0), ("eligibility_facts", 0)]):
                     name = f"cfg sharing: {mode} {prime}-prime {query} executions <= {limit}"
-                    count_ran = sum(map(int, re.findall(rf"\b{query}=(\d+)", fresh)))
-                    held = ("queries:" in fresh and re.search(rf"\b{query}=\d+", primed) is not None
+                    disabled_policy = mode == "off" and query in ("pair_eligibility", "eligibility_facts")
+                    count_ran = sum(map(int, re.findall(rf"\b{query}=(\d+)", primed + fresh if disabled_policy else fresh)))
+                    held = ("queries:" in fresh and ("queries:" in primed if disabled_policy else re.search(rf"\b{query}=\d+", primed) is not None)
                             and count_ran <= limit)
                     checks.append((name, held, f"executed {count_ran}"))
                     print(f"  {'ok ' if held else 'NOT'} {name}: {count_ran}", flush=True)

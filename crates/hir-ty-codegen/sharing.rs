@@ -289,21 +289,22 @@ impl Cache {
         }
         let shared = input.clone().capture(db);
         let captured = start.elapsed();
-        self.eligibility = input
-            .pairs
-            .iter()
-            .map(|&(normal, test, both)| {
-                let state = crate::sharing::EligibilityState::new(db, normal, test, both);
-                assert_eq!(
-                    state.result(),
-                    crate::sharing::pair_eligibility(db, normal, test, both),
-                    "sharing retained evaluator initialization"
-                );
-                ((normal, test, both), state)
-            })
-            .collect();
+        self.eligibility.clear();
         self.files.clear();
         if !input.is_empty() {
+            self.eligibility = input
+                .pairs
+                .iter()
+                .map(|&(normal, test, both)| {
+                    let state = crate::sharing::EligibilityState::new(db, normal, test, both);
+                    assert_eq!(
+                        state.result(),
+                        crate::sharing::pair_eligibility(db, normal, test, both),
+                        "sharing retained evaluator initialization"
+                    );
+                    ((normal, test, both), state)
+                })
+                .collect();
             let mut crates = FxHashMap::default();
             for &(normal, test, _) in &input.pairs {
                 crates.insert(normal, true);
