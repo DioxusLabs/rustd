@@ -2756,7 +2756,7 @@ fn dump_twins(db: &RootDatabase, args: &Args) {
                     );
                 }
             }
-            let safety = hir_ty::sharing::pair_safety(db, normal, test);
+            let safety = hir_ty::sharing::local_pair_safety(db, normal, test);
             let veto = if safety.is_empty() { "none".to_owned() } else { safety.join(",") };
             eprintln!(
                 "cfg eligibility: {name}: local analysis bodies {counts:?}; pair veto: {veto}; both copies {both}; TypeId: per-copy"

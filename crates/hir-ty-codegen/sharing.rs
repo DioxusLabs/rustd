@@ -30,19 +30,9 @@ fn reverse_twins(
 }
 
 #[salsa::tracked(returns(copy))]
-fn decision_serial(
-    db: &dyn HirDatabase,
-    normal: Crate,
-    test: Crate,
-    both: bool,
-    local: bool,
-) -> u128 {
+fn decision_serial(db: &dyn HirDatabase, normal: Crate, test: Crate, both: bool) -> u128 {
     let twins = reverse_twins(db, normal, test);
-    let eligibility = if local {
-        local_eligibility(db, normal, test)
-    } else {
-        crate::sharing::pair_eligibility(db, normal, test, both)
-    };
+    let eligibility = crate::sharing::pair_eligibility(db, normal, test, both);
     let mut twins: Vec<_> = twins.iter().map(|(&n, &t)| super::print_of(&(&t, &n))).collect();
     let mut full: Vec<_> = eligibility.candidates.iter().map(super::print_of).collect();
     let mut analysis: Vec<_> = eligibility.analysis_shared.iter().map(super::print_of).collect();
@@ -50,24 +40,6 @@ fn decision_serial(
     full.sort_unstable();
     analysis.sort_unstable();
     super::print_of(&(twins, full, analysis, &eligibility.pair_veto))
-}
-
-#[salsa::tracked(returns(ref))]
-fn local_eligibility(
-    db: &dyn HirDatabase,
-    normal: Crate,
-    test: Crate,
-) -> crate::sharing::Eligibility {
-    let mut result = crate::sharing::Eligibility::default();
-    let twins = super::backend::Tally::global()
-        .step(super::Step::LocalTwins, || hir_def::twins::twin_index(db, normal, test));
-    for &item in &twins.function_items {
-        let AttrDefId::FunctionId(func) = item else { continue };
-        if crate::sharing::local_analysis(db, normal, test, func).is_none() {
-            result.analysis_shared.insert(item);
-        }
-    }
-    result
 }
 
 /// The crate copies present in one program. An empty policy compiles without sharing.
@@ -129,7 +101,7 @@ impl Cache {
     }
 
     pub(super) fn needs_before_edit(&self, files: &[base_db::FileId]) -> bool {
-        self.shared.as_ref().is_some_and(|sharing| !sharing.is_empty())
+        self.shared.as_ref().is_some_and(|sharing| !sharing.is_empty() && !sharing.local)
             && files.iter().any(|file| !self.files.contains_key(file))
     }
 
@@ -175,6 +147,10 @@ impl Cache {
         input: Sharing,
         program: &str,
     ) -> Sharing {
+        if input.local {
+            self.changed.clear();
+            return input;
+        }
         let start = Instant::now();
         let changed = std::mem::take(&mut self.changed);
         let mut reason = "policy input changed";
@@ -286,19 +262,15 @@ impl Cache {
 
 impl Sharing {
     fn capture(mut self, db: &dyn HirDatabase) -> Self {
-        if !self.is_empty() {
+        if !self.is_empty() && !self.local {
             self.snapshot = Some(Arc::new(Policy(
                 self.pairs
                     .iter()
                     .map(|&(n, t, both)| PairPolicy {
-                        key: (n, t, both, decision_serial(db, n, t, both, self.local)),
+                        key: (n, t, both, decision_serial(db, n, t, both)),
                         twins: hir_def::twins::twin_index(db, n, t).clone(),
                         reverse: reverse_twins(db, n, t).clone(),
-                        eligibility: if self.local {
-                            local_eligibility(db, n, t).clone()
-                        } else {
-                            crate::sharing::pair_eligibility(db, n, t, both).clone()
-                        },
+                        eligibility: crate::sharing::pair_eligibility(db, n, t, both).clone(),
                     })
                     .collect(),
             )));
@@ -339,16 +311,18 @@ impl Sharing {
         test: Crate,
         both: bool,
     ) -> &'a crate::sharing::Eligibility {
-        self.policy(normal, test).map(|it| &it.eligibility).unwrap_or_else(|| {
-            if self.local {
-                local_eligibility(db, normal, test)
-            } else {
-                crate::sharing::pair_eligibility(db, normal, test, both)
-            }
-        })
+        self.policy(normal, test)
+            .map(|it| &it.eligibility)
+            .unwrap_or_else(|| crate::sharing::pair_eligibility(db, normal, test, both))
     }
 
     pub(super) fn prewarm(&self, db: &dyn HirDatabase) {
+        if self.local() {
+            for &(normal, test, _) in &self.pairs {
+                crate::sharing::local_pair_safety(db, normal, test);
+            }
+            return;
+        }
         if self.is_empty() || self.snapshot.is_some() {
             return;
         }
@@ -360,13 +334,13 @@ impl Sharing {
     }
 
     pub(super) fn decisions(&self, db: &dyn HirDatabase) -> Vec<u128> {
-        if self.is_empty() {
+        if self.is_empty() || self.local {
             return Vec::new();
         }
         if let Some(snapshot) = &self.snapshot {
             return snapshot.0.iter().map(|it| it.key.3).collect();
         }
-        self.pairs.iter().map(|&(n, t, both)| decision_serial(db, n, t, both, self.local)).collect()
+        self.pairs.iter().map(|&(n, t, both)| decision_serial(db, n, t, both)).collect()
     }
 
     pub fn new(pairs: Vec<(Crate, Crate, bool)>) -> Self {
@@ -385,6 +359,10 @@ impl Sharing {
 
     pub(super) fn is_empty(&self) -> bool {
         !self.enabled || self.pairs.is_empty()
+    }
+
+    pub(super) fn local(&self) -> bool {
+        self.local && !self.is_empty()
     }
 
     pub(super) fn tentative(&self) -> bool {
@@ -425,7 +403,11 @@ impl Sharing {
     pub(super) fn analysis_shared(&self, db: &dyn HirDatabase, func: FunctionId) -> bool {
         self.pairs.iter().any(|&(n, t, both)| {
             func.krate(db) == t
-                && self.eligibility(db, n, t, both).analysis_shared.contains(&func.into())
+                && if self.local {
+                    crate::sharing::local_analysis(db, n, t, func).is_none()
+                } else {
+                    self.eligibility(db, n, t, both).analysis_shared.contains(&func.into())
+                }
         })
     }
 
@@ -434,6 +416,18 @@ impl Sharing {
         db: &dyn HirDatabase,
         func: FunctionId,
     ) -> Option<FunctionId> {
+        if self.local() {
+            for &(normal, test, _) in &self.pairs {
+                if func.krate(db) == test
+                    && crate::sharing::local_analysis(db, normal, test, func).is_none()
+                    && let Some(AttrDefId::FunctionId(source)) =
+                        hir_def::twins::local_item_twin(db, normal, test, func.into()).twin
+                {
+                    return Some(source);
+                }
+            }
+            return None;
+        }
         if self.is_empty() || !self.analysis_shared(db, func) {
             return None;
         }
@@ -497,6 +491,9 @@ impl Sharing {
         let normal = source.krate(db);
         for &(n, t, _) in &self.pairs {
             if n == normal && item.module(db).krate(db) == n {
+                if self.local {
+                    return hir_def::twins::declaration_twin(db, t, n, item).unwrap_or(item);
+                }
                 return self.reverse(db, n, t).get(&item).copied().unwrap_or(item);
             }
         }
@@ -588,7 +585,7 @@ impl Sharing {
         krate: Crate,
         value: T,
     ) -> T {
-        if self.is_empty() {
+        if self.is_empty() || self.local {
             return value;
         }
         value.fold_with(&mut Canonical {
@@ -602,7 +599,7 @@ impl Sharing {
     }
 
     pub(super) fn link_type<'db>(&self, db: &'db dyn HirDatabase, ty: Ty<'db>) -> Ty<'db> {
-        if self.is_empty() {
+        if self.is_empty() || self.local {
             return ty;
         }
         ty.fold_with(&mut Canonical {
@@ -630,6 +627,9 @@ impl Sharing {
     }
 
     fn link_item(&self, db: &dyn HirDatabase, item: AttrDefId) -> AttrDefId {
+        if self.local {
+            return item;
+        }
         for &(normal, test, both) in &self.pairs {
             if !both && item.module(db).krate(db) == normal {
                 if let Some(&t) = self.reverse(db, normal, test).get(&item) {
@@ -641,7 +641,7 @@ impl Sharing {
     }
 
     pub(super) fn instance(&self, db: &dyn HirDatabase, instance: &Instance) -> Instance {
-        if self.is_empty() {
+        if self.is_empty() || self.local {
             return instance.clone();
         }
         super::backend::Tally::global()
@@ -670,7 +670,7 @@ impl Sharing {
         instance: &Instance,
         env: &StoredParamEnvAndCrate,
     ) -> StoredParamEnvAndCrate {
-        if self.is_empty() || self.needs_policy(db, instance) {
+        if self.is_empty() || self.local || self.needs_policy(db, instance) {
             return env.clone();
         }
         let home = super::home::Homes::default().home(db, instance, env);
@@ -683,9 +683,18 @@ impl Sharing {
     }
 
     pub(super) fn needs_policy(&self, db: &dyn HirDatabase, instance: &Instance) -> bool {
+        if self.is_empty() || self.local {
+            return false;
+        }
         let mut types = TestTypes { db, sharing: self, found: false };
         instance.args.as_ref().visit_with(&mut types);
         types.found || self.test_body(db, instance)
+    }
+
+    pub(super) fn analysis_types(&self, db: &dyn HirDatabase, instance: &Instance) -> bool {
+        let mut types = TestTypes { db, sharing: self, found: false };
+        instance.args.as_ref().visit_with(&mut types);
+        types.found
     }
 
     fn test_body(&self, db: &dyn HirDatabase, instance: &Instance) -> bool {
@@ -709,7 +718,7 @@ impl Sharing {
         db: &dyn HirDatabase,
         id: hir_def::StaticId,
     ) -> hir_def::StaticId {
-        if self.is_empty() {
+        if self.is_empty() || self.local {
             return id;
         }
         for &(normal, test, both) in &self.pairs {
@@ -734,7 +743,7 @@ impl Sharing {
     }
 
     pub(super) fn link_function(&self, db: &dyn HirDatabase, func: FunctionId) -> FunctionId {
-        if self.is_empty() {
+        if self.is_empty() || self.local {
             return func;
         }
         for &(normal, test, both) in &self.pairs {
@@ -767,6 +776,10 @@ impl<'db> Canonical<'_, 'db> {
         if let Some(normal) = self.analysis {
             for &(n, t, _) in &self.sharing.pairs {
                 if n == normal && item.module(self.db).krate(self.db) == n {
+                    if self.sharing.local {
+                        return hir_def::twins::declaration_twin(self.db, t, n, item)
+                            .unwrap_or(item);
+                    }
                     return self.sharing.reverse(self.db, n, t).get(&item).copied().unwrap_or(item);
                 }
             }

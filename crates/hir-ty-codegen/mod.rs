@@ -1986,11 +1986,18 @@ fn program_instance<'db>(
 ) -> &'db Result<CompiledFunction> {
     let canonical = sharing.instance(db, &instance);
     let env = sharing.env(db, &canonical, &env);
-    if sharing.needs_policy(db, &canonical) {
+    if sharing.needs_policy(db, &canonical)
+        || (sharing.local() && local_instance_policy(db, canonical.clone(), sharing.clone()))
+    {
         shared_instance(db, canonical, env, sharing.clone())
     } else {
         compiled_instance(db, canonical, env)
     }
+}
+
+#[salsa::tracked(returns(copy))]
+fn local_instance_policy(db: &dyn HirDatabase, instance: Instance, sharing: Sharing) -> bool {
+    sharing.analysis_types(db, &instance) || sharing.analysis_instance(db, instance.def).is_some()
 }
 
 #[salsa::tracked(returns(ref))]
@@ -2357,6 +2364,15 @@ fn program_instance_body<'db>(
         return instance_body(db, instance, env);
     }
     let analysis = sharing.analysis_instance(db, instance.def);
+    if sharing.local() && analysis.is_none() && !sharing.analysis_types(db, instance) {
+        return instance_body(db, instance, env);
+    }
+    if sharing.local() {
+        return local_instance_body(db, instance.clone(), env, sharing.clone())
+            .as_ref()
+            .map(Cow::Borrowed)
+            .map_err(Clone::clone);
+    }
     let def = analysis.map_or(instance.def, |(_, def)| def);
     let raw = match def {
         InstanceDef::Fn(func) => db.mir_body(func.into()),
@@ -2378,6 +2394,58 @@ fn program_instance_body<'db>(
             remap::monomorphized(db, sharing, &mapped, &instance.args, &env)
         })
         .map(Cow::Owned)
+        .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))
+}
+
+#[salsa::tracked(returns(ref))]
+fn local_mapped_body<'db>(
+    db: &'db dyn HirDatabase,
+    source: FunctionId,
+    def: InstanceDef,
+    sharing: Sharing,
+) -> Result<MirBody<'db>> {
+    let raw = match def {
+        InstanceDef::Fn(func) => db.mir_body(func.into()),
+        InstanceDef::Closure(id) => db.mir_body_for_closure(InternedClosureId::from_id(id)),
+        InstanceDef::Coroutine(id) => db.mir_body_for_coroutine(InternedCoroutineId::from_id(id)),
+        InstanceDef::CoroutineByMove(id) => {
+            db.mir_body_for_coroutine_by_move(InternedCoroutineId::from_id(id))
+        }
+        _ => unsupported!("analysis-sharing a shim"),
+    }
+    .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
+    backend::Tally::global().step(Step::Remap, || remap::body(db, &sharing, source, raw))
+}
+
+#[salsa::tracked(returns(ref))]
+fn local_instance_body<'db>(
+    db: &'db dyn HirDatabase,
+    instance: Instance,
+    env: StoredParamEnvAndCrate,
+    sharing: Sharing,
+) -> Result<MirBody<'db>> {
+    let analysis = sharing.analysis_instance(db, instance.def);
+    let mapped = match analysis {
+        Some((source, def)) => {
+            local_mapped_body(db, source, def, sharing.clone()).as_ref().map_err(Clone::clone)?
+        }
+        None => match instance.def {
+            InstanceDef::Fn(func) => db.mir_body(func.into()),
+            InstanceDef::Closure(id) => db.mir_body_for_closure(InternedClosureId::from_id(id)),
+            InstanceDef::Coroutine(id) => {
+                db.mir_body_for_coroutine(InternedCoroutineId::from_id(id))
+            }
+            InstanceDef::CoroutineByMove(id) => {
+                db.mir_body_for_coroutine_by_move(InternedCoroutineId::from_id(id))
+            }
+            _ => return instance_body(db, &instance, env).map(Cow::into_owned),
+        }
+        .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?,
+    };
+    backend::Tally::global()
+        .step(Step::Monomorphize, || {
+            remap::monomorphized(db, &sharing, mapped, &instance.args, &env)
+        })
         .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))
 }
 
@@ -3767,6 +3835,24 @@ fn program_body<'db>(
     func: FunctionId,
     sharing: &Sharing,
 ) -> Result<(Cow<'db, MirBody<'db>>, ParamEnvAndCrate<'db>)> {
+    if sharing.local() {
+        if !sharing.test_crate(func.krate(db)) {
+            return root_body(db, func).map(|(body, env)| (Cow::Borrowed(body), env));
+        }
+        let env = ParamEnvAndCrate {
+            param_env: crate::next_solver::ParamEnv::empty(),
+            krate: func.krate(db),
+        };
+        let instance = Instance {
+            def: InstanceDef::Fn(func),
+            args: GenericArgs::new_from_slice(&[]).store(),
+            checked: false,
+        };
+        let body = local_instance_body(db, instance, env.store(), sharing.clone())
+            .as_ref()
+            .map_err(Clone::clone)?;
+        return Ok((Cow::Borrowed(body), env));
+    }
     if let Some(source) = sharing.analysis_source(db, func) {
         let raw = db
             .mir_body(source.into())
