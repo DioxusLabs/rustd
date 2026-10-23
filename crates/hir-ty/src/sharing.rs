@@ -85,6 +85,70 @@ pub struct BodySharingFacts {
     items: BodyItems,
 }
 
+impl BodySharingFacts {
+    pub fn changed_fields(&self, new: &Self) -> Vec<(&'static str, String, String)> {
+        let mut changed = Vec::new();
+        macro_rules! field {
+            ($name:literal, $old:expr, $new:expr) => {
+                if $old != $new {
+                    changed.push(($name, format!("{:?}", $old), format!("{:?}", $new)));
+                }
+            };
+        }
+        match (&self.references, &new.references) {
+            (Some(old), Some(new)) => {
+                field!("references.items", old.items, new.items);
+                field!("references.type_items", old.type_items, new.type_items);
+                field!("references.signature_types", old.signature_types, new.signature_types);
+                field!("references.baked_items", old.baked_items, new.baked_items);
+                field!("references.unknown", old.unknown, new.unknown);
+                field!(
+                    "references.generic_unresolved",
+                    old.generic_unresolved,
+                    new.generic_unresolved
+                );
+            }
+            (old, new) => field!("references", old, new),
+        }
+        field!("cfg.atoms", self.cfg.atoms, new.cfg.atoms);
+        field!("cfg.predicates", self.cfg.predicates, new.cfg.predicates);
+        field!("cfg.read_all", self.cfg.read_all, new.cfg.read_all);
+        field!("cfg.unknown", self.cfg.unknown, new.cfg.unknown);
+        field!("items.declarations", self.items.declarations, new.items.declarations);
+        field!("items.impls", self.items.impls, new.items.impls);
+        field!("items.macros", self.items.macros, new.items.macros);
+        changed
+    }
+}
+
+#[cfg(test)]
+mod body_fact_tests {
+    use super::{BodyItems, BodySharingFacts, References};
+
+    #[test]
+    fn identifies_changed_fields_without_position_data() {
+        let old = BodySharingFacts {
+            references: Some(References::default()),
+            cfg: Default::default(),
+            items: BodyItems::default(),
+        };
+        assert!(old.changed_fields(&old).is_empty());
+        let mut new = old.clone();
+        new.references.as_mut().unwrap().unknown = true;
+        new.cfg.unknown = true;
+        assert_eq!(
+            old.changed_fields(&new),
+            vec![
+                ("references.unknown", "false".into(), "true".into()),
+                ("cfg.unknown", "false".into(), "true".into()),
+            ]
+        );
+        new = old.clone();
+        new.references = None;
+        assert_eq!(old.changed_fields(&new)[0].0, "references");
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BodyItems {
     declarations: Vec<ModuleDefId>,
