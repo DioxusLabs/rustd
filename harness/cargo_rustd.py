@@ -1238,7 +1238,13 @@ pub fn tls_value() -> u32 { TLS.with(|value| value.get()) }
 def test_graph_sharing(work):
     ws = os.path.realpath(os.path.join(work, "graph-sharing"))
     files = {
-        "Cargo.toml": '[package]\nname = "graph_sharing"\nversion = "0.1.0"\nedition = "2021"\n[workspace]\nmembers = ["probe"]\n[dev-dependencies]\nprobe = { path = "probe" }\n',
+        "Cargo.toml": '[package]\nname = "graph_sharing"\nversion = "0.1.0"\nedition = "2021"\n[workspace]\nmembers = ["probe", "format_helper"]\n[dev-dependencies]\nprobe = { path = "probe" }\nformat_helper = { path = "format_helper" }\n',
+        "format_helper/Cargo.toml": '[package]\nname = "format_helper"\nversion = "0.1.0"\nedition = "2021"\n',
+        "format_helper/src/lib.rs": '''pub struct Compare<T>(pub T);
+impl<T: std::fmt::Debug> std::fmt::Display for Compare<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{:?}", self.0) }
+}
+''',
         "probe/Cargo.toml": '[package]\nname = "probe"\nversion = "0.1.0"\nedition = "2021"\n[dependencies]\ngraph_sharing = { path = ".." }\n',
         "probe/src/lib.rs": '''pub fn normal() { assert_eq!(graph_sharing::lease(), 900); assert!(!graph_sharing::tested()); assert_eq!(graph_sharing::caller(), 7); assert_eq!(graph_sharing::const_operand(), 17); assert_eq!(graph_sharing::analysis_closure(), 7); assert_eq!(graph_sharing::analysis_result(true), Ok(7)); assert_eq!(graph_sharing::analysis_result(false), Err(())); }
 pub fn shared() -> u32 { graph_sharing::shared() }
@@ -1265,6 +1271,7 @@ pub fn hidden_size() -> usize { graph_sharing::hidden_size() }
         "src/main.rs": 'fn main() { println!("{}", graph_sharing::shared()); }\n',
         "src/lib.rs": '''use std::sync::atomic::{AtomicUsize, Ordering};
 #[inline(never)] pub fn shared() -> u32 { 40 + 2 }
+pub async fn shared_async() -> u32 { 13 }
 #[cfg(test)] const LEASE: u32 = 1;
 #[cfg(not(test))] const LEASE: u32 = 900;
 pub fn lease() -> u32 { LEASE }
@@ -1288,6 +1295,33 @@ impl Default for Defaulted {
 }
 pub fn analysis_default() -> u32 { Some(()).map(|_| Defaulted::default().0).unwrap() }
 pub async fn analysis_async_closure() -> u32 { let call = async || different(); call().await }
+pub trait AsyncRunner { async fn run(&self) -> u32; }
+pub struct AsyncWorker;
+impl AsyncRunner for AsyncWorker { async fn run(&self) -> u32 { different() } }
+pub async fn analysis_trait_async() -> u32 { AsyncWorker.run().await }
+pub trait AsyncDefault { async fn default_value() -> u32; }
+impl AsyncDefault for Defaulted {
+    async fn default_value() -> u32 { Self::default().0 }
+}
+pub async fn analysis_trait_generic<T: AsyncDefault>() -> u32 {
+    let _ = different();
+    T::default_value().await
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedSegment<T> { Normal(String), Tagged(T) }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanSegment { Normal(String), Tagged(u32) }
+fn map_segment(segment: TaggedSegment<u32>) -> PlanSegment {
+    match segment {
+        TaggedSegment::Normal(text) => PlanSegment::Normal(text),
+        TaggedSegment::Tagged(value) => PlanSegment::Tagged(value),
+    }
+}
+pub fn analysis_collect_segments() -> Vec<PlanSegment> {
+    let _ = different();
+    vec![TaggedSegment::Normal(String::from("plan")), TaggedSegment::Tagged(23)]
+        .into_iter().map(map_segment).collect()
+}
 static STATE: AtomicUsize = AtomicUsize::new(0);
 pub fn bump() -> usize { STATE.fetch_add(1, Ordering::SeqCst) }
 pub fn read() -> usize { STATE.load(Ordering::SeqCst) }
@@ -1345,6 +1379,12 @@ pub fn hidden_size() -> usize { std::mem::size_of_val(&changed()) }
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         assert_eq!(std::future::Future::poll(closure.as_mut(), &mut context), std::task::Poll::Ready(9));
         assert_eq!(probe::async_closure_value(), 7);
+        let mut trait_future = std::pin::pin!(super::analysis_trait_async());
+        assert_eq!(std::future::Future::poll(trait_future.as_mut(), &mut context), std::task::Poll::Ready(9));
+        let mut shared_future = std::pin::pin!(super::shared_async());
+        assert_eq!(std::future::Future::poll(shared_future.as_mut(), &mut context), std::task::Poll::Ready(13));
+        let mut local_generic = std::pin::pin!(super::analysis_trait_generic::<super::Defaulted>());
+        assert_eq!(std::future::Future::poll(local_generic.as_mut(), &mut context), std::task::Poll::Ready(19));
         let mut future = std::pin::pin!(super::analysis_async());
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         assert_eq!(std::future::Future::poll(future.as_mut(), &mut context), std::task::Poll::Ready(128));
@@ -1357,6 +1397,12 @@ pub fn hidden_size() -> usize { std::mem::size_of_val(&changed()) }
         assert_eq!(object.calc(), 3);
         let debug: &dyn std::fmt::Debug = &super::Shape;
         assert_eq!(format!("{:?}", debug), "shape");
+        assert_eq!(format!("{}", format_helper::Compare(super::Shape)), "shape");
+        assert_eq!(super::analysis_collect_segments(), vec![
+            super::PlanSegment::Normal(String::from("plan")), super::PlanSegment::Tagged(23)
+        ]);
+        assert!(Vec::<super::TaggedSegment<u32>>::new().into_iter().map(super::map_segment)
+            .collect::<Vec<super::PlanSegment>>().is_empty());
         assert_eq!(super::static_generic(super::Shape), "shape");
         let mut flattened = vec![super::Batch([3])].into_iter().flatten();
         assert_eq!(flattened.next(), Some(3));
@@ -1413,7 +1459,9 @@ pub fn hidden_size() -> usize { std::mem::size_of_val(&changed()) }
         shared = re.findall(r"cfg codegen body: shared: T compiled (\d+), redirected (\d+)", text)
         check("shared function has no T compilation", bool(shared) and all(t == "0" and n == "1" for t, n in shared), str(shared))
         check("opaque callers stay analysis-shared", "cfg body: graph_sharing::count: analysis-shared" in text and "cfg body: graph_sharing::hidden_size: analysis-shared" in text, "count, hidden_size")
-        for body in ("caller", "count", "hidden_size", "bump", "read", "tls_bump", "tls_read", "static_generic", "const_operand", "analysis_closure", "analysis_async", "analysis_result", "analysis_default", "analysis_async_closure"):
+        queries = re.findall(r"cfg analysis query: (infer|mir) shared_async: test (true|false)", text)
+        check("shared async has no T analysis", bool(queries) and all(copy == "false" for _, copy in queries), str(queries))
+        for body in ("caller", "count", "hidden_size", "bump", "read", "tls_bump", "tls_read", "static_generic", "const_operand", "analysis_closure", "analysis_async", "analysis_result", "analysis_default", "analysis_async_closure", "analysis_trait_async", "analysis_trait_generic", "analysis_collect_segments"):
             queries = re.findall(rf"cfg analysis query: (infer|mir) {body}: test (true|false)", text)
             check(f"{body} reuses N analysis", bool(queries) and all(copy == "false" for _, copy in queries), str(queries))
             compiled = re.findall(rf"cfg codegen body: {body}: T compiled 1, redirected 0, analysis-shared (\d+)", text)

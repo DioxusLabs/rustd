@@ -571,6 +571,22 @@ impl CodegenUnit {
         denied: &FxHashSet<FunctionId>,
         known: &mut Rejections,
     ) -> Result<CodegenUnit> {
+        retry_sharing(!roots.sharing.is_empty(), known, |sharing, known| {
+            let mut roots = roots.clone();
+            if !sharing {
+                roots.sharing = roots.sharing.disabled();
+            }
+            Self::compile_inner(db, symbols, roots, denied, known)
+        })
+    }
+
+    fn compile_inner(
+        db: &dyn HirDatabase,
+        symbols: &dyn SymbolResolver,
+        roots: Roots<'_>,
+        denied: &FxHashSet<FunctionId>,
+        known: &mut Rejections,
+    ) -> Result<CodegenUnit> {
         let mut sharing = roots.sharing.clone();
         if !sharing.is_empty() {
             known.base = None;
@@ -778,6 +794,18 @@ impl CodegenUnit {
                 start_over("a shared type reaches TypeId");
                 continue;
             }
+            if !sharing.is_empty() {
+                if let Some((_, rejection)) = failed.first() {
+                    return Err(CodegenError::Unsupported(rejection.why.clone()));
+                }
+                if let Some((_, error)) = report_errors.first().or_else(|| {
+                    skipped.iter().find(|(root, error)| {
+                        !denied.contains(root) && !left.contains(root) && !error.no_symbol()
+                    })
+                }) {
+                    return Err(error.clone());
+                }
+            }
             if cg.misfit {
                 start_over("an entry of the store did not fit");
                 rejected.extend(failed);
@@ -924,6 +952,61 @@ impl CodegenUnit {
             start_over(&format!("{} instances did not compile, the first: {first}", failed.len()));
             cg.poison_callers(&mut failed);
             rejected.extend(failed);
+        }
+    }
+}
+
+fn retry_sharing<T>(
+    sharing: bool,
+    known: &mut Rejections,
+    mut compile: impl FnMut(bool, &mut Rejections) -> Result<T>,
+) -> Result<T> {
+    if !sharing {
+        return compile(false, known);
+    }
+    let before = known.clone();
+    match compile(true, known) {
+        Ok(unit) => Ok(unit),
+        Err(error) => {
+            eprintln!("cfg sharing fallback: demoting all program items to unshared: {error}");
+            *known = before;
+            let result = compile(false, known);
+            known.stats.sharing.fallback_restarts += 1;
+            result
+        }
+    }
+}
+
+#[cfg(test)]
+mod sharing_retry_tests {
+    use super::*;
+
+    #[test]
+    fn retries_only_sharing_errors_and_restores_state() {
+        for (sharing, fails, attempts, succeeds) in [
+            (false, 0, 1, true),
+            (false, 1, 1, false),
+            (true, 0, 1, true),
+            (true, 1, 2, true),
+            (true, 2, 2, false),
+        ] {
+            let mut known = Rejections::default();
+            known.stats.bodies = 11;
+            let mut calls = 0;
+            let result = retry_sharing(sharing, &mut known, |enabled, known| {
+                calls += 1;
+                assert_eq!(enabled, sharing && calls == 1);
+                assert_eq!(known.stats.bodies, 11);
+                known.stats.bodies = 99;
+                if calls <= fails {
+                    Err(CodegenError::Unsupported("refusal".to_owned()))
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(result.is_ok(), succeeds);
+            assert_eq!(calls, attempts);
+            assert_eq!(known.stats.sharing.fallback_restarts, usize::from(attempts == 2));
         }
     }
 }
@@ -1156,6 +1239,7 @@ pub struct SharingStats {
     pub redirected: usize,
     pub analysis_shared_compiled: usize,
     pub type_id_restarts: usize,
+    pub fallback_restarts: usize,
 }
 
 /// Time spent in each step of the last round.
@@ -2199,9 +2283,12 @@ fn program_instance_body<'db>(
         Some((source, _)) => remap::body(db, sharing, source, raw)?,
         None => remap::opaques(db, sharing, raw)?,
     };
-    monomorphized(db, &mapped, &instance.args, &env)
-        .map(Cow::Owned)
-        .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))
+    remap::monomorphized(db, sharing, &mapped, &instance.args, &env).map(Cow::Owned).map_err(|e| {
+        if std::env::var_os("RUSTD_CFG_SHARING_TRACE").is_some() {
+            eprintln!("sharing mono error: {instance:?}, env {:?}: {e:?}", env.krate);
+        }
+        CodegenError::Frontend(format!("mir: {e:?}"))
+    })
 }
 
 /// The types a body takes and returns, which is all its callers have to know about it. Asked
@@ -3600,7 +3687,7 @@ fn program_body<'db>(
             krate: func.krate(db),
         };
         let args = GenericArgs::new_from_slice(&[]).store();
-        let body = monomorphized(db, &mapped, &args, &env.store())
+        let body = remap::monomorphized(db, sharing, &mapped, &args, &env.store())
             .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
         Ok((Cow::Owned(body), env))
     } else if !sharing.is_empty() {
@@ -3612,7 +3699,7 @@ fn program_body<'db>(
             krate: func.krate(db),
         };
         let args = GenericArgs::new_from_slice(&[]).store();
-        let body = monomorphized(db, &mapped, &args, &env.store())
+        let body = remap::monomorphized(db, sharing, &mapped, &args, &env.store())
             .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
         Ok((Cow::Owned(body), env))
     } else {
@@ -6476,9 +6563,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn layout(&self, ty: Ty<'db>) -> Result<Arc<Layout>> {
-        let canonical = self.cg.sharing.fold(self.cg.db, self.env.krate, ty);
-        let env = self.cg.sharing.type_env(self.cg.db, canonical, self.env);
-        let ty = canonical;
+        let env = self.env;
         if let Some(layout) = self.layouts.borrow().get(&ty) {
             return Ok(layout.clone());
         }
@@ -12173,9 +12258,29 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         >,
         GenericArgs<'db>,
     ) {
-        let ty = Ty::new_fn_def(self.interner, CallableDefId::FunctionId(func).into(), args);
-        let env = self.cg.sharing.type_env(self.cg.db, ty, self.env);
-        self.cg.db.lookup_impl_method(env, func, args)
+        let env = self.env;
+        let result = self.cg.db.lookup_impl_method(env, func, args);
+        if result.0 == either::Either::Left(func)
+            && matches!(func.loc(self.cg.db).container, ItemContainerId::TraitId(_))
+            && std::env::var_os("RUSTD_CFG_SHARING_TRACE").is_some()
+        {
+            eprintln!(
+                "sharing lookup unresolved: {:?} {args:?}, body env {:?}, lookup env {:?}, test env {}, self crate {:?}",
+                FunctionSignature::of(self.cg.db, func).name,
+                self.env.krate,
+                env.krate,
+                self.cg.sharing.test_crate(env.krate),
+                args.iter().next().and_then(|arg| arg.ty()).and_then(|ty| {
+                    match ty.kind() {
+                        TyKind::Adt(adt, _) => {
+                            Some((adt.def_id(), adt.def_id().module(self.cg.db).krate(self.cg.db)))
+                        }
+                        _ => None,
+                    }
+                })
+            );
+        }
+        result
     }
 
     /// Calls `func` with arguments that live at the given addresses.

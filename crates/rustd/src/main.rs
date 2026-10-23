@@ -6921,11 +6921,12 @@ fn report_stats(stats: &hir_ty::mir::codegen::BuildStats) {
         stats.compiled, stats.bodies, stats.reused
     );
     eprintln!(
-        "cfg codegen: T bodies compiled {}, redirected to N {}, analysis-shared compiled {}, TypeId restarts {}",
+        "cfg codegen: T bodies compiled {}, redirected to N {}, analysis-shared compiled {}, TypeId restarts {}, sharing fallback restarts {}",
         stats.sharing.t_compiled,
         stats.sharing.redirected,
         stats.sharing.analysis_shared_compiled,
-        stats.sharing.type_id_restarts
+        stats.sharing.type_id_restarts,
+        stats.sharing.fallback_restarts
     );
     if let Some(patched) = stats.patched {
         eprintln!("patch: {patched} functions");

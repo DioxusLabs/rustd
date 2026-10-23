@@ -14,6 +14,33 @@ use crate::{
 };
 use triomphe::Arc;
 
+pub(super) fn monomorphized<'db>(
+    db: &'db dyn HirDatabase,
+    sharing: &Sharing,
+    body: &MirBody<'db>,
+    args: &StoredGenericArgs,
+    env: &StoredParamEnvAndCrate,
+) -> std::result::Result<MirBody<'db>, super::super::MirLowerError<'db>> {
+    use rustc_type_ir::Interner;
+    let interner = crate::next_solver::DbInterner::new_with(db, env.krate);
+    crate::mir::monomorphization::monomorphized_with(db, body, args, env, &|id, args| {
+        if let crate::ImplTraitId::ReturnTypeImplTrait(func, index) = id.loc(db)
+            && let Some(source) = sharing.body_source(db, func)
+        {
+            let source_id = crate::db::InternedOpaqueTyId::new(
+                db,
+                crate::ImplTraitId::ReturnTypeImplTrait(source, index),
+            );
+            let hidden = interner.type_of(source_id.into()).instantiate_identity().skip_norm_wip();
+            let hidden = sharing.analysis_fold(db, source, hidden);
+            return crate::next_solver::EarlyBinder::bind(hidden)
+                .instantiate(interner, args)
+                .skip_norm_wip();
+        }
+        interner.type_of(id.into()).instantiate(interner, args).skip_norm_wip()
+    })
+}
+
 struct ProgramLayout<'a, 'db> {
     db: &'db dyn HirDatabase,
     sharing: &'a Sharing,
@@ -64,7 +91,12 @@ impl<'db> LayoutProvider<'db> for ProgramLayout<'_, 'db> {
             env,
             self.sharing,
         )
-        .map_err(|_| LayoutError::Unknown)
+        .map_err(|e| {
+            if std::env::var_os("RUSTD_CFG_SHARING_TRACE").is_some() {
+                eprintln!("sharing coroutine layout error: {id:?}: {e:?}");
+            }
+            LayoutError::Unknown
+        })
     }
 }
 
@@ -78,15 +110,7 @@ pub(super) fn layout(
     if sharing.is_empty() {
         return db.layout_of_ty(ty, env);
     }
-    let original = ty.as_ref();
-    let canonical = sharing.fold(db, env.krate, original);
-    let env = sharing.type_env(db, canonical, env.as_ref(db)).store();
-    crate::layout::layout_of_ty_with(
-        db,
-        canonical.store(),
-        env,
-        &ProgramLayout { db, sharing: &sharing },
-    )
+    crate::layout::layout_of_ty_with(db, ty, env, &ProgramLayout { db, sharing: &sharing })
 }
 
 fn layout_cycle(
@@ -128,7 +152,7 @@ pub(super) fn promoted<'db>(
     let raw = super::super::promoted_mir_body_query(db, source.into(), expr)
         .map_err(|e| CodegenError::Frontend(format!("promoted mir: {e:?}")))?;
     let mapped = body(db, &sharing, source, &raw)?;
-    super::monomorphized(db, &mapped, &args, &env)
+    monomorphized(db, &sharing, &mapped, &args, &env)
         .map_err(|e| CodegenError::Frontend(format!("promoted mir: {e:?}")))
 }
 
