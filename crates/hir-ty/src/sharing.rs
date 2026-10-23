@@ -167,6 +167,7 @@ fn local_trait_impls(db: &dyn HirDatabase, krate: Crate) -> FxHashMap<TraitId, V
     result
 }
 
+#[salsa::tracked(returns(ref))]
 fn applicable_adt_impls(db: &dyn HirDatabase, adt: AdtId) -> FxHashSet<ImplId> {
     struct MentionsAdt {
         adt: AdtId,
@@ -966,17 +967,27 @@ pub fn pair_safety(db: &dyn HirDatabase, normal: Crate, test: Crate) -> Vec<&'st
     veto
 }
 
-fn same_signature(
+#[salsa::tracked(returns(ref))]
+fn generic_twins(
     db: &dyn HirDatabase,
     normal: Crate,
-    n: AttrDefId,
-    t: AttrDefId,
-    twins: &FxHashMap<AttrDefId, AttrDefId>,
-) -> bool {
+    test: Crate,
+) -> FxHashMap<GenericDefId, GenericDefId> {
+    twin_index(db, normal, test)
+        .twins
+        .iter()
+        .filter_map(|(&t, &n)| Some((generic(t)?, generic(n)?)))
+        .collect()
+}
+
+#[salsa::tracked]
+fn same_signature(db: &dyn HirDatabase, normal: Crate, n: AttrDefId, t: AttrDefId) -> bool {
+    let test = t.module(db).krate(db);
+    let twins = &twin_index(db, normal, test).twins;
     struct MapTypes<'a, 'db> {
         interner: DbInterner<'db>,
         twins: &'a FxHashMap<AttrDefId, AttrDefId>,
-        generics: FxHashMap<GenericDefId, GenericDefId>,
+        generics: &'a FxHashMap<GenericDefId, GenericDefId>,
     }
     impl<'db> TypeFolder<DbInterner<'db>> for MapTypes<'_, 'db> {
         fn cx(&self) -> DbInterner<'db> {
@@ -1063,7 +1074,7 @@ fn same_signature(
         }
     }
     let interner = DbInterner::new_with(db, normal);
-    let generics = twins.iter().filter_map(|(&t, &n)| Some((generic(t)?, generic(n)?))).collect();
+    let generics = generic_twins(db, normal, test);
     let mut mapper = MapTypes { interner, twins, generics };
     match (n, t) {
         (AttrDefId::FunctionId(n), AttrDefId::FunctionId(t)) => {
@@ -1211,8 +1222,7 @@ pub fn pair_eligibility(
         .iter()
         .filter_map(|(&n, &t)| {
             let (AttrDefId::StaticId(n), AttrDefId::StaticId(t)) = (n, t) else { return None };
-            same_signature(db, normal, n.into(), t.into(), &twins.twins)
-                .then_some(AttrDefId::from(n))
+            same_signature(db, normal, n.into(), t.into()).then_some(AttrDefId::from(n))
         })
         .collect();
     let mut own = FxHashMap::default();
@@ -1222,7 +1232,7 @@ pub fn pair_eligibility(
         let refs = references(db, item, !per_copy.contains(&item));
         if let AttrDefId::AdtId(adt) = item {
             let impls = applicable_adt_impls(db, adt);
-            for id in &impls {
+            for id in impls {
                 if let Some(&dependency) = nodes.get(&AttrDefId::ImplId(*id)) {
                     graph.add_edge(node, dependency, ());
                 }
@@ -1274,7 +1284,7 @@ pub fn pair_eligibility(
     let rejected = reverse_closure(&graph, own.keys().copied().chain(impl_mismatches));
     let compatible: FxHashSet<_> = matched
         .iter()
-        .filter_map(|(&n, &t)| same_signature(db, normal, n, t, &twins.twins).then_some(n))
+        .filter_map(|(&n, &t)| same_signature(db, normal, n, t).then_some(n))
         .collect();
     let mut layout_graph = DiGraph::<AttrDefId, ()>::new();
     for &item in graph.node_weights() {
