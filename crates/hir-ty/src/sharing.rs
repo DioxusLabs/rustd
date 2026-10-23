@@ -1115,9 +1115,11 @@ fn pair_safety_mode(
             veto.insert("cfg-test-macro-rules");
         }
     }
-    for (n, t) in safety_scopes(db, normal, test, local) {
-        if namespace_shadowed(db, normal, test, n, t, local) {
-            veto.insert("namespace-shadowing");
+    if !local {
+        for (n, t) in safety_scopes(db, normal, test, local) {
+            if namespace_shadowed(db, normal, test, n, t, local) {
+                veto.insert("namespace-shadowing");
+            }
         }
     }
     veto.extend(impl_safety(db, normal, test, local));

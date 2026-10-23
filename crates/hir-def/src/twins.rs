@@ -13,6 +13,8 @@
 //! derives append items rather than rewrite their input ADT.
 //! Inert derive helpers follow the resolved DeriveHelper bindings constructed by
 //! rustc_resolve/src/macros.rs at the same tag; their owning expansion is still compared.
+//! Local observations include block item gates before stripping and the import gates
+//! used by a body's names, as resolved by rustc_resolve/src/imports.rs at that tag.
 
 use std::ops::ControlFlow;
 
@@ -21,6 +23,7 @@ use cfg::{CfgOptions, CfgReads};
 use hir_expand::{
     ErasedAstId, HirFileId, MacroCallId, MacroCallKind, MacroDefId, MacroDefKind,
     attrs::expand_cfg_attr,
+    name::AsName,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use span::{ErasedFileAstId, SyntaxContext};
@@ -436,6 +439,96 @@ fn declaration_definitions(
         .collect()
 }
 
+fn scope_item(item: ModuleDefId) -> Option<AttrDefId> {
+    Some(match item {
+        ModuleDefId::ModuleId(id) => id.into(),
+        ModuleDefId::FunctionId(id) => id.into(),
+        ModuleDefId::AdtId(id) => id.into(),
+        ModuleDefId::EnumVariantId(id) => id.into(),
+        ModuleDefId::ConstId(id) => id.into(),
+        ModuleDefId::StaticId(id) => id.into(),
+        ModuleDefId::TraitId(id) => id.into(),
+        ModuleDefId::TypeAliasId(id) => id.into(),
+        ModuleDefId::MacroId(id) => id.into(),
+        ModuleDefId::BuiltinType(_) => return None,
+    })
+}
+
+#[salsa::tracked(returns(clone))]
+fn local_scope_reads(db: &dyn SourceDatabase, item: AttrDefId) -> CfgReads {
+    let krate = item.module(db).krate(db);
+    let (options, recorder) = krate.cfg_options(db).recording();
+    let mut reads = CfgReads::default();
+    let mut pending = vec![item];
+    let mut seen = FxHashSet::default();
+    while let Some(next) = pending.pop() {
+        if !seen.insert(next) {
+            continue;
+        }
+        let Some(id) = ast_id(db, next) else {
+            reads.unknown |= !matches!(next, AttrDefId::ModuleId(_));
+            continue;
+        };
+        let syntax = node(db, id);
+        if next == item {
+            for owner in syntax.descendants().filter_map(ast::AnyHasAttrs::cast) {
+                observe_attrs(&owner, &options, &mut reads);
+            }
+        }
+        let names: FxHashSet<_> = syntax
+            .descendants()
+            .filter_map(ast::NameRef::cast)
+            .map(|name| name.as_name())
+            .collect();
+        let mut modules = vec![next.module(db)];
+        let mut visited = FxHashSet::default();
+        while let Some(module) = modules.pop() {
+            if module.krate(db) != krate || !visited.insert(module) {
+                continue;
+            }
+            modules.extend(module.containing_module(db));
+            let scope = module.def_map(db).module(db, module).scope(db);
+            for name in &names {
+                let entry = scope.get(name);
+                for def in [
+                    entry.types.map(|it| it.def),
+                    entry.values.map(|it| it.def),
+                    entry.macros.map(|it| it.def.into()),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if let ModuleDefId::ModuleId(module) = def {
+                        modules.push(module);
+                    }
+                    if let Some(def) = scope_item(def)
+                        && def.module(db).krate(db) == krate
+                    {
+                        reads.merge(item_cfg_reads(db, def));
+                    }
+                }
+                for import in [
+                    entry.types.and_then(|it| it.import),
+                    entry.values.and_then(|it| it.import).map(Into::into),
+                    entry.macros.and_then(|it| it.import),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if let Some(id) = import.use_()
+                        && id.module(db).krate(db) == krate
+                    {
+                        reads.merge(item_cfg_reads(db, id.into()));
+                        pending.push(id.into());
+                    }
+                }
+            }
+        }
+    }
+    reads.merge(&recorder.finish());
+    reads
+}
+
 #[salsa::tracked(returns(copy))]
 pub fn declaration_twin(
     db: &dyn SourceDatabase,
@@ -516,6 +609,8 @@ pub fn local_item_twin(
     };
     let Some(twin) = result.twin else { return result };
     let (mut n, mut t) = (origin_reads(db, twin), origin_reads(db, item));
+    n.merge(&local_scope_reads(db, twin));
+    t.merge(&local_scope_reads(db, item));
     let mut macros_known = true;
     if let (Some(no), Some(to)) = (body(twin), body(item)) {
         let (ni, ti) = (body_inventory(db, no), body_inventory(db, to));
@@ -1204,6 +1299,61 @@ fn shared() {}
         let (db, normal, test) = pair("#[cfg(test)] fn only_test() {}\n");
         for &item in &declaration_items(&db, test).items {
             assert!(local_item_twin(&db, normal, test, item).twin.is_none());
+        }
+    }
+
+    #[test]
+    fn local_twins_observe_block_item_gates() {
+        let (db, normal, test) = pair(
+            r#"
+fn shadowed() { #[cfg(test)] struct String; let _: String; }
+fn named() {
+    #[cfg(test)] fn name() {}
+    #[cfg(not(test))] fn name() {}
+    name();
+}
+fn unrelated() {}
+fn malformed() { #[cfg()] struct Item; }
+"#,
+        );
+        for &item in &declaration_items(&db, test).items {
+            let AttrDefId::FunctionId(id) = item else { continue };
+            let facts = local_item_twin(&db, normal, test, item);
+            let name = FunctionSignature::of(&db, id).name.as_str();
+            assert!(facts.twin.is_some(), "{name}");
+            match name {
+                "shadowed" | "named" => assert_eq!(facts.differs, 1, "{name}"),
+                "unrelated" => assert_eq!((facts.differs, facts.unknown), (0, 0)),
+                "malformed" => assert_eq!(facts.unknown, 1),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn local_twins_follow_only_used_scope_names() {
+        let (db, normal, test) = pair(
+            r#"
+mod normal { pub struct Map; }
+mod tested { pub struct Map; }
+mod names {
+    #[cfg(not(test))] pub use crate::normal::Map;
+    #[cfg(test)] pub use crate::tested::Map;
+    pub fn direct() { let _: Map; }
+    pub fn unrelated() {}
+}
+use names::Map as Alias;
+fn aliased() { let _: Alias; }
+fn qualified() { let _: names::Map; }
+"#,
+        );
+        for &item in &declaration_items(&db, test).items {
+            let AttrDefId::FunctionId(id) = item else { continue };
+            let facts = local_item_twin(&db, normal, test, item);
+            let name = FunctionSignature::of(&db, id).name.as_str();
+            assert!(facts.twin.is_some(), "{name}");
+            assert_eq!(facts.differs, usize::from(name != "unrelated"), "{name}");
+            assert_eq!(facts.unknown, 0, "{name}");
         }
     }
 
