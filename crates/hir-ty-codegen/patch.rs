@@ -922,9 +922,10 @@ impl Base {
                 self.compiled.len()
             );
             eprintln!(
-                "patch instance candidates: {} of {}",
+                "patch instance candidates: {} of {}; opaque={}",
                 self.instances_to_ask(false, 0, 1).count(),
-                self.instances.len()
+                self.instances.len(),
+                self.homes.instances_of_any_file.iter().collect::<FxHashSet<_>>().len()
             );
         }
         for i in self.roots_to_ask(check_all, part, parts) {

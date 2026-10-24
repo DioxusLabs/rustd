@@ -6888,6 +6888,8 @@ impl Program {
         wanted: Option<&Outputs>,
         link_it: bool,
     ) -> anyhow::Result<Result<String, String>> {
+        let queued = edit.start.elapsed().saturating_sub(edit.apply);
+        let preparing = Instant::now();
         // The crates left to rustc are as edited when a client has named what it built since.
         let named_anew = std::mem::take(&mut self.unbuilt.named_anew);
         let unnamed = if named_anew { None } else { self.widen(db) };
@@ -6913,13 +6915,20 @@ impl Program {
         // Neither is what no crate that is built reads: an example, or a test.
         edited.retain(|&file| listed.sees(db, file));
         // The check of the edited files does not wait for the build: it reads other things.
-        let (warm, broken) = std::thread::scope(|scope| {
+        let prepared = preparing.elapsed();
+        let (warm, broken, diagnostics, diagnostics_wait) = std::thread::scope(|scope| {
             let check = {
                 let (db, edited) = (db.clone(), &edited);
-                scope.spawn(move || broken_in(&db, edited, paths))
+                scope.spawn(move || {
+                    let start = Instant::now();
+                    let broken = broken_in(&db, edited, paths);
+                    (broken, start.elapsed())
+                })
             };
             let warm = build(db, table, args, known, listed, text);
-            (warm, check.join().ok().flatten())
+            let joining = Instant::now();
+            let (broken, diagnostics) = check.join().unwrap_or_default();
+            (warm, broken, diagnostics, joining.elapsed())
         });
         let warm = warm?;
         if known.stats.patched.is_none() {
@@ -6992,7 +7001,16 @@ impl Program {
                 ("write-reach", warm.emitted[1]),
                 ("write-harness", warm.emitted[2]),
                 ("write-diagnostics", warm.emitted[3]),
-                ("build-rest", built.saturating_sub(apply + warm.codegen + warm.emit)),
+                ("schedule", queued),
+                ("sync-prepare", prepared),
+                ("diagnostics", diagnostics),
+                ("diagnostics-wait", diagnostics_wait),
+                (
+                    "build-rest",
+                    built.saturating_sub(
+                        apply + queued + prepared + warm.codegen + warm.emit + diagnostics_wait,
+                    ),
+                ),
                 ("report", reported - built),
                 ("link", total - reported),
             ];

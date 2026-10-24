@@ -1568,13 +1568,16 @@ def test_graph_sharing_incremental(work):
         functions = "\n".join(f"pub fn f{i}<T: Copy>(x: T) -> (T, u64) {{ (x, if enabled(1) {{ {i} }} else {{ 0 }}) }}" for i in range(400))
         total = "+".join(f"f{i}(1u64).1" for i in range(400))
         feature = "pub fn enabled(x: u64) -> bool { x != 0 }\nfn identity(x: u64) -> u64 { x }\n#[derive(Clone)] pub struct Flag;\nmacro_rules! generated { () => { pub fn generated_value() -> u64 { 7 } } }\ngenerated!();\nimpl Flag { pub fn check(x: u64) -> bool { enabled(x) } }\npub fn dependency_value() -> u64 { named_dependency::value() }\npub fn schema_value() -> u64 { schema_probe::value() }\npub fn policy_value() -> u64 { policy_cycle(0) }\nfn policy_cycle(x: u8) -> u64 { if x == 0 { 7 } else { policy_value() } }\n" + functions + "\n"
+        feature += "named_dependency::macro_value!(0);\n"
         reports = "\n".join(f'#[test] fn report{i}() -> Result<(), &\'static str> {{ Ok(()) }}' for i in range(20))
         files = {
-            "Cargo.toml": '[package]\nname="sharing_incremental"\nversion="0.1.0"\nedition="2021"\n[workspace]\nmembers=["probe", "named_dependency", "schema"]\n[dependencies]\nnamed_dependency={path="named_dependency"}\nschema_probe={path="schema"}\n[dev-dependencies]\nprobe={path="probe"}\n',
+            "Cargo.toml": '[package]\nname="sharing_incremental"\nversion="0.1.0"\nedition="2021"\n[workspace]\nmembers=["probe", "named_dependency", "schema", "unused_dependency"]\n[dependencies]\nnamed_dependency={path="named_dependency"}\nschema_probe={path="schema"}\nunused_dependency={path="unused_dependency"}\n[dev-dependencies]\nprobe={path="probe"}\n',
             "schema/Cargo.toml": '[package]\nname="schema_probe"\nversion="0.1.0"\nedition="2021"\n[dev-dependencies]\nsharing_incremental={path=".."}\n',
             "schema/src/lib.rs": 'pub fn value() -> u64 { 7 }\n#[cfg(test)] mod tests { #[test] fn dependency() { assert_eq!(sharing_incremental::schema_value(), 7); } }\n',
             "named_dependency/Cargo.toml": '[package]\nname="named_dependency"\nversion="0.1.0"\nedition="2021"\n',
-            "named_dependency/src/lib.rs": 'pub fn value() -> u64 { 7 }\npub static VALUE: u64 = 7;\n',
+            "named_dependency/src/lib.rs": 'pub fn value() -> u64 { 7 }\npub static VALUE: u64 = 7;\n#[macro_export] macro_rules! macro_value { (0) => { pub fn macro_dependency_value() -> u64 { 7 } }; (1) => { pub fn macro_dependency_value() -> u64 { unused_dependency::value() } }; }\n',
+            "unused_dependency/Cargo.toml": '[package]\nname="unused_dependency"\nversion="0.1.0"\nedition="2021"\n',
+            "unused_dependency/src/lib.rs": 'pub fn value() -> u64 { 7 }\n',
             "probe/Cargo.toml": '[package]\nname="probe"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nsharing_incremental={path=".."}\n',
             "probe/src/lib.rs": 'pub fn total() -> u64 { sharing_incremental::total() }\npub fn different() -> u64 { sharing_incremental::different() }\npub fn policy_value() -> u64 { sharing_incremental::policy_value() }\n',
             "src/features.rs": feature,
@@ -1591,6 +1594,7 @@ pub fn total() -> u64 {{ {total} }}
         assert!(super::Flag::check(1));
         let _ = super::Flag.clone();
         assert_eq!(super::generated_value(), 7);
+        assert_eq!(super::macro_dependency_value(), 7);
         assert_eq!(super::macro_local(), 3);
         assert_eq!(super::total(), 79800);
         assert_eq!(super::total(), probe::total());
@@ -1702,6 +1706,16 @@ pub fn total() -> u64 {{ {total} }}
                         held = "write text: retained skipped=true harness=true" in fresh
                         checks.append((name, held, fresh[-700:]))
                         print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                for case, text in [("added", feature.replace("macro_value!(0)", "macro_value!(1)")), ("removed", feature)]:
+                    before = logs()
+                    pathlib.Path(ws, "src/features.rs").write_text(text)
+                    _, result = side.cargo("test", "--lib")
+                    fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                    name = f"cfg sharing: {mode} {prime}-prime {case} macro dependency invalidates loaded crates"
+                    ran = sum(map(int, re.findall(r"\bloaded_crates=(\d+)", fresh)))
+                    held = result.returncode == 0 and ran > 0
+                    checks.append((name, held, f"executed {ran}"))
+                    print(f"  {'ok ' if held else 'NOT'} {name}: {ran}", flush=True)
                 if mode == "on":
                     before = logs()
                     pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "let _ = std::any::TypeId::of::<u64>(); let _ = named_dependency::VALUE; !std::ops::Not::not(x != 0)"))
