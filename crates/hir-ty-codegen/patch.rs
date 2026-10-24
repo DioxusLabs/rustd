@@ -13,7 +13,7 @@ use std::{
 use base_db::{Crate, FileId};
 use cranelift_module::{Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
-use hir_def::{FunctionId, HasModule, StaticId};
+use hir_def::{DefWithBodyId, FunctionId, HasModule, StaticId};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 type FxIndexMap<K, V> = indexmap::IndexMap<K, V, FxBuildHasher>;
@@ -312,7 +312,6 @@ pub(super) struct Base {
     reports: FxHashMap<FunctionId, Mark>,
     /// The crate of each of `compiled`, and the file it is written in.
     crates: Vec<Crate>,
-    files: Vec<FileId>,
     touched: Touched,
     pub(super) skipped: Vec<(FunctionId, CodegenError)>,
     /// For each of `skipped` that rustc has a copy of.
@@ -344,6 +343,8 @@ struct Homes {
     root: FxHashMap<FunctionId, u32>,
     roots_of_crate: FxHashMap<Crate, Vec<u32>>,
     roots_of_file: FxHashMap<FileId, Vec<u32>>,
+    roots_of_function: FxHashMap<FunctionId, Vec<u32>>,
+    roots_of_other_body: FxHashMap<FileId, Vec<u32>>,
     instances_of_crate: FxHashMap<Crate, Vec<u32>>,
     instances_of_file: FxHashMap<FileId, Vec<u32>>,
     /// The instances that the bodies of any file may be part of.
@@ -352,7 +353,9 @@ struct Homes {
 
 impl Homes {
     fn new(
+        db: &dyn HirDatabase,
         compiled: &[(FunctionId, String)],
+        bodies: &[Vec<DefWithBodyId>],
         crates: &[Crate],
         files: &[FileId],
         instances: &FxIndexMap<Instance, BaseInstance>,
@@ -362,6 +365,18 @@ impl Homes {
             homes.root.insert(root, i as u32);
             homes.roots_of_crate.entry(crates[i]).or_default().push(i as u32);
             homes.roots_of_file.entry(files[i]).or_default().push(i as u32);
+            for &body in &bodies[i] {
+                match body {
+                    DefWithBodyId::FunctionId(func) => {
+                        homes.roots_of_function.entry(func).or_default().push(i as u32)
+                    }
+                    _ => homes
+                        .roots_of_other_body
+                        .entry(body_file(db, body))
+                        .or_default()
+                        .push(i as u32),
+                }
+            }
         }
         for (i, was) in instances.values().enumerate() {
             homes.instances_of_crate.entry(was.env.krate).or_default().push(i as u32);
@@ -396,6 +411,8 @@ struct Touched {
     crates: FxHashSet<Crate>,
     /// The files that changed in the bodies of functions alone.
     bodies: FxHashSet<FileId>,
+    wide_bodies: FxHashSet<FileId>,
+    functions: FxHashSet<FunctionId>,
     /// A file changed that we can't tell the crates of.
     any: bool,
     /// What the last look found changed.
@@ -529,11 +546,25 @@ impl Base {
         let debug = cg.debug.is_some();
         let root_mark = |db: &dyn HirDatabase, root| {
             let compiled = program_root(db, root, sharing).as_ref().ok()?;
-            Some(Mark::of_function(
-                db,
-                program_root_serial(db, root, sharing.clone()),
-                compiled,
-                debug,
+            let mut bodies = vec![root.into()];
+            if let Some((owner, _)) = &compiled.source {
+                bodies.push(*owner);
+            }
+            for data in &compiled.requests.datas {
+                match data {
+                    DataRequest::Location(Some((owner, _))) => bodies.push(*owner),
+                    DataRequest::Declaration(func) => bodies.push((*func).into()),
+                    _ => {}
+                }
+            }
+            Some((
+                Mark::of_function(
+                    db,
+                    program_root_serial(db, root, sharing.clone()),
+                    compiled,
+                    debug,
+                ),
+                bodies,
             ))
         };
         let instance_mark =
@@ -561,6 +592,7 @@ impl Base {
             .zip(root_marks)
             .map(|(&(root, _), mark)| mark.into_inner().unwrap_or_else(|| root_mark(db, root)))
             .collect::<Option<Vec<_>>>()?;
+        let (marks, root_bodies): (Vec<_>, Vec<_>) = marks.into_iter().unzip();
         let mut instances = envs
             .iter()
             .zip(instance_marks)
@@ -664,9 +696,8 @@ impl Base {
                     Some((test, Mark::new(db, super::report_serial(db, test), &compiled.requests)))
                 })
                 .collect::<Option<_>>()?,
-            homes: Homes::new(compiled, &crates, &files, &instances),
+            homes: Homes::new(db, compiled, &root_bodies, &crates, &files, &instances),
             crates,
-            files,
             touched: Touched::default(),
             skipped: skipped.to_vec(),
             left,
@@ -723,8 +754,21 @@ impl Base {
 
     /// Notes that a file changed in the bodies of functions alone, none of which the rest of
     /// the program sees into.
-    pub(super) fn touch_bodies(&mut self, db: &dyn HirDatabase, file: FileId) {
+    pub(super) fn touch_bodies(
+        &mut self,
+        db: &dyn HirDatabase,
+        file: FileId,
+        functions: Option<&[FunctionId]>,
+        relocated: &[FunctionId],
+    ) {
         self.touched.bodies.insert(file);
+        match functions {
+            Some(functions) => self.touched.functions.extend(functions),
+            None => {
+                self.touched.wide_bodies.insert(file);
+            }
+        }
+        self.touched.functions.extend(relocated);
         self.outdated |= self.hydrated
             && base_db::relevant_crates(db, file).iter().any(|it| self.crates.contains(it));
     }
@@ -773,8 +817,14 @@ impl Base {
         }
         let homes = &self.homes;
         let of_crates = touched.crates.iter().filter_map(|it| homes.roots_of_crate.get(it));
-        let of_files = touched.bodies.iter().filter_map(|it| homes.roots_of_file.get(it));
+        let of_files = touched.wide_bodies.iter().filter_map(|it| homes.roots_of_file.get(it));
         let mut asked: Vec<u32> = of_crates.chain(of_files).flatten().copied().collect();
+        asked.extend(
+            touched.functions.iter().filter_map(|it| homes.roots_of_function.get(it)).flatten(),
+        );
+        asked.extend(
+            touched.bodies.iter().filter_map(|it| homes.roots_of_other_body.get(it)).flatten(),
+        );
         asked.extend(touched.roots.iter().filter_map(|it| homes.root.get(it)));
         Box::new(part_of(asked, part, parts))
     }
@@ -820,7 +870,8 @@ impl Base {
         let every = |len: usize| (part..len).step_by(parts);
         // A check of the skipping below: looks at what no edit can have changed too, and says
         // so if one did.
-        let check_all = std::env::var_os("RUSTD_CHECK_ALL").is_some();
+        let verify = std::env::var_os("RUSTD_VERIFY_FASTPATH").is_some_and(|it| it == "1");
+        let check_all = std::env::var_os("RUSTD_CHECK_ALL").is_some() || verify;
         for i in every(self.rejected.len()) {
             stale.steps.rejected_asked += 1;
             let (instance, env) = &self.rejected[i];
@@ -833,11 +884,18 @@ impl Base {
         }
         stale.steps.rejected = start.elapsed() - stale.steps.policy;
         let start = stdx::time::Instant::now();
+        let selected: Vec<_> =
+            if check_all { self.roots_to_ask(false, 0, 1).collect() } else { Vec::new() };
+        if part == 0 && std::env::var_os("RUSTD_STATS").is_some() {
+            eprintln!(
+                "patch root candidates: {} of {}",
+                self.roots_to_ask(false, 0, 1).count(),
+                self.compiled.len()
+            );
+        }
         for i in self.roots_to_ask(check_all, part, parts) {
             let root = self.compiled[i].0;
-            let touched = self.touched.reaches(self.crates[i])
-                || self.touched.reaches_bodies(Some(&[self.files[i]]))
-                || self.touched.roots.contains(&root);
+            let touched = !check_all || selected.binary_search(&i).is_ok();
             if !touched && !check_all {
                 continue;
             }
@@ -856,7 +914,15 @@ impl Base {
             match mark {
                 Some(Some(mark)) if mark == self.marks[i] => {}
                 _ if !touched => {
-                    eprintln!("check-all: MISSED root {root:?} of {:?}", self.crates[i]);
+                    eprintln!(
+                        "check-all: MISSED root {root:?} of {:?}: symbol={} file={:?} before={:?} after={:?}",
+                        self.crates[i],
+                        self.compiled[i].1,
+                        body_file(db, root.into()),
+                        (self.marks[i].serial, self.marks[i].locations, self.marks[i].lines),
+                        mark.map(|it| it.map(|mark| (mark.serial, mark.locations, mark.lines)))
+                    );
+                    assert!(!verify, "root invalidation fast path missed {root:?}");
                     continue;
                 }
                 Some(Some(mark)) => {

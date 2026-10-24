@@ -21,7 +21,7 @@ repo = Path(__file__).resolve().parent.parent
 workspace = Path(os.environ.get('RUSTD_BENCH_WORKSPACE', str(Path.home() / 'codex/codex-rs')))
 reports = Path(os.environ.get('RUSTD_BENCH_REPORTS', str(Path.home() / 'bench/profile7')))
 mode = sys.argv[1]
-assert mode in ('on', 'off', 'cli')
+assert mode in ('on', 'off', 'local', 'cli')
 head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo).strip()
 diff = subprocess.check_output(['git', 'diff'], cwd=repo)
 root = reports / os.environ.get('RUSTD_BENCH_RUN', 'sharing-perf-' + mode)
@@ -32,7 +32,7 @@ store = Path(os.environ.get('RUSTD_BENCH_STORE', str(store)))
 binary = Path(os.environ.get('RUSTD_BENCH_BIN', str(repo / 'target/release/rustd')))
 env = dict(os.environ, PATH=str(binary.parent) + os.pathsep + os.environ['PATH'],
            RUSTUP_TOOLCHAIN='1.99.0', RUSTD_HOME=str(home), RUSTD_CACHE=str(store),
-           RUSTD_STATS='1', RUSTD_CFG_SHARING='0' if mode == 'off' else '1',
+           RUSTD_STATS='1', RUSTD_CFG_SHARING='local' if mode == 'local' else ('0' if mode == 'off' else '1'),
            CARGO_PROFILE_DEV_SPLIT_DEBUGINFO='unpacked',
            CARGO_PROFILE_TEST_SPLIT_DEBUGINFO='unpacked', TMPDIR='/home/ubuntu/b')
 for key in list(env):
@@ -153,6 +153,14 @@ try:
     summary = summarize(edits)
     (root / 'five-edits.summary.json').write_text(json.dumps(summary, indent=2))
     print(mode, 'five-edits', json.dumps(summary), flush=True)
+    if os.environ.get('RUSTD_BENCH_REFERENCE_EDIT') == '1':
+        source.write_bytes(original)
+        run('restore-before-reference')
+        replacement = b'        self.enabled.contains(&f) && !f.key().is_empty()'
+        source.write_bytes(original.replace(old, replacement))
+        (root / 'reference-edit.patch').write_text(
+            '- ' + old.decode() + '\n+ ' + replacement.decode() + '\n')
+        run('reference-edit')
 finally:
     source.write_bytes(original)
     assert source.read_bytes() == original

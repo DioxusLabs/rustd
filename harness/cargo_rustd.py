@@ -1647,6 +1647,12 @@ pub fn total() -> u64 {{ {total} }}
                 held = bool(candidates) and max(candidates) <= 4
                 checks.append((name, held, str(candidates)))
                 print(f"  {'ok ' if held else 'NOT'} {name}: {candidates}", flush=True)
+                if mode == "on":
+                    name = f"cfg sharing: {prime}-prime policy checks only edited function facts"
+                    candidates = list(map(int, re.findall(r"sharing candidates: bodies=(\d+)", fresh)))
+                    held = bool(candidates) and max(candidates) <= 2
+                    checks.append((name, held, str(candidates)))
+                    print(f"  {'ok ' if held else 'NOT'} {name}: {candidates}", flush=True)
                 name = f"cfg sharing: {mode} {prime}-prime path diagnostics identify the program"
                 paths = re.findall(r"^(?:reach|sharing) (?:fast|full) path:?.*$", fresh, re.M)
                 held = bool(paths) and all("; program=" in line for line in paths)
@@ -1665,7 +1671,7 @@ pub fn total() -> u64 {{ {total} }}
                 held = projected > 0 and re.search(r"\bloaded_crates=\d+", primed) is not None
                 checks.append((name, held, f"executed {projected}"))
                 print(f"  {'ok ' if held else 'NOT'} {name}: {projected}", flush=True)
-                for case, text in [("code-only edit", feature.replace("x != 0", "x != 3")), ("restored code", feature)]:
+                for case, text in [("code-only edit", feature.replace("x != 0", "x != 3")), ("restored code", feature), ("relocated source", feature.replace("x != 0", "{\n x != 0\n}"))]:
                     before = logs()
                     pathlib.Path(ws, "src/features.rs").write_text(text)
                     _, result = side.cargo("test", "--lib")
@@ -1674,6 +1680,16 @@ pub fn total() -> u64 {{ {total} }}
                     held = result.returncode == 0 and "reach fast path: unchanged edges" in fresh
                     checks.append((name, held, fresh[-700:]))
                     print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                    if case == "restored code":
+                        name = f"cfg sharing: {mode} {prime}-prime root checks follow changed functions"
+                        candidates = re.findall(r"patch root candidates: (\d+) of (\d+)", fresh)
+                        held = bool(candidates) and all(int(selected) <= 4 for selected, total in candidates)
+                        checks.append((name, held, str(candidates)))
+                        print(f"  {'ok ' if held else 'NOT'} {name}: {candidates}", flush=True)
+                        name = f"cfg sharing: {mode} {prime}-prime retains diagnostics and harness text"
+                        held = "write text: retained skipped=true harness=true" in fresh
+                        checks.append((name, held, fresh[-700:]))
+                        print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
                 if mode == "on":
                     before = logs()
                     pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "let _ = std::any::TypeId::of::<u64>(); let _ = named_dependency::VALUE; !std::ops::Not::not(x != 0)"))

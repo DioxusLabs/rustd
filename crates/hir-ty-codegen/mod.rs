@@ -1202,12 +1202,18 @@ impl Rejections {
     /// Notes that a file changed in the bodies of functions alone, none of which the rest of
     /// the program sees into: not `const` or `async`, not returning `impl Trait`, declaring no
     /// items, and not handed to a macro.
-    pub fn touch_bodies(&mut self, db: &dyn HirDatabase, file: base_db::FileId) {
+    pub fn touch_bodies(
+        &mut self,
+        db: &dyn HirDatabase,
+        file: base_db::FileId,
+        functions: Option<&[FunctionId]>,
+        relocated: &[FunctionId],
+    ) {
         self.reach.touch(file);
-        self.policy.touch(file);
+        self.policy.touch(file, functions);
         self.frozen.edit_bodies(file);
         if let Some(base) = &mut self.base {
-            base.touch_bodies(db, file);
+            base.touch_bodies(db, file, functions, relocated);
         }
         self.forget();
     }

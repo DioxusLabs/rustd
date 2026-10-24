@@ -88,7 +88,7 @@ pub(super) struct Cache {
     input: Option<Sharing>,
     shared: Option<Sharing>,
     files: FxHashMap<base_db::FileId, FileFacts>,
-    changed: FxHashSet<base_db::FileId>,
+    changed: FxHashMap<base_db::FileId, Option<FxHashSet<FunctionId>>>,
     eligibility: Vec<((Crate, Crate, bool), crate::sharing::EligibilityState)>,
 }
 
@@ -96,6 +96,14 @@ pub(super) struct Cache {
 struct FileFacts {
     trees: Vec<(Crate, hir_expand::HirFileId, Option<Arc<hir_def::item_tree::ItemTree>>)>,
     bodies: Vec<(FunctionId, bool, crate::sharing::BodySharingFacts)>,
+    by_function: FxHashMap<FunctionId, usize>,
+}
+
+impl FileFacts {
+    fn push(&mut self, func: FunctionId, normal: bool, facts: crate::sharing::BodySharingFacts) {
+        self.by_function.insert(func, self.bodies.len());
+        self.bodies.push((func, normal, facts));
+    }
 }
 
 impl Cache {
@@ -103,8 +111,15 @@ impl Cache {
         *self = Self::default();
     }
 
-    pub(super) fn touch(&mut self, file: base_db::FileId) {
-        self.changed.insert(file);
+    pub(super) fn touch(&mut self, file: base_db::FileId, functions: Option<&[FunctionId]>) {
+        let functions = functions.map(|it| it.iter().copied().collect::<FxHashSet<_>>());
+        self.changed
+            .entry(file)
+            .and_modify(|was| match (was.as_mut(), functions.as_ref()) {
+                (Some(was), Some(now)) => was.extend(now),
+                _ => *was = None,
+            })
+            .or_insert(functions);
     }
 
     pub(super) fn needs_before_edit(&self, files: &[base_db::FileId]) -> bool {
@@ -138,11 +153,7 @@ impl Cache {
                 ));
             }
             if hir_def::signatures::FunctionSignature::of(db, func).has_body() {
-                facts.bodies.push((
-                    func,
-                    true,
-                    crate::sharing::body_sharing_facts(db, func, true).clone(),
-                ));
+                facts.push(func, true, crate::sharing::body_sharing_facts(db, func, true).clone());
             }
         }
         self.files.insert(file, facts);
@@ -158,17 +169,24 @@ impl Cache {
         let changed = std::mem::take(&mut self.changed);
         let mut reason = "policy input changed";
         let mut updates = Vec::new();
+        let mut checked = 0;
         let mut bodies = FxHashSet::default();
         let stable = self.input.as_ref() == Some(&input)
-            && changed.iter().all(|file| {
+            && changed.iter().all(|(file, functions)| {
                 let Some(facts) = self.files.get(file) else {
                     reason = "changed file has no retained facts";
                     return false;
                 };
+                let indexes: Vec<_> = match functions {
+                    Some(functions) => functions.iter().filter_map(|func| facts.by_function.get(func).copied()).collect(),
+                    None => (0..facts.bodies.len()).collect(),
+                };
                 facts.trees.iter().all(|(krate, file, tree)| {
                     reason = "item tree changed";
                     &hir_def::item_tree::file_item_tree_snapshot(db, *file, *krate) == tree
-                }) && facts.bodies.iter().enumerate().all(|(index, (func, normal, facts))| {
+                }) && indexes.into_iter().all(|index| {
+                    let (func, normal, facts) = &facts.bodies[index];
+                    checked += 1;
                     reason = "body facts changed";
                     let new = crate::sharing::body_sharing_facts(db, *func, *normal);
                     if new == facts {
@@ -200,6 +218,9 @@ impl Cache {
                 })
             });
         let validated = start.elapsed();
+        if !input.is_empty() && std::env::var_os("RUSTD_STATS").is_some() {
+            eprintln!("sharing candidates: bodies={checked}; program={program}");
+        }
         let rejected_before: usize = self
             .shared
             .as_ref()
@@ -328,11 +349,11 @@ impl Cache {
                             hir_def::item_tree::file_item_tree_snapshot(db, source, krate),
                         ));
                     }
-                    facts.bodies.push((
+                    facts.push(
                         func,
                         normal,
                         crate::sharing::body_sharing_facts(db, func, normal).clone(),
-                    ));
+                    );
                 }
             }
         }
