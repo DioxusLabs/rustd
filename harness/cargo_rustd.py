@@ -963,7 +963,7 @@ pub fn hit() -> usize { HITS.fetch_add(1, Ordering::SeqCst) + 1 }
 const A: u32 = 1;
 #[cfg(test)]
 mod tests {
-    #[test] fn ta() { assert_eq!(super::a(), 1); }
+    #[test] fn ta() { assert_eq!(shared::identity(super::a()), 1); }
     #[test] fn tb() { assert_eq!(super::b(), 2); }
     #[test] fn h1() { assert!(super::hit() >= 1); }
     #[test] fn h2() { assert!(super::hit() >= 1); }
@@ -980,7 +980,10 @@ def incremental(work):
     ws = os.path.realpath(os.path.join(work, "incremental"))
     lib = os.path.join(ws, "src/lib.rs")
     os.makedirs(os.path.dirname(lib), exist_ok=True)
-    open(os.path.join(ws, "Cargo.toml"), "w").write('[package]\nname = "lib"\nversion = "0.1.0"\nedition = "2021"\n')
+    open(os.path.join(ws, "Cargo.toml"), "w").write('[package]\nname = "lib"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nshared = { path = "shared" }\n')
+    os.makedirs(os.path.join(ws, "shared/src"), exist_ok=True)
+    open(os.path.join(ws, "shared/Cargo.toml"), "w").write('[package]\nname = "shared"\nversion = "0.1.0"\nedition = "2021"\n')
+    open(os.path.join(ws, "shared/src/lib.rs"), "w").write('pub fn identity<T>(value: T) -> T { value }\n')
     open(lib, "w").write(INCREMENTAL_LIB)
     side = Side(ws, base_env(os.path.join(work, "home-incremental")), True)
     checks = []
@@ -1025,6 +1028,859 @@ def incremental(work):
     held = "---- tests::abort stdout ----" in aborted.stdout and "failures:\n    tests::abort" in aborted.stdout
     checks.append(("incremental: a test that aborts is listed among the failures", held, ""))
     side.cargo("stop")
+    return checks
+
+
+def test_graph(work):
+    ws = os.path.realpath(os.path.join(work, "test-graph"))
+    files = {
+        "Cargo.toml": '[package]\nname = "test_graph"\nversion = "0.1.0"\nedition = "2021"\n\n[features]\ndefault = ["test-support"]\ntest-support = []\n\n[workspace]\nmembers = ["probe"]\n\n[dev-dependencies]\nprobe = { path = "probe" }\n',
+        "probe/Cargo.toml": '[package]\nname = "probe"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\ntest_graph = { path = ".." }\n',
+        "probe/src/lib.rs": 'pub fn tested() -> bool { test_graph::tested() }\n',
+        "src/lib.rs": '''pub fn tested() -> bool { cfg!(test) }
+pub fn value() -> u32 { 40 + 2 }
+#[cfg(not(test))] const CONFIG: u32 = 7;
+#[cfg(test)] const CONFIG: u32 = 8;
+pub fn configured() -> u32 { CONFIG }
+#[cfg_attr(test, inline)] pub fn attributed() {}
+pub fn gated() -> u32 { let mut n = 0; #[cfg(test)] { n = 1; } n }
+pub struct Shape;
+#[derive(Debug, Clone)]
+pub struct Derived;
+pub fn formatted() -> String { format!("{:?}", Derived.clone()) }
+pub enum Choice { One }
+pub type Alias = Shape;
+pub const SHARED: u32 = 1;
+pub static STATE: u32 = 2;
+pub trait Value { fn get(&self) -> u32; }
+impl Value for Shape { fn get(&self) -> u32 { SHARED } }
+impl Shape { pub fn own(&self) -> u32 { STATE } }
+pub fn nested() { fn local() {} local(); }
+macro_rules! generate { () => { pub fn generated() {} } }
+generate!();
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unit() {
+        assert!(super::tested());
+        assert!(!probe::tested());
+        assert_eq!(super::value(), 42);
+        assert_eq!(super::configured(), 8);
+        assert_eq!(super::gated(), 1);
+        assert_eq!(super::formatted(), "Derived");
+    }
+}
+''',
+        "tests/integration.rs": '''#[test]
+fn integration() {
+    assert!(cfg!(test));
+    assert!(!test_graph::tested());
+    assert_eq!(test_graph::value(), 42);
+}
+''',
+    }
+    for file, text in files.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
+        open(os.path.join(ws, file), "w").write(text)
+    side = Side(ws, dict(base_env(os.path.join(work, "home-test-graph")), RUSTD_CFG_TWINS="items"), True)
+    checks = []
+
+    def check(name, held, detail):
+        checks.append((f"test graph: {name}", held, detail))
+        print(f"  {'ok ' if held else 'NOT'} test graph: {name}  {detail}", flush=True)
+
+    try:
+        _, cold = side.cargo("test")
+        check("cold unit and integration tests", cold.returncode == 0, cold.stderr[-200:])
+        _, states = wait_warm(side, ws)
+        _, status = side.cargo("status")
+        workers = re.findall(r"worker: pid (\d+)", status.stdout)
+        check("both checkouts share one worker", len(workers) == 1 and states == ["ready", "ready"], f"workers {workers}, states {states}")
+        for manifest in pathlib.Path(side.env["RUSTD_HOME"]).glob("spares/*/package/Cargo.toml"):
+            rewrite(str(manifest), 'version = "0.0.0"', 'version = "0.0.1"')
+        for label in ("warm", "edited"):
+            if label == "edited":
+                rewrite(os.path.join(ws, "src/lib.rs"), "40 + 2", "41 + 2")
+                for file in ("src/lib.rs", "tests/integration.rs"):
+                    rewrite(os.path.join(ws, file), ", 42)", ", 43)")
+            _, ran = side.cargo("test")
+            check(f"{label} unit and integration tests are daemon-built", ran.returncode == 0 and how_built(ran.stderr) == "daemon" and "tests::unit" in ran.stdout and "test integration" in ran.stdout, f"exit {ran.returncode}, {how_built(ran.stderr)}; {ran.stderr[-200:]}")
+        logs = pathlib.Path(side.env["RUSTD_HOME"])
+        loads = sum(path.read_text(errors="replace").count("load workspace:") for path in logs.glob("**/log"))
+        check("the graph was loaded once", loads == 1, f"loads {loads}")
+        twin_counts = [tuple(map(int, match)) for path in logs.glob("**/log") for match in re.findall(
+            r"cfg twins: test_graph: twins (\d+), cfg-differing (\d+), test-only (\d+), unmatched (\d+)", path.read_text(errors="replace"))]
+        check("cfg source and expansion twins before and after the edit", len(twin_counts) >= 2 and all(count == (26, 3, 3, 0) for count in twin_counts), str(twin_counts))
+        body_counts = [tuple(map(int, match)) for path in logs.glob("**/log") for match in re.findall(
+            r"cfg twins: test_graph: [^\n]+; function bodies: twins (\d+), cfg-differing (\d+), test-only (\d+), unmatched (\d+), unknown (\d+)", path.read_text(errors="replace"))]
+        check("generated and format bodies have known twins", len(body_counts) >= 2 and all(count == (13, 3, 1, 0, 0) for count in body_counts), str(body_counts))
+        text = "\n".join(path.read_text(errors="replace") for path in logs.glob("**/log"))
+        check("unrelated body is fully shared", "cfg body: test_graph::value: fully-shared" in text, "value")
+        check("paired cfg constants reject their caller transitively", "cfg body: test_graph::configured: transitive" in text, "configured")
+        check("static reverse closure is analysis shared", "cfg body: test_graph::own: analysis-shared" in text, "Shape::own")
+        eligibility = re.findall(r"cfg eligibility: test_graph: [^\n]+pair veto: ([^;]+);", text)
+        check("the main pair has no safety veto", eligibility and all(reason == "none" for reason in eligibility), str(eligibility))
+        check("TypeId is deferred to codegen", "both copies true; TypeId: deferred to codegen" in text and "would veto program" not in text, "deferred")
+
+        source = os.path.join(ws, "src/lib.rs")
+        original = pathlib.Path(source).read_text()
+        integration = pathlib.Path(ws, "tests/integration.rs")
+        integration_source = integration.read_text()
+        before = {path: len(path.read_text(errors="replace")) for path in logs.glob("**/log")}
+        positive = original.split("#[cfg(test)]\nmod tests")[0] + '''#[cfg(test)]
+mod tests {
+    #[test] fn unit() { super::generated(); let _ = probe::tested(); }
+}
+'''
+        pathlib.Path(source).write_text(positive)
+        integration.write_text("#[test] fn integration() { test_graph::generated(); }\n")
+        _, ran = side.cargo("test")
+        fresh = "\n".join(path.read_text(errors="replace")[before.get(path, 0):] for path in logs.glob("**/log"))
+        check("positive program defers TypeId", ran.returncode == 0 and "both copies true; TypeId: deferred to codegen" in fresh, f"exit {ran.returncode}, expected deferred TypeId with both copies")
+        integration.write_text(integration_source)
+        variants = [
+            ("predicate result", """
+#[cfg(any(test, feature = "test-support"))] pub fn predicate_gate() {}
+pub fn predicate_caller() { predicate_gate(); }
+""", "cfg body: test_graph::predicate_caller: fully-shared"),
+            ("rejected function remapping", """
+pub fn different_function() -> u32 { if cfg!(test) { 9 } else { 7 } }
+pub fn call_different_function() -> u32 { different_function() }
+""", "cfg body: test_graph::call_different_function: analysis-shared"),
+            ("baked const length", """
+pub const DIFFERENT_LENGTH: usize = if cfg!(test) { 9 } else { 7 };
+pub fn baked_length() -> usize { let value = [0u8; DIFFERENT_LENGTH]; value.len() }
+""", "cfg body: test_graph::baked_length: transitive"),
+            ("baked rejection stops at call boundary", """
+pub const DIFFERENT_LENGTH: usize = if cfg!(test) { 9 } else { 7 };
+pub fn baked_length() -> usize { let value = [0u8; DIFFERENT_LENGTH]; value.len() }
+pub fn call_baked_length() -> usize { baked_length() }
+""", "cfg body: test_graph::call_baked_length: analysis-shared"),
+            ("baked const generic", """
+pub const DIFFERENT_LENGTH: usize = if cfg!(test) { 9 } else { 7 };
+fn length<const N: usize>() -> usize { N }
+pub fn baked_generic() -> usize { length::<DIFFERENT_LENGTH>() }
+""", "cfg body: test_graph::baked_generic: transitive"),
+            ("baked const annotation", """
+pub const DIFFERENT_LENGTH: usize = if cfg!(test) { 9 } else { 7 };
+pub fn baked_annotation() -> usize { let value: [u8; DIFFERENT_LENGTH] = Default::default(); value.len() }
+""", "cfg body: test_graph::baked_annotation: transitive"),
+            ("concrete impl precision", """
+#[derive(Debug, Clone)]
+pub struct Changed { #[cfg(test)] extra: u32 }
+pub fn unrelated_debug() -> String { format!("{:?}", Derived.clone()) }
+""", "cfg body: test_graph::unrelated_debug: fully-shared"),
+            ("default derive helper", """
+#[derive(Default)]
+pub enum DefaultChoice { #[default] First, Second }
+pub fn default_choice() -> DefaultChoice { DefaultChoice::default() }
+""", "cfg body: test_graph::default_choice: fully-shared"),
+            ("per-copy initializer", """
+pub static PER_COPY: u32 = if cfg!(test) { 9 } else { 7 };
+pub fn per_copy_value() -> u32 { PER_COPY }
+""", "cfg body: test_graph::per_copy_value: analysis-shared"),
+            ("static absent counterpart", """
+#[cfg(not(test))] pub static ABSENT: u32 = 7;
+#[cfg(test)] pub static ABSENT: u32 = 9;
+pub fn absent_static() -> u32 { ABSENT }
+""", "cfg body: test_graph::absent_static: transitive"),
+            ("per-copy type changes", """
+pub struct StaticShape { #[cfg(test)] extra: u32 }
+pub static STATIC_SHAPE: StaticShape = StaticShape { #[cfg(test)] extra: 1 };
+pub fn changed_static_type() -> &'static StaticShape { &STATIC_SHAPE }
+""", "cfg body: test_graph::changed_static_type: transitive"),
+            ("generic dispatch", "\npub fn unresolved<T: Value>(value: &T) -> u32 { value.get() }\n", "cfg body: test_graph::unresolved: fully-shared"),
+            ("dyn dispatch", "\npub fn dynamic(value: &dyn Value) -> u32 { value.get() }\n", "cfg body: test_graph::dynamic: fully-shared"),
+            ("generic impl edges", "\npub struct Other;\nimpl Value for Other { fn get(&self) -> u32 { STATE } }\npub fn dispatch_all<T: Value>(value: &T) -> u32 { value.get() }\n", "cfg body: test_graph::dispatch_all: analysis-shared"),
+            ("dyn impl edges", "\npub struct Other;\nimpl Value for Other { fn get(&self) -> u32 { STATE } }\npub fn dynamic_all(value: &dyn Value) -> u32 { value.get() }\n", "cfg body: test_graph::dynamic_all: analysis-shared"),
+            ("projection edges", "\npub trait Project { type Output; }\nimpl Project for Shape { type Output = u32; }\npub fn projected<T: Project>(value: T::Output) -> T::Output { value }\n", "cfg body: test_graph::projected: fully-shared"),
+            ("foreign local argument", "\npub fn foreign_local() -> Option<Shape> { Some(Shape) }\n", "cfg body: test_graph::foreign_local: fully-shared"),
+            ("inherent impl type identity", "\nimpl Shape { pub fn changed(&self) -> bool { cfg!(test) } }\npub fn inherent_shape() -> Option<Shape> { Some(Shape) }\n", "cfg body: test_graph::inherent_shape: analysis-shared"),
+            ("blanket impl type identity", "\npub trait Blanket { fn changed(&self) -> bool; }\nimpl<T> Blanket for T { fn changed(&self) -> bool { cfg!(test) } }\npub fn blanket_shape() -> Option<Shape> { Some(Shape) }\n", "cfg body: test_graph::blanket_shape: analysis-shared"),
+            ("blanket predicate type identity", "\npub trait Bound<T> {}\npub trait Blanket { fn changed(&self) -> bool; }\nimpl<T: Bound<Shape>> Blanket for Vec<T> { fn changed(&self) -> bool { cfg!(test) } }\npub fn blanket_bound_shape() -> Option<Shape> { Some(Shape) }\n", "cfg body: test_graph::blanket_bound_shape: analysis-shared"),
+            ("trait argument type identity", "\npub trait Accept<T> { fn changed(&self) -> bool; }\nimpl Accept<Shape> for u32 { fn changed(&self) -> bool { cfg!(test) } }\npub fn argument_shape() -> Option<Shape> { Some(Shape) }\n", "cfg body: test_graph::argument_shape: analysis-shared"),
+            ("Self variant", "\nimpl Choice { pub fn one() -> Self { Self::One } }\n", "cfg body: test_graph::one: fully-shared"),
+            ("indirect unknown", "\npub fn indirect(f: fn() -> u32) -> u32 { f() }\n", "cfg body: test_graph::indirect: unknown"),
+            ("projected indirect unknown", "\npub struct Pointer { call: fn() -> u32 }\npub fn indirect_field(value: Pointer) -> u32 { (value.call)() }\n", "cfg body: test_graph::indirect_field: unknown"),
+            ("TLS", '''\nthread_local! { static TLS: core::cell::Cell<u32> = const { core::cell::Cell::new(3) }; }
+pub fn tls_value() -> u32 { TLS.with(|value| value.get()) }
+#[test] fn tls_probe() { assert_eq!(tls_value(), 3); }
+''', "cfg body: test_graph::tls_value: analysis-shared"),
+            ("TypeId", "\n#[test] fn identity_probe() { let _ = std::any::TypeId::of::<Shape>(); }\n", "TypeId: deferred to codegen"),
+            ("common trait impl", "\n#[cfg(test)] impl core::fmt::Display for Shape { fn fmt(&self, _: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { Ok(()) } }\n", "pair veto: test-only-trait-impl"),
+            ("test-only trait exception", "\n#[cfg(test)] trait Only {}\n#[cfg(test)] impl Only for Shape {}\n", "pair veto: none"),
+            ("blanket impl", "\n#[cfg(test)] trait Only {}\n#[cfg(test)] impl<T> Only for T {}\n", "pair veto: test-only-blanket-impl"),
+            ("prelude shadowing", "\n#[cfg(test)] pub struct Option;\n", "pair veto: namespace-shadowing"),
+            ("block scope shadowing", "\npub fn scoped() { #[cfg(test)] struct Option; }\n", "pair veto: namespace-shadowing"),
+            ("value namespace shadowing", "\n#[cfg(test)] fn Some() {}\n", "pair veto: namespace-shadowing"),
+            ("macro namespace shadowing", "\n#[cfg(test)] use std::stringify as vec;\n", "pair veto: namespace-shadowing"),
+            ("inherent method collision", "\n#[cfg(not(test))] impl Shape { fn collision() {} }\n#[cfg(test)] impl Shape { fn collision() {} }\n", "pair veto: colliding-inherent-method"),
+            ("exported test macro", "\n#[cfg(test)] #[macro_export] macro_rules! only_test { () => { () } }\n", "pair veto: cfg-test-macro-rules"),
+            ("isolated test macro", "\n#[cfg(test)] mod isolated { macro_rules! only_test { () => { () } } fn use_it() { only_test!(); } }\n", "pair veto: none"),
+            ("shared foreign test macro", "\n#[cfg(test)] use core::assert as foreign_assert;\n", "pair veto: none"),
+            ("unused tail test macro", "\n#[cfg(test)] macro_rules! only_test { () => { () } }\n", "pair veto: none"),
+            ("textual test macro", "\n#[cfg(test)] macro_rules! only_test { () => { () } }pub fn after_macro() {}\n", "pair veto: cfg-test-macro-rules"),
+            ("macro_use test macro", "\n#[cfg(test)] #[macro_use] mod macros { macro_rules! only_test { () => { () } } }\npub fn after_macro() {}\n", "pair veto: cfg-test-macro-rules"),
+            ("re-exported test macro", "\n#[cfg(test)] mod macros { macro_rules! only_test { () => { () } } pub(crate) use only_test; }\n#[cfg(test)] use macros::only_test;\n", "pair veto: cfg-test-macro-rules"),
+            ("drop closure", "\npub struct Dropped;\nimpl Drop for Dropped { fn drop(&mut self) { let _ = STATE; } }\npub fn dropped() { let _ = Dropped; }\n", "cfg body: test_graph::dropped: analysis-shared"),
+        ]
+        for label, addition, expected in variants:
+            before = {path: len(path.read_text(errors="replace")) for path in logs.glob("**/log")}
+            pathlib.Path(source).write_text(original + addition)
+            _, ran = side.cargo("test")
+            fresh = "\n".join(path.read_text(errors="replace")[before.get(path, 0):] for path in logs.glob("**/log"))
+            check(f"{label} diagnostics", ran.returncode == 0 and expected in fresh, f"exit {ran.returncode}, expected {expected}")
+    finally:
+        side.cargo("stop")
+    return checks + test_graph_sharing(work)
+
+
+def test_graph_sharing(work):
+    ws = os.path.realpath(os.path.join(work, "graph-sharing"))
+    files = {
+        "Cargo.toml": '[package]\nname = "graph_sharing"\nversion = "0.1.0"\nedition = "2021"\n[workspace]\nmembers = ["probe", "format_helper"]\n[dev-dependencies]\nprobe = { path = "probe" }\nformat_helper = { path = "format_helper" }\n',
+        "format_helper/Cargo.toml": '[package]\nname = "format_helper"\nversion = "0.1.0"\nedition = "2021"\n',
+        "format_helper/src/lib.rs": '''pub struct Compare<T>(pub T);
+impl<T: std::fmt::Debug> std::fmt::Display for Compare<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{:?}", self.0) }
+}
+''',
+        "probe/Cargo.toml": '[package]\nname = "probe"\nversion = "0.1.0"\nedition = "2021"\n[dependencies]\ngraph_sharing = { path = ".." }\n',
+        "probe/src/lib.rs": '''pub fn normal() { assert_eq!(graph_sharing::lease(), 900); assert!(!graph_sharing::tested()); assert_eq!(graph_sharing::caller(), 7); assert_eq!(graph_sharing::const_operand(), 17); assert_eq!(graph_sharing::analysis_closure(), 7); assert_eq!(graph_sharing::analysis_result(true), Ok(7)); assert_eq!(graph_sharing::analysis_result(false), Err(())); }
+pub fn shared() -> u32 { graph_sharing::shared() }
+pub fn pointer() -> usize { graph_sharing::shared as usize }
+pub fn bump() -> usize { graph_sharing::bump() }
+pub fn read() -> usize { graph_sharing::read() }
+pub fn tls_bump() -> usize { graph_sharing::tls_bump() }
+pub fn tls_read() -> usize { graph_sharing::tls_read() }
+pub fn default_value() -> u32 { graph_sharing::analysis_default() }
+pub use graph_sharing::Defaulted as NormalDefault;
+pub trait ExternalValue { type Inner; }
+impl ExternalValue for u8 { type Inner = u8; }
+pub struct External<T: ExternalValue> { pub value: T::Inner }
+pub fn async_closure_value() -> u32 {
+    let mut future = std::pin::pin!(graph_sharing::analysis_async_closure());
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match std::future::Future::poll(future.as_mut(), &mut context) {
+        std::task::Poll::Ready(value) => value,
+        std::task::Poll::Pending => panic!("ready future"),
+    }
+}
+pub fn hidden_size() -> usize { graph_sharing::hidden_size() }
+''',
+        "src/main.rs": 'fn main() { println!("{}", graph_sharing::shared()); }\n',
+        "src/lib.rs": '''use std::sync::atomic::{AtomicUsize, Ordering};
+#[inline(never)] pub fn shared() -> u32 { 40 + 2 }
+pub fn share_switch() -> u32 { 17 }
+pub async fn shared_async() -> u32 { 13 }
+#[cfg(test)] const LEASE: u32 = 1;
+#[cfg(not(test))] const LEASE: u32 = 900;
+pub fn lease() -> u32 { LEASE }
+pub fn tested() -> bool { cfg!(test) }
+pub fn different() -> u32 { if cfg!(test) { 9 } else { 7 } }
+pub fn caller() -> u32 { different() }
+const PER_COPY: u32 = if cfg!(test) { 19 } else { 17 };
+pub fn const_operand() -> u32 { PER_COPY }
+pub fn analysis_closure() -> u32 { let call = || different(); call() }
+pub async fn analysis_async() -> usize {
+    let iter = changed();
+    std::future::ready(()).await;
+    iter.count()
+}
+pub fn analysis_result(ok: bool) -> Result<u32, ()> {
+    if ok { Ok(different()) } else { Err(()) }
+}
+pub struct Defaulted(pub u32);
+impl Default for Defaulted {
+    fn default() -> Self { Self(if cfg!(test) { 19 } else { 17 }) }
+}
+pub fn analysis_default() -> u32 { Some(()).map(|_| Defaulted::default().0).unwrap() }
+pub async fn analysis_async_closure() -> u32 { let call = async || different(); call().await }
+pub trait AsyncRunner { async fn run(&self) -> u32; }
+pub struct AsyncWorker;
+impl AsyncRunner for AsyncWorker { async fn run(&self) -> u32 { different() } }
+pub async fn analysis_trait_async() -> u32 { AsyncWorker.run().await }
+pub trait AsyncDefault { async fn default_value() -> u32; }
+impl AsyncDefault for Defaulted {
+    async fn default_value() -> u32 { Self::default().0 }
+}
+pub async fn analysis_trait_generic<T: AsyncDefault>() -> u32 {
+    let _ = different();
+    T::default_value().await
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedSegment<T> { Normal(String), Tagged(T) }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanSegment { Normal(String), Tagged(u32) }
+fn map_segment(segment: TaggedSegment<u32>) -> PlanSegment {
+    match segment {
+        TaggedSegment::Normal(text) => PlanSegment::Normal(text),
+        TaggedSegment::Tagged(value) => PlanSegment::Tagged(value),
+    }
+}
+pub fn analysis_collect_segments() -> Vec<PlanSegment> {
+    let _ = different();
+    vec![TaggedSegment::Normal(String::from("plan")), TaggedSegment::Tagged(23)]
+        .into_iter().map(map_segment).collect()
+}
+static STATE: AtomicUsize = AtomicUsize::new(0);
+pub fn bump() -> usize { STATE.fetch_add(1, Ordering::SeqCst) }
+pub fn read() -> usize { STATE.load(Ordering::SeqCst) }
+std::thread_local! { static TLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+pub fn tls_bump() -> usize { TLS.with(|value| value.replace(value.get() + 1)) }
+pub fn tls_read() -> usize { TLS.with(|value| value.get()) }
+pub fn static_generic<T: std::fmt::Debug>(value: T) -> String {
+    let _ = STATE.load(Ordering::SeqCst);
+    format!("{:?}", value)
+}
+pub struct Batch(pub [u8; 1]);
+impl IntoIterator for Batch {
+    type Item = u8;
+    type IntoIter = std::array::IntoIter<u8, 1>;
+    fn into_iter(self) -> Self::IntoIter { self.0.into_iter() }
+}
+pub struct Shape;
+impl std::fmt::Debug for Shape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("shape") }
+}
+pub trait Calc { fn calc(&self) -> u32; }
+impl Calc for Shape { fn calc(&self) -> u32 { 3 } }
+pub fn generic<T: Calc>(value: T) -> u32 { value.calc() }
+pub fn closure() -> u32 { let value = || shared(); value() }
+pub fn changed() -> impl Iterator<Item = u8> {
+    #[cfg(test)] { [0u8; 128].into_iter() }
+    #[cfg(not(test))] { [0u8; 1].into_iter() }
+}
+pub fn count() -> usize { changed().count() }
+pub fn hidden_size() -> usize { std::mem::size_of_val(&changed()) }
+#[cfg(test)] mod tests {
+    struct Only;
+    impl super::Calc for Only { fn calc(&self) -> u32 { 11 } }
+    #[test] fn s3c_identity() {
+        let local: super::Defaulted = Default::default();
+        let normal: probe::NormalDefault = Default::default();
+        assert_eq!(local.0, 19);
+        assert_eq!(normal.0, 17);
+    }
+    #[test] fn dev_dependency_layout() {
+        let value = probe::External::<u8> { value: 3 };
+        assert_eq!(value.value, 3);
+    }
+    #[test] fn both_copies() {
+        assert_eq!(super::lease(), 1);
+        assert!(super::tested());
+        assert_eq!(super::caller(), 9);
+        assert_eq!(super::share_switch(), 17);
+        assert_eq!(super::const_operand(), 19);
+        assert_eq!(super::analysis_closure(), 9);
+        assert_eq!(super::analysis_result(true), Ok(9));
+        assert_eq!(super::analysis_result(false), Err(()));
+        assert_eq!(super::analysis_default(), 19);
+        assert_eq!(probe::default_value(), 17);
+        let mut closure = std::pin::pin!(super::analysis_async_closure());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert_eq!(std::future::Future::poll(closure.as_mut(), &mut context), std::task::Poll::Ready(9));
+        assert_eq!(probe::async_closure_value(), 7);
+        let mut trait_future = std::pin::pin!(super::analysis_trait_async());
+        assert_eq!(std::future::Future::poll(trait_future.as_mut(), &mut context), std::task::Poll::Ready(9));
+        let mut shared_future = std::pin::pin!(super::shared_async());
+        assert_eq!(std::future::Future::poll(shared_future.as_mut(), &mut context), std::task::Poll::Ready(13));
+        let mut local_generic = std::pin::pin!(super::analysis_trait_generic::<super::Defaulted>());
+        assert_eq!(std::future::Future::poll(local_generic.as_mut(), &mut context), std::task::Poll::Ready(19));
+        let mut future = std::pin::pin!(super::analysis_async());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert_eq!(std::future::Future::poll(future.as_mut(), &mut context), std::task::Poll::Ready(128));
+        probe::normal();
+        assert_eq!(super::shared(), 42);
+        assert_eq!(probe::shared(), 42);
+        assert_eq!(super::generic(super::Shape), 3);
+        assert_eq!(super::generic(Only), 11);
+        let object: &dyn super::Calc = &super::Shape;
+        assert_eq!(object.calc(), 3);
+        let debug: &dyn std::fmt::Debug = &super::Shape;
+        assert_eq!(format!("{:?}", debug), "shape");
+        assert_eq!(format!("{}", format_helper::Compare(super::Shape)), "shape");
+        assert_eq!(super::analysis_collect_segments(), vec![
+            super::PlanSegment::Normal(String::from("plan")), super::PlanSegment::Tagged(23)
+        ]);
+        assert!(Vec::<super::TaggedSegment<u32>>::new().into_iter().map(super::map_segment)
+            .collect::<Vec<super::PlanSegment>>().is_empty());
+        assert_eq!(super::static_generic(super::Shape), "shape");
+        let mut flattened = vec![super::Batch([3])].into_iter().flatten();
+        assert_eq!(flattened.next(), Some(3));
+        assert_eq!(flattened.next(), None);
+        assert_eq!(super::closure(), 42);
+        assert_ne!(super::shared as usize, probe::pointer());
+        assert_eq!(super::bump(), 0);
+        assert_eq!(probe::read(), 0);
+        assert_eq!(probe::bump(), 0);
+        assert_eq!(super::read(), 1);
+        assert_eq!(super::tls_bump(), 0);
+        assert_eq!(probe::tls_read(), 0);
+        assert_eq!(probe::tls_bump(), 0);
+        assert_eq!(super::tls_read(), 1);
+        assert_eq!(super::count(), 128);
+        assert_ne!(super::hidden_size(), probe::hidden_size());
+    }
+}
+''',
+        "tests/integration.rs": '''#[test] fn normal_copy() {
+    assert_eq!(graph_sharing::shared(), 42);
+    assert_eq!(graph_sharing::lease(), 900);
+    assert!(!graph_sharing::tested());
+    assert_eq!(graph_sharing::caller(), 7);
+    assert_eq!(graph_sharing::count(), 1);
+}
+''',
+    }
+    for file, text in files.items():
+        path = pathlib.Path(ws, file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    side = Side(ws, dict(base_env(os.path.join(work, "home-graph-sharing")), RUSTD_CFG_TWINS="items", RUSTD_CACHE_CHECK="1", RUSTD_CFG_ANALYSIS_TRACE="1"), True)
+    checks = []
+
+    def check(name, held, detail):
+        checks.append((f"cfg sharing: {name}", bool(held), detail))
+        print(f"  {'ok ' if held else 'NOT'} cfg sharing: {name}  {detail}", flush=True)
+
+    logs = pathlib.Path(side.env["RUSTD_HOME"])
+    def snapshot():
+        return {path: path.read_text(errors="replace") for path in logs.glob("**/log")}
+
+    def log(before=None):
+        return "\n".join(text[len((before or {}).get(path, "")):] for path, text in snapshot().items())
+
+    try:
+        _, cold = side.cargo("test")
+        check("cold runtime", cold.returncode == 0, cold.stderr[-300:])
+        wait_warm(side, ws)
+        _, warm = side.cargo("test")
+        check("both copies, statics and opaque layout", warm.returncode == 0 and how_built(warm.stderr) == "daemon" and "tests::both_copies" in warm.stdout and "test normal_copy" in warm.stdout, warm.stderr[-300:])
+        text = log()
+        shared = re.findall(r"cfg codegen body: shared: T compiled (\d+), redirected (\d+)", text)
+        check("shared function has no T compilation", bool(shared) and all(t == "0" and n == "1" for t, n in shared), str(shared))
+        check("opaque callers stay analysis-shared", "cfg body: graph_sharing::count: analysis-shared" in text and "cfg body: graph_sharing::hidden_size: analysis-shared" in text, "count, hidden_size")
+        queries = re.findall(r"cfg analysis query: (infer|mir) shared_async: test (true|false)", text)
+        check("shared async has no T analysis", bool(queries) and all(copy == "false" for _, copy in queries), str(queries))
+        for body in ("caller", "count", "hidden_size", "bump", "read", "tls_bump", "tls_read", "static_generic", "const_operand", "analysis_closure", "analysis_async", "analysis_result", "analysis_default", "analysis_async_closure", "analysis_trait_async", "analysis_trait_generic", "analysis_collect_segments"):
+            queries = re.findall(rf"cfg analysis query: (infer|mir) {body}: test (true|false)", text)
+            check(f"{body} reuses N analysis", bool(queries) and all(copy == "false" for _, copy in queries), str(queries))
+            compiled = re.findall(rf"cfg codegen body: {body}: T compiled 1, redirected 0, analysis-shared (\d+)", text)
+            check(f"{body} compiled from N MIR", bool(compiled) and all(count == "1" for count in compiled), str(compiled))
+        _, built = side.cargo("run", "--bin", "graph_sharing")
+        check("CLI before edit", built.returncode == 0 and built.stdout.strip() == "42", built.stderr[-200:])
+        rewrite(os.path.join(ws, "src/lib.rs"), "40 + 2", "41 + 2")
+        for file in ("src/lib.rs", "tests/integration.rs"):
+            path = pathlib.Path(ws, file)
+            path.write_text(path.read_text().replace(", 42)", ", 43)"))
+        before = snapshot()
+        _, edited = side.cargo("run", "--bin", "graph_sharing")
+        fresh = log(before)
+        check("CLI shared edit splices one function", edited.returncode == 0 and edited.stdout.strip() == "43" and "spliced: 1 functions redirected" in fresh, edited.stderr[-200:] + fresh[-600:])
+        before = snapshot()
+        _, tests = side.cargo("test")
+        check("both programs observe shared edit", tests.returncode == 0 and how_built(tests.stderr) == "daemon" and "tests::both_copies" in tests.stdout and "test normal_copy" in tests.stdout, tests.stderr[-300:])
+        fresh = log(before)
+        check("test shared edit patches with sharing", fresh.count("patch:") >= 2 and "spliced:" in fresh and "the whole object was written again" not in fresh, fresh[-900:])
+        source = pathlib.Path(ws, "src/lib.rs")
+        source.write_text(source.read_text().replace("share_switch() -> u32 { 17 }", "share_switch() -> u32 { if cfg!(test) { 19 } else { 17 } }").replace("super::share_switch(), 17", "super::share_switch(), 19"))
+        before = snapshot()
+        _, switched = side.cargo("test")
+        fresh = log(before)
+        check("changed sharing decisions rebuild", switched.returncode == 0 and "cfg sharing decisions changed" in fresh, switched.stderr[-300:] + fresh[-900:])
+        probe = pathlib.Path(ws, "probe/src/lib.rs")
+        probe.write_text(probe.read_text() + '\npub fn boxed() -> Box<dyn std::any::Any> { Box::new(graph_sharing::Shape) }\n')
+        source.write_text(source.read_text() + '''
+#[cfg(test)] mod identity {
+    #[test] fn cross_copy_downcast() {
+        assert!(probe::boxed().downcast::<super::Shape>().is_err());
+        let value: Box<dyn std::any::Any> = Box::new(super::Shape);
+        assert!(value.downcast::<super::Shape>().is_ok());
+    }
+}
+''')
+        before = snapshot()
+        _, identity = side.cargo("test")
+        fresh = log(before)
+        check("cross-copy TypeId restarts unshared", identity.returncode == 0 and "identity::cross_copy_downcast" in identity.stdout and "TypeId restarts 1" in fresh, identity.stderr[-400:] + fresh[-600:])
+    finally:
+        side.cargo("stop")
+    disabled = Side(ws, dict(base_env(os.path.join(work, "home-sharing-disabled")), RUSTD_CFG_TWINS="items", RUSTD_CFG_SHARING="0"), True)
+    try:
+        disabled.cargo("test")
+        wait_warm(disabled, ws)
+        _, result = disabled.cargo("test")
+        text = "\n".join(path.read_text(errors="replace") for path in pathlib.Path(disabled.env["RUSTD_HOME"]).glob("**/log"))
+        check("sharing switch keeps T compilation", result.returncode == 0 and how_built(result.stderr) == "daemon" and "cfg codegen body: shared: T compiled 1, redirected 0" in text and "TypeId restarts 1" not in text, result.stderr[-300:])
+    finally:
+        disabled.cargo("stop")
+
+    single_ws = os.path.join(work, "sharing-single")
+    os.makedirs(os.path.join(single_ws, "src"))
+    pathlib.Path(single_ws, "Cargo.toml").write_text('[package]\nname="sharing_single"\nversion="0.1.0"\nedition="2021"\n')
+    pathlib.Path(single_ws, "src/lib.rs").write_text('''use std::sync::atomic::{AtomicUsize, Ordering};
+pub struct Token;
+pub struct Batch(Vec<u8>);
+impl IntoIterator for Batch {
+    type Item = u8;
+    type IntoIter = std::vec::IntoIter<u8>;
+    fn into_iter(self) -> Self::IntoIter { self.0.into_iter() }
+}
+static STATE: AtomicUsize = AtomicUsize::new(0);
+pub fn bump() -> usize { STATE.fetch_add(1, Ordering::SeqCst) }
+pub fn boxed() -> Box<dyn std::any::Any> { Box::new(Token) }
+pub fn changed() -> u8 { if cfg!(test) { 3 } else { 4 } }
+pub fn flatten() -> Option<u8> {
+    let _ = STATE.load(Ordering::SeqCst);
+    vec![Batch(vec![changed()])].into_iter().flatten().next()
+}
+#[test] fn one_copy() {
+    let mut flattened = vec![Batch(vec![3])].into_iter().flatten();
+    assert_eq!(flattened.next(), Some(3));
+    assert_eq!(flattened.next(), None);
+    assert_eq!(flatten(), Some(3));
+    assert_eq!(bump(), 0);
+    assert_eq!(STATE.load(Ordering::SeqCst), 1);
+    let value: Box<dyn std::any::Any> = Box::new(Token);
+    assert!(value.is::<Token>());
+    assert!(value.downcast::<Token>().is_ok());
+    assert!(boxed().downcast::<Token>().is_ok());
+}
+''')
+    single = Side(single_ws, dict(base_env(os.path.join(work, "home-sharing-single")), RUSTD_CFG_TWINS="items", RUSTD_CFG_ANALYSIS_TRACE="1"), True)
+    try:
+        single.cargo("test")
+        wait_warm(single, single_ws)
+        _, result = single.cargo("test")
+        text = "\n".join(path.read_text(errors="replace") for path in pathlib.Path(single.env["RUSTD_HOME"]).glob("**/log"))
+        check("one copy retains static and TypeId identity", result.returncode == 0 and how_built(result.stderr) == "daemon" and "cfg codegen body: bump: T compiled 0, redirected 1" in text and "TypeId restarts 1" not in text, result.stderr[-300:])
+        check("one-copy analysis Flatten uses N impl environment", result.returncode == 0 and "cfg codegen body: flatten: T compiled 1, redirected 0, analysis-shared 1" in text and "cfg analysis query: mir flatten: test true" not in text and "cfg analysis query: infer flatten: test true" not in text, result.stderr[-300:])
+    finally:
+        single.cargo("stop")
+    return checks + test_graph_sharing_incremental(work)
+
+
+def test_graph_sharing_incremental(work):
+    checks, counts = [], {}
+    for mode in ("on", "off"):
+        ws = os.path.realpath(os.path.join(work, "sharing-incremental-" + mode))
+        functions = "\n".join(f"pub fn f{i}<T: Copy>(x: T) -> (T, u64) {{ (x, if enabled(1) {{ {i} }} else {{ 0 }}) }}" for i in range(400))
+        total = "+".join(f"f{i}(1u64).1" for i in range(400))
+        feature = "pub fn enabled(x: u64) -> bool { x != 0 }\nfn identity(x: u64) -> u64 { x }\n#[derive(Clone)] pub struct Flag;\nmacro_rules! generated { () => { pub fn generated_value() -> u64 { 7 } } }\ngenerated!();\nimpl Flag { pub fn check(x: u64) -> bool { enabled(x) } }\npub fn dependency_value() -> u64 { named_dependency::value() }\npub fn schema_value() -> u64 { schema_probe::value() }\npub fn policy_value() -> u64 { policy_cycle(0) }\nfn policy_cycle(x: u8) -> u64 { if x == 0 { 7 } else { policy_value() } }\n" + functions + "\n"
+        feature += "named_dependency::macro_value!(0);\n"
+        reports = "\n".join(f'#[test] fn report{i}() -> Result<(), &\'static str> {{ Ok(()) }}' for i in range(20))
+        files = {
+            "Cargo.toml": '[package]\nname="sharing_incremental"\nversion="0.1.0"\nedition="2021"\n[workspace]\nmembers=["probe", "named_dependency", "schema", "unused_dependency"]\n[dependencies]\nnamed_dependency={path="named_dependency"}\nschema_probe={path="schema"}\nunused_dependency={path="unused_dependency"}\n[dev-dependencies]\nprobe={path="probe"}\n',
+            "schema/Cargo.toml": '[package]\nname="schema_probe"\nversion="0.1.0"\nedition="2021"\n[dev-dependencies]\nsharing_incremental={path=".."}\n',
+            "schema/src/lib.rs": 'pub fn value() -> u64 { 7 }\n#[cfg(test)] mod tests { #[test] fn dependency() { assert_eq!(sharing_incremental::schema_value(), 7); } }\n',
+            "named_dependency/Cargo.toml": '[package]\nname="named_dependency"\nversion="0.1.0"\nedition="2021"\n',
+            "named_dependency/src/lib.rs": 'pub fn value() -> u64 { 7 }\npub static VALUE: u64 = 7;\n#[macro_export] macro_rules! macro_value { (0) => { pub fn macro_dependency_value() -> u64 { 7 } }; (1) => { pub fn macro_dependency_value() -> u64 { unused_dependency::value() } }; }\n',
+            "unused_dependency/Cargo.toml": '[package]\nname="unused_dependency"\nversion="0.1.0"\nedition="2021"\n',
+            "unused_dependency/src/lib.rs": 'pub fn value() -> u64 { 7 }\n',
+            "probe/Cargo.toml": '[package]\nname="probe"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nsharing_incremental={path=".."}\n',
+            "probe/src/lib.rs": 'pub fn total() -> u64 { sharing_incremental::total() }\npub fn different() -> u64 { sharing_incremental::different() }\npub fn policy_value() -> u64 { sharing_incremental::policy_value() }\n',
+            "src/features.rs": feature,
+            "src/lib.rs": f'''mod features;
+pub use features::*;
+thread_local! {{ static SAID: std::cell::RefCell<Option<String>> = None.into(); }}
+pub fn macro_local() -> u64 {{ SAID.with_borrow(|it| if it.is_none() {{ 3 }} else {{ 4 }}) }}
+pub fn total() -> u64 {{ {total} }}
+#[cfg(not(test))] pub fn different() -> u64 {{ 2 }}
+#[cfg(test)] pub fn different() -> u64 {{ 1 }}
+#[cfg(test)] mod tests {{
+    {reports}
+    #[test] fn copies() {{
+        assert!(super::Flag::check(1));
+        let _ = super::Flag.clone();
+        assert_eq!(super::generated_value(), 7);
+        assert_eq!(super::macro_dependency_value(), 7);
+        assert_eq!(super::macro_local(), 3);
+        assert_eq!(super::total(), 79800);
+        assert_eq!(super::total(), probe::total());
+        assert_eq!(super::different(), 1);
+        assert_eq!(probe::different(), 2);
+    }}
+    #[test] fn policy_values() {{
+        let local = super::policy_value();
+        let normal = probe::policy_value();
+        println!("policy-values: {{local}}/{{normal}}");
+        if local == 7 {{ assert_eq!(normal, 7); }}
+        else {{ assert_eq!(local, 1); assert_eq!(normal, 2); }}
+    }}
+}}
+''',
+        }
+        for name, text in files.items():
+            path = pathlib.Path(ws, name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        store = os.path.join(work, "store-sharing-incremental-" + mode)
+        for prime in ("cold", "retained"):
+            env = dict(base_env(os.path.join(work, f"hi-{mode}-{prime[0]}")), RUSTD_CACHE=store,
+                       RUSTD_STATS="1", RUSTD_TRACE="1", RUSTD_VERIFY_FASTPATH="1", RUSTD_CFG_SHARING="1" if mode == "on" else "0")
+            side = Side(ws, env, True)
+            def logs():
+                return {path: path.read_text(errors="replace") for path in pathlib.Path(env["RUSTD_HOME"]).glob("**/log")}
+            try:
+                _, built = side.cargo("test", "--lib")
+                wait_warm(side, ws)
+                before = logs()
+                primed = "\n".join(before.values())
+                pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "let enabled = x != 2;\n    enabled"))
+                _, edited = side.cargo("test", "--lib")
+                fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                count = sum(map(int, re.findall(r"backend: (?:cranelift|llvm) compiled (\d+) functions,", fresh)))
+                counts[mode, prime] = count
+                name = f"cfg sharing: {mode} {prime}-prime body edit splices"
+                held = (built.returncode == edited.returncode == 0 and how_built(edited.stderr) == "daemon"
+                        and "spliced:" in fresh and "the whole object was written again" not in fresh
+                        and "cfg sharing decisions changed" not in fresh and "patch discard:" not in fresh)
+                detail = f"{count} backend functions; {fresh[-700:]}"
+                checks.append((name, held, detail))
+                print(f"  {'ok ' if held else 'NOT'} {name}  {detail}", flush=True)
+                name = f"cfg sharing: {mode} {prime}-prime body edit takes verified fast paths"
+                held = ("reach fast path: unchanged edges" in fresh and "reach full path" not in fresh
+                        and (mode == "off" or ("sharing fast path: unchanged facts" in fresh and "sharing full path" not in fresh)))
+                checks.append((name, held, fresh[-700:]))
+                print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                name = f"cfg sharing: {mode} {prime}-prime edit keeps unchanged report shims"
+                held = "patch reports: 0 of 20" in fresh
+                checks.append((name, held, fresh[-700:]))
+                print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                name = f"cfg sharing: {mode} {prime}-prime reach checks only patch functions"
+                candidates = list(map(int, re.findall(r"reach patch candidates: (\d+)", fresh)))
+                held = bool(candidates) and max(candidates) <= 4
+                checks.append((name, held, str(candidates)))
+                print(f"  {'ok ' if held else 'NOT'} {name}: {candidates}", flush=True)
+                if mode == "on":
+                    name = f"cfg sharing: {prime}-prime policy checks only edited function facts"
+                    candidates = list(map(int, re.findall(r"sharing candidates: bodies=(\d+)", fresh)))
+                    held = bool(candidates) and max(candidates) <= 2
+                    checks.append((name, held, str(candidates)))
+                    print(f"  {'ok ' if held else 'NOT'} {name}: {candidates}", flush=True)
+                name = f"cfg sharing: {mode} {prime}-prime path diagnostics identify the program"
+                paths = re.findall(r"^(?:reach|sharing) (?:fast|full) path:?.*$", fresh, re.M)
+                held = bool(paths) and all("; program=" in line for line in paths)
+                checks.append((name, held, str(paths)))
+                print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                for query, limit in [("reach_topology", 0), ("reach_component_print", 2), ("reach_root_code", 1), ("loaded_crates", 0)] + ([("twin_index", 0), ("pair_safety", 0), ("pair_eligibility", 0), ("decision_serial", 0), ("applicable_adt_impls", 0), ("local_trait_impls", 0)] if mode == "on" else [("pair_eligibility", 0), ("eligibility_facts", 0)]):
+                    name = f"cfg sharing: {mode} {prime}-prime {query} executions <= {limit}"
+                    disabled_policy = mode == "off" and query in ("pair_eligibility", "eligibility_facts")
+                    count_ran = sum(map(int, re.findall(rf"\b{query}=(\d+)", primed + fresh if disabled_policy else fresh)))
+                    held = ("queries:" in fresh and ("queries:" in primed if disabled_policy else re.search(rf"\b{query}=\d+", primed) is not None)
+                            and count_ran <= limit)
+                    checks.append((name, held, f"executed {count_ran}"))
+                    print(f"  {'ok ' if held else 'NOT'} {name}: {count_ran}", flush=True)
+                name = f"cfg sharing: {mode} {prime}-prime edited file dependency names execute and backdate"
+                projected = sum(map(int, re.findall(r"\bfile_dependency_names=(\d+)", fresh)))
+                held = projected > 0 and re.search(r"\bloaded_crates=\d+", primed) is not None
+                checks.append((name, held, f"executed {projected}"))
+                print(f"  {'ok ' if held else 'NOT'} {name}: {projected}", flush=True)
+                for case, text in [("code-only edit", feature.replace("x != 0", "x != 3")), ("restored code", feature), ("relocated source", feature.replace("x != 0", "{\n x != 0\n}"))]:
+                    before = logs()
+                    pathlib.Path(ws, "src/features.rs").write_text(text)
+                    _, result = side.cargo("test", "--lib")
+                    fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                    name = f"cfg sharing: {mode} {prime}-prime {case} verifies reach prints"
+                    held = result.returncode == 0 and "reach fast path: unchanged edges" in fresh
+                    checks.append((name, held, fresh[-700:]))
+                    print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                    if case == "restored code":
+                        name = f"cfg sharing: {mode} {prime}-prime body edits skip impl prewarm"
+                        prewarm = re.findall(r"check impls prewarm: (\w+);", fresh)
+                        held = bool(prewarm) and all(value == "skipped" for value in prewarm)
+                        checks.append((name, held, str(prewarm)))
+                        print(f"  {'ok ' if held else 'NOT'} {name}: {prewarm}", flush=True)
+                        name = f"cfg sharing: {mode} {prime}-prime root checks follow changed functions"
+                        candidates = re.findall(r"patch root candidates: (\d+) of (\d+)", fresh)
+                        held = bool(candidates) and all(int(selected) <= 4 for selected, total in candidates)
+                        checks.append((name, held, str(candidates)))
+                        print(f"  {'ok ' if held else 'NOT'} {name}: {candidates}", flush=True)
+                        name = f"cfg sharing: {mode} {prime}-prime instance checks follow changed functions"
+                        candidates = re.findall(r"patch instance candidates: (\d+) of (\d+)", fresh)
+                        held = bool(candidates) and all(int(selected) < int(total) or int(total) == 0 for selected, total in candidates)
+                        checks.append((name, held, str(candidates)))
+                        print(f"  {'ok ' if held else 'NOT'} {name}: {candidates}", flush=True)
+                        name = f"cfg sharing: {mode} {prime}-prime retains diagnostics and harness text"
+                        held = "write text: retained skipped=true harness=true" in fresh
+                        checks.append((name, held, fresh[-700:]))
+                        print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                for case, text in [("added", feature.replace("macro_value!(0)", "macro_value!(1)")), ("removed", feature)]:
+                    before = logs()
+                    pathlib.Path(ws, "src/features.rs").write_text(text)
+                    _, result = side.cargo("test", "--lib")
+                    fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                    name = f"cfg sharing: {mode} {prime}-prime {case} macro dependency invalidates loaded crates"
+                    ran = sum(map(int, re.findall(r"\bloaded_crates=(\d+)", fresh)))
+                    held = result.returncode == 0 and ran > 0
+                    checks.append((name, held, f"executed {ran}"))
+                    print(f"  {'ok ' if held else 'NOT'} {name}: {ran}", flush=True)
+                if mode == "on":
+                    before = logs()
+                    pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "let _ = std::any::TypeId::of::<u64>(); let _ = named_dependency::VALUE; !std::ops::Not::not(x != 0)"))
+                    _, foreign_edit = side.cargo("test", "--lib")
+                    fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                    name = f"cfg sharing: {prime}-prime foreign trait reference keeps policy fast path"
+                    held = (foreign_edit.returncode == 0 and "field=references.items" in fresh
+                            and "sharing fast path" in fresh and "sharing full path" not in fresh
+                            and "sharing incremental path" not in fresh)
+                    checks.append((name, held, fresh[-700:]))
+                    print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                    for case, text in [
+                        ("rejection", feature.replace("if x == 0 { 7 }", "if x == 0 { super::different() }")),
+                        ("un-rejection", feature),
+                    ]:
+                        before = logs()
+                        pathlib.Path(ws, "src/features.rs").write_text(text)
+                        _, policy_edit = side.cargo("test", "--lib", "--", "--nocapture")
+                        fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                        updates = re.findall(r"sharing incremental path: bodies=(\d+) affected=(\d+) rejected=(\d+)->(\d+)", fresh)
+                        name = f"cfg sharing: {prime}-prime SCC incremental {case}"
+                        values = "policy-values: 1/2" if case == "rejection" else "policy-values: 7/7"
+                        held = (policy_edit.returncode == 0 and values in policy_edit.stdout
+                                and bool(updates) and "sharing full path" not in fresh
+                                and all(int(bodies) == 1 and 2 <= int(affected) <= 8
+                                        and (int(new) > int(old) if case == "rejection" else int(new) < int(old))
+                                        for bodies, affected, old, new in updates))
+                        checks.append((name, held, str(updates) + fresh[-700:]))
+                        print(f"  {'ok ' if held else 'NOT'} {name}: {updates}", flush=True)
+                before = logs()
+                pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "identity(x) != 0"))
+                _, edge_edit = side.cargo("test", "--lib")
+                fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                name = f"cfg sharing: {mode} {prime}-prime edge edit leaves unrelated roots cached"
+                topology_ran = sum(map(int, re.findall(r"\breach_topology=(\d+)", fresh)))
+                roots_ran = sum(map(int, re.findall(r"\breach_root_code=(\d+)", fresh)))
+                held = (edge_edit.returncode == 0 and topology_ran == 1 and roots_ran == 1
+                        and "reach fast path: updated edges" in fresh and "reach full path" not in fresh)
+                detail = f"topology {topology_ran}, roots {roots_ran}"
+                checks.append((name, held, detail))
+                print(f"  {'ok ' if held else 'NOT'} {name}: {detail}", flush=True)
+                before = logs()
+                pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "identity(x) != 0").replace("fn identity(x: u64) -> u64 { x }", "fn identity(x: u64) -> u64 { x + 1 }"))
+                _, new_callee_edit = side.cargo("test", "--lib")
+                fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                name = f"cfg sharing: {mode} {prime}-prime edit of callee absent from patch base verifies reach"
+                held = new_callee_edit.returncode == 0 and "reach fast path: unchanged edges" in fresh
+                checks.append((name, held, fresh[-700:]))
+                print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                for case, text in [
+                    ("remove a call", feature),
+                    ("create a cycle", feature.replace("x != 0", "identity(x) != 0").replace(
+                        "fn identity(x: u64) -> u64 { x }",
+                        "fn identity(x: u64) -> u64 { if x == 0 { enabled(1) as u64 } else { x } }")),
+                    ("break a cycle", feature.replace("x != 0", "identity(x) != 0")),
+                ]:
+                    before = logs()
+                    pathlib.Path(ws, "src/features.rs").write_text(text)
+                    _, edge_change = side.cargo("test", "--lib")
+                    fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                    name = f"cfg sharing: {mode} {prime}-prime verified reach {case}"
+                    held = (edge_change.returncode == 0 and "reach fast path: updated edges" in fresh
+                            and "reach full path" not in fresh)
+                    checks.append((name, held, fresh[-700:]))
+                    print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                nested_feature = feature.replace("impl Flag {", "const _: () = { impl Flag {").replace("enabled(x) } }", "enabled(x) } } };")
+                before = logs()
+                pathlib.Path(ws, "src/features.rs").write_text(nested_feature)
+                _, nested_prime = side.cargo("test", "--lib")
+                broad = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                name = f"cfg sharing: {mode} {prime}-prime impl edits retain impl prewarm"
+                held = nested_prime.returncode == 0 and "check impls prewarm: enabled;" in broad
+                checks.append((name, held, broad[-700:]))
+                print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                before = logs()
+                pathlib.Path(ws, "src/features.rs").write_text(nested_feature.replace("x != 0", "x != 2"))
+                _, nested_edit = side.cargo("test", "--lib")
+                fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                name = f"cfg sharing: {mode} {prime}-prime unrelated nested impl permits verified reach fast path"
+                held = nested_prime.returncode == nested_edit.returncode == 0 and "reach fast path: unchanged edges" in fresh and "reach full path" not in fresh
+                checks.append((name, held, fresh[-700:]))
+                print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                if mode == "on":
+                    name = f"cfg sharing: {prime}-prime unrelated nested impl permits one verified policy fast path"
+                    held = fresh.count("sharing fast path: unchanged facts") == 1 and "sharing full path" not in fresh
+                    checks.append((name, held, fresh[-700:]))
+                    print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                    before = logs()
+                    pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "let _ = cfg!(test); identity(x) != 0"))
+                    _, cfg_edit = side.cargo("test", "--lib")
+                    fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                    name = f"cfg sharing: {prime}-prime body cfg fact invalidates policy"
+                    held = cfg_edit.returncode == 0 and "sharing full path" in fresh
+                    checks.append((name, held, fresh[-700:]))
+                    print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                    before = logs()
+                    pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "const _: u64 = 0; x != 0"))
+                    _, inventory_edit = side.cargo("test", "--lib")
+                    fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                    impls_ran = sum(map(int, re.findall(r"\blocal_impls=(\d+)", fresh)))
+                    applicable_ran = sum(map(int, re.findall(r"\bapplicable_adt_impls=(\d+)", fresh)))
+                    name = f"cfg sharing: {prime}-prime body item preserves ADT impl facts"
+                    held = inventory_edit.returncode == 0 and impls_ran > 0 and applicable_ran == 0
+                    detail = f"impl inventory {impls_ran}, ADT impl facts {applicable_ran}"
+                    checks.append((name, held, detail))
+                    print(f"  {'ok ' if held else 'NOT'} {name}: {detail}", flush=True)
+                for case, text in [("added static", feature.replace("x != 0", "static ON: u64 = 1; x != 0 && ON == 1")), ("removed static", feature)]:
+                    before = logs()
+                    pathlib.Path(ws, "src/features.rs").write_text(text)
+                    _, result = side.cargo("test", "--lib")
+                    fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                    name = f"cfg sharing: {mode} {prime}-prime {case} rebuilds reach"
+                    held = result.returncode == 0 and "reach full path" in fresh
+                    checks.append((name, held, fresh[-700:]))
+                    print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                if mode == "on" and prime == "cold":
+                    source = files["src/lib.rs"]
+                    cases = [
+                        ("error result", source.replace("fn report0() -> Result<(), &'static str> { Ok(()) }", "fn report0() -> Result<(), &'static str> { Err(\"expected\") }"), "0 of 20", False),
+                        ("changed return", source.replace("fn report0() -> Result<(), &'static str> { Ok(()) }", "fn report0() -> std::process::ExitCode { std::process::ExitCode::SUCCESS }"), "1 of 20", True),
+                        ("unit return", source.replace("fn report0() -> Result<(), &'static str> { Ok(()) }", "fn report0() {}"), "0 of 19", True),
+                        ("new return", source.replace("fn copies() {", "fn copies() -> Result<(), &'static str> {").replace("assert_eq!(probe::different(), 2);", "assert_eq!(probe::different(), 2); Ok(())"), "1 of 21", True),
+                    ]
+                    for case, text, expected, succeeds in cases:
+                        before = logs()
+                        pathlib.Path(ws, "src/lib.rs").write_text(text)
+                        _, result = side.cargo("test", "--lib")
+                        fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                        name = f"cfg sharing: {case} report shim"
+                        held = (result.returncode == 0) == succeeds and f"patch reports: {expected}" in fresh
+                        checks.append((name, held, f"{result.stdout[-300:]} {fresh[-700:]}"))
+                        print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                if mode == "on":
+                    pathlib.Path(ws, "src/features.rs").write_text(feature)
+                    pathlib.Path(ws, "src/lib.rs").write_text(files["src/lib.rs"])
+                    _, schema_prime = side.cargo("test", "-p", "schema_probe", "--lib")
+                    before = logs()
+                    pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "x != 2"))
+                    _, schema_edit = side.cargo("test", "-p", "schema_probe", "--lib")
+                    fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                    policy = [line for line in fresh.splitlines() if "sharing " in line and "/schema_probe-" in line]
+                    name = f"cfg sharing: {prime}-prime dependency body retains schema policy facts"
+                    held = schema_prime.returncode == schema_edit.returncode == 0 and any("sharing fast path" in line for line in policy) and not any("sharing full path" in line for line in policy)
+                    checks.append((name, held, "\n".join(policy)))
+                    print(f"  {'ok ' if held else 'NOT'} {name}: {policy}", flush=True)
+                    before = logs()
+                    pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "let _ = cfg!(test); x != 0"))
+                    _, schema_cfg = side.cargo("test", "-p", "schema_probe", "--lib")
+                    fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                    policy = [line for line in fresh.splitlines() if "sharing " in line and "/schema_probe-" in line]
+                    name = f"cfg sharing: {prime}-prime dependency cfg fact invalidates schema policy"
+                    held = schema_cfg.returncode == 0 and any("sharing full path" in line for line in policy) and any("field=cfg." in line for line in policy)
+                    checks.append((name, held, "\n".join(policy)))
+                    print(f"  {'ok ' if held else 'NOT'} {name}: {policy}", flush=True)
+            finally:
+                side.cargo("stop")
+                pathlib.Path(ws, "src/features.rs").write_text(feature)
+                pathlib.Path(ws, "src/lib.rs").write_text(files["src/lib.rs"])
+    for prime in ("cold", "retained"):
+        name = f"cfg sharing: {prime}-prime edit backend count <= off + 2"
+        on, off = counts["on", prime], counts["off", prime]
+        held = on <= off + 2 and (on > 0 or prime == "retained")
+        detail = f"on {on}, off {off}"
+        checks.append((name, held, detail))
+        print(f"  {'ok ' if held else 'NOT'} {name}  {detail}", flush=True)
     return checks
 
 
@@ -1608,7 +2464,7 @@ def main():
         result["flags"], result["flags_status"] = rows, counted
         result["wrong"] += wrong
         print("daemon:", flush=True)
-        result["daemon"] = daemon(work) + incremental(work)
+        result["daemon"] = daemon(work) + incremental(work) + test_graph(work)
         result["wrong"] += [f"daemon: {name} {detail}" for name, held, detail in result["daemon"] if not held]
         print("plain cargo:", flush=True)
         result["plain"] = plain(work)

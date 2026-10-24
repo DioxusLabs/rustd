@@ -181,6 +181,7 @@ def main():
                 print(open(log_path, errors="replace").read()[-6000:], flush=True)
                 reply = "no answer in 120 s"
             took = (time.time() - began) * 1000
+            outputs = None
             cargo = subprocess.run(["cargo", "build", "-q", "-p", "sapp", *TARGET_ARGS], cwd=checkout["ws"], capture_output=True,
                                    text=True, env={**os.environ, "CARGO_TARGET_DIR": checkout["reference"]})
             assert (cargo.returncode != 0) == (at in broken), cargo.stderr[-2000:]
@@ -193,11 +194,13 @@ def main():
             elif not reply.startswith("ok"):
                 verdict = "REFUSED"
             else:
-                same = run(checkout["bin"]) == run(built(checkout["reference"], "sapp"))
-                verdict = "same" if same else "DIFFERENT OUTPUT"
+                outputs = run(checkout["bin"]), run(built(checkout["reference"], "sapp"))
+                verdict = "same" if outputs[0] == outputs[1] else "DIFFERENT OUTPUT"
             asked += 1
             wrong += verdict.isupper()
             print(f"    checkout {at} {verdict:16} {took:6.0f} ms  {reply[:90]}", flush=True)
+            if verdict == "DIFFERENT OUTPUT":
+                print(f"      rustd: {outputs[0]!r}\n      cargo: {outputs[1]!r}", flush=True)
             if daemon.poll() is not None:
                 print(open(log_path, errors="replace").read()[-6000:], flush=True)
                 raise SystemExit(f"the daemon died: {log_path}")

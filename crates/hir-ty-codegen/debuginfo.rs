@@ -16,7 +16,7 @@ mod split;
 mod types;
 
 use codeview::CodeView;
-pub(super) use types::Types;
+pub(super) use types::{Descriptions, Types};
 
 use cranelift_codegen::{
     binemit::CodeOffset,
@@ -107,7 +107,7 @@ pub(super) type TypeSet = std::sync::Arc<TypeList>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct TypeList {
-    pub(super) types: Vec<DebugType>,
+    pub(super) types: std::sync::Arc<[DebugType]>,
     pub(super) links: Vec<TypeSet>,
 }
 
@@ -490,11 +490,13 @@ const FUNCTIONS_OF_A_UNIT: usize = 256;
 pub(super) struct Dwarf {
     /// The unit functions are being added to.
     dwarf: DwarfUnit,
-    /// The units that have all their functions.
-    full: Vec<gimli::write::Unit>,
+    /// The encoded sections of the units that have all their functions.
+    full: Sections<SectionWriter>,
     /// What the names of the files the entries of the units are read from start with, when
     /// they are kept apart from what is linked, and the units that are.
-    apart: Option<(String, Vec<split::Apart>)>,
+    apart: Option<(String, split::Split)>,
+    units: usize,
+    error: Option<String>,
     /// What tells the unit functions are being added to from another: what was added.
     id: FxHasher,
     encoding: Encoding,
@@ -540,8 +542,19 @@ impl Dwarf {
             Encoding { format: Format::Dwarf32, version: 4, address_size: isa.pointer_bytes() };
         let mut context = Dwarf {
             dwarf: DwarfUnit::new(encoding),
-            full: Vec::new(),
-            apart: apart.map(|name| (name, Vec::new())),
+            full: Sections::new(SectionWriter::default()),
+            apart: apart.map(|name| {
+                let split = split::Split::new(
+                    encoding,
+                    directory.as_bytes().to_vec(),
+                    name.clone(),
+                    isa.triple().binary_format,
+                    isa.triple().architecture,
+                );
+                (name, split)
+            }),
+            units: 0,
+            error: None,
             id: FxHasher::default(),
             addresses: Vec::new(),
             encoding,
@@ -596,6 +609,12 @@ impl Dwarf {
     /// Ends the unit functions were added to, which is left out when it has none, and
     /// begins the next.
     fn end_unit(&mut self) {
+        if let Err(error) = self.write_unit() {
+            self.error.get_or_insert(error);
+        }
+    }
+
+    fn write_unit(&mut self) -> Result<(), String> {
         let next = gimli::write::Unit::new(self.encoding, LineProgram::none());
         let mut unit = std::mem::replace(&mut self.dwarf.unit, next);
         let ranges = std::mem::take(&mut self.ranges);
@@ -606,22 +625,27 @@ impl Dwarf {
         self.namespaces.clear();
         self.begin_unit();
         if ranges.is_empty() {
-            return;
+            return Ok(());
         }
+        let nth = self.units;
+        self.units += 1;
         let root = unit.root();
         let addresses = std::mem::take(&mut self.addresses);
         if let Some((name, apart)) = &mut self.apart {
             let lines = std::mem::replace(&mut unit.line_program, LineProgram::none());
             let root = unit.get_mut(root);
-            let name = split::file(name, apart.len()).into_bytes();
+            let name = split::file(name, nth).into_bytes();
             root.set(DW_AT_GNU_dwo_name, AttributeValue::String(name));
             root.set(DW_AT_GNU_dwo_id, AttributeValue::Data8(id));
-            apart.push(split::Apart { unit, lines, ranges, addresses, id });
-            return;
+            return apart.add(split::Apart { unit, lines, ranges, addresses, id });
         }
         let ranges = unit.ranges.add(RangeList(ranges));
         unit.get_mut(root).set(DW_AT_ranges, AttributeValue::RangeListRef(ranges));
-        self.full.push(unit);
+        let mut units = gimli::write::UnitTable::default();
+        units.add(unit);
+        units
+            .write(&mut self.full, &mut self.dwarf.line_strings, &mut self.dwarf.strings)
+            .map_err(|e| e.to_string())
     }
 
     fn file(&mut self, name: &str) -> FileId {
@@ -1106,18 +1130,16 @@ impl Dwarf {
     /// described.
     fn sections(mut self) -> Result<Vec<Section>, String> {
         self.end_unit();
+        if let Some(error) = self.error {
+            return Err(error);
+        }
         let mut sections = Vec::new();
-        if self.full.is_empty() {
+        if self.units == 0 {
             return Ok(sections);
         }
-        let mut dwarf = gimli::write::Dwarf::new();
-        (dwarf.strings, dwarf.line_strings) = (self.dwarf.strings, self.dwarf.line_strings);
-        for unit in self.full {
-            dwarf.units.add(unit);
-        }
-        let mut written = Sections::new(SectionWriter::default());
-        dwarf.write(&mut written).map_err(|e| e.to_string())?;
-        written.for_each(|id, section: &SectionWriter| {
+        self.dwarf.line_strings.write(&mut self.full.debug_line_str).map_err(|e| e.to_string())?;
+        self.dwarf.strings.write(&mut self.full.debug_str).map_err(|e| e.to_string())?;
+        self.full.for_each(|id, section: &SectionWriter| {
             sections.push(Section { id, written: section.clone() });
             Ok::<_, String>(())
         })?;
@@ -1128,18 +1150,17 @@ impl Dwarf {
     /// Answers the files of what is kept apart from it.
     fn emit(mut self, product: &mut ObjectProduct) -> Result<Vec<Sidecar>, String> {
         self.end_unit();
+        if let Some(error) = self.error.take() {
+            return Err(error);
+        }
         if !matches!(product.object.format(), BinaryFormat::Elf | BinaryFormat::MachO) {
             return Ok(Vec::new());
         }
-        let Some((name, apart)) = self.apart.take() else {
+        let Some((_, split)) = self.apart.take() else {
             place(product, self.sections()?)?;
             return Ok(Vec::new());
         };
-        let mut split = split::Split::new(self.encoding, self.directory, name, &product.object);
-        for unit in apart {
-            split.add(unit)?;
-        }
-        let (sections, files) = split.finish();
+        let (sections, files) = split.finish()?;
         place(product, sections)?;
         Ok(files)
     }
@@ -1155,7 +1176,18 @@ struct Section {
 pub struct Sidecar {
     /// Where the unit left in the object says the file is.
     pub name: String,
+    /// A temporary file containing the unit, written while it was encoded.
+    /// It is renamed to `name` only after the object is ready.
+    pub staged: Option<std::path::PathBuf>,
     pub bytes: Vec<u8>,
+}
+
+impl Drop for Sidecar {
+    fn drop(&mut self) {
+        if let Some(path) = self.staged.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// Writes the sections into the object, each with what the linker is to fill in. A Mach-O
@@ -1413,16 +1445,131 @@ impl Writer for SectionWriter {
 mod tests {
     use super::*;
 
+    fn split_isa() -> cranelift_codegen::isa::OwnedTargetIsa {
+        cranelift_codegen::isa::lookup_by_name("x86_64-unknown-linux-gnu")
+            .unwrap()
+            .finish(cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()))
+            .unwrap()
+    }
+
+    fn staging_directory() -> std::path::PathBuf {
+        let nonce =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("rustd-dwo-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn split_units_are_staged_and_cleaned_up() {
+        let directory = staging_directory();
+        let object = directory.join("unit.o");
+        let isa = split_isa();
+        let mut dwarf = Dwarf::new(&*isa, "/", true, Some(object.to_str().unwrap().to_owned()));
+        let debug = FunctionDebug::new("f".to_owned(), "f".to_owned());
+        dwarf.add_function(FuncId::from_u32(0), 8, &debug);
+        dwarf.end_unit();
+        assert!(dwarf.error.is_none());
+        let (_, split) = dwarf.apart.take().unwrap();
+        let (_, files) = split.finish().unwrap();
+        assert_eq!(files.len(), 1);
+        let staged = files[0].staged.as_ref().unwrap().clone();
+        assert!(!std::fs::read(&staged).unwrap().is_empty());
+        assert!(!std::path::Path::new(&files[0].name).exists());
+        assert!(files[0].bytes.is_empty());
+        drop(files);
+        assert!(!staged.exists());
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn unfinished_split_build_removes_staged_units() {
+        let directory = staging_directory();
+        let object = directory.join("unit.o");
+        let isa = split_isa();
+        let mut dwarf = Dwarf::new(&*isa, "/", true, Some(object.to_str().unwrap().to_owned()));
+        let debug = FunctionDebug::new("f".to_owned(), "f".to_owned());
+        dwarf.add_function(FuncId::from_u32(0), 8, &debug);
+        dwarf.end_unit();
+        assert!(dwarf.error.is_none());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        drop(dwarf);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn split_write_errors_reach_emit() {
+        let directory = staging_directory();
+        let object = directory.join("missing/unit.o");
+        let isa = split_isa();
+        let mut dwarf = Dwarf::new(&*isa, "/", true, Some(object.to_str().unwrap().to_owned()));
+        let debug = FunctionDebug::new("f".to_owned(), "f".to_owned());
+        dwarf.add_function(FuncId::from_u32(0), 8, &debug);
+        dwarf.end_unit();
+        let expected = dwarf.error.clone().unwrap();
+        assert!(matches!(dwarf.sections(), Err(error) if error == expected));
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn finished_units_are_encoded() {
+        let isa =
+            super::super::Target::selected().and_then(|it| it.isa("backtracking", false)).unwrap();
+        let mut dwarf = Dwarf::new(&*isa, "/", true, None);
+        for at in 0..=FUNCTIONS_OF_A_UNIT {
+            let debug = FunctionDebug::new(format!("f{at}"), format!("f{at}"));
+            dwarf.add_function(FuncId::from_u32(at as u32), 8, &debug);
+        }
+        assert_eq!(dwarf.units, 1);
+        assert!(dwarf.full.debug_info.len() > 0);
+        assert!(dwarf.full.debug_abbrev.len() > 0);
+        assert_eq!(dwarf.full.debug_str.len(), 0);
+        assert_eq!(dwarf.ranges.len(), 1);
+        let sections = dwarf.sections().unwrap();
+        assert!(sections.iter().any(|it| it.id == SectionId::DebugStr && it.written.len() > 0));
+    }
+
+    #[test]
+    fn empty_units_have_no_sections() {
+        let isa =
+            super::super::Target::selected().and_then(|it| it.isa("backtracking", false)).unwrap();
+        for apart in [None, Some("empty".to_owned())] {
+            let dwarf = Dwarf::new(&*isa, "/", true, apart);
+            assert!(dwarf.sections().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn encoding_errors_reach_emit() {
+        let isa =
+            super::super::Target::selected().and_then(|it| it.isa("backtracking", false)).unwrap();
+        let mut dwarf = Dwarf::new(&*isa, "/", true, None);
+        let encoding = Encoding { version: 1, ..dwarf.encoding };
+        dwarf.dwarf.unit = gimli::write::Unit::new(encoding, LineProgram::none());
+        dwarf.begin_unit();
+        let debug = FunctionDebug::new("f".to_owned(), "f".to_owned());
+        dwarf.add_function(FuncId::from_u32(0), 8, &debug);
+        dwarf.end_unit();
+        let expected = gimli::write::Error::UnsupportedVersion(1).to_string();
+        assert_eq!(dwarf.error.as_ref(), Some(&expected));
+        assert!(matches!(dwarf.sections(), Err(error) if error == expected));
+    }
+
     #[test]
     fn linked_types_share_one_die() {
         let isa =
             super::super::Target::selected().and_then(|it| it.isa("backtracking", false)).unwrap();
         let shared = TypeSet::new(TypeList {
-            types: vec![DebugType::Base { name: "Shared".to_owned(), size: 4, encoding: 7 }],
+            types: vec![DebugType::Base { name: "Shared".to_owned(), size: 4, encoding: 7 }].into(),
             links: Vec::new(),
         });
         let linked = || {
-            TypeSet::new(TypeList { types: vec![DebugType::Link(0)], links: vec![shared.clone()] })
+            TypeSet::new(TypeList {
+                types: vec![DebugType::Link(0)].into(),
+                links: vec![shared.clone()],
+            })
         };
         let mut dwarf = Dwarf::new(&*isa, "/", true, None);
 

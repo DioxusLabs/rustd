@@ -146,7 +146,7 @@ def main():
                     perf.wait()
                 print(f"{label:38} {'edit-to-binary' if '--patch' in args else 'edit-to-object'} {b[8]:>8}  recompiled {b[5]:>5} of {b[6]}"
                       + (f"  save-to-binary-on-disk {wall:.0f}ms" if wall else ""), flush=True)
-                steps = dict((k, int(v) / 1000) for k, v in (kv.split("=") for kv in b[7].split()))
+                steps = dict((k, int(v) / 1000) for k, v in (kv.split("=") for kv in b[7].split(";", 1)[0].split()))
                 samples.append({"edit": name, "files": len(paths), "revert": label != name, "wall_ms": wall, "steps_ms": steps, "recompiled": int(b[5]), "profiled": perf is not None})
                 if "--patch" in args and "doctor" in name:
                     ran = subprocess.run([binary, "doctor", "--help"], capture_output=True, text=True)

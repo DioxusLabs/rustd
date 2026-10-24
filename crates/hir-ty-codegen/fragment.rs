@@ -153,6 +153,7 @@ impl PartialEq for Code {
 /// leaves what was built from it alone.
 #[derive(PartialEq, Hash)]
 pub struct CompiledFunction {
+    pub(super) sharing: super::Sharing,
     pub(super) requests: Requests,
     pub(super) code: Code,
     /// The body the function was compiled from and the statements of it that
@@ -253,6 +254,7 @@ pub(super) const INLINED: u32 = u32::MAX;
 
 /// Collects the requests of one function while its IR is built.
 pub(super) struct Recorder<'db> {
+    pub(super) sharing: super::Sharing,
     pub(super) db: &'db dyn HirDatabase,
     pub(super) isa: &'static dyn TargetIsa,
     /// What `isa` generates code for.
@@ -300,6 +302,7 @@ impl<'db> Recorder<'db> {
         checked: bool,
     ) -> Self {
         Recorder {
+            sharing: super::Sharing::default(),
             db,
             isa,
             target,

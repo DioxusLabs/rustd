@@ -7,7 +7,10 @@
 //! nor one a macro is handed, nor one that declares items other than statics and constants.
 //! Such bodies count as part of what the rest of the program sees.
 
-use std::hash::{Hash, Hasher};
+use std::{
+    hash::{Hash, Hasher},
+    time::Instant,
+};
 
 use hir_def::{FunctionId, Lookup, ModuleDefId, expr_store::Body};
 use ide_db::{
@@ -42,7 +45,39 @@ const INERT: &[&str] = &[
 /// Each file as it was when last looked at.
 #[derive(Default)]
 pub(crate) struct Outlines {
-    files: FxHashMap<FileId, Option<u64>>,
+    files: FxHashMap<FileId, Option<Outline>>,
+}
+
+#[derive(Clone)]
+struct Outline {
+    outside: u64,
+    functions: Option<FxHashMap<FunctionId, (u64, u32, u32)>>,
+}
+
+pub(crate) struct ChangedFunctions {
+    pub(crate) code: Vec<FunctionId>,
+    pub(crate) locations: Vec<FunctionId>,
+}
+
+fn function_changes<K: Copy + Eq + Hash>(
+    was: &FxHashMap<K, (u64, u32, u32)>,
+    now: &FxHashMap<K, (u64, u32, u32)>,
+) -> Option<(Vec<K>, Vec<K>)> {
+    if now.len() != was.len() || now.keys().any(|id| !was.contains_key(id)) {
+        return None;
+    }
+    let mut code = Vec::new();
+    let mut locations = Vec::new();
+    for (id, source) in now {
+        let old = was[id];
+        if old.0 != source.0 {
+            code.push(*id);
+        }
+        if (old.1, old.2) != (source.1, source.2) {
+            locations.push(*id);
+        }
+    }
+    Some((code, locations))
 }
 
 impl Outlines {
@@ -60,20 +95,34 @@ impl Outlines {
         db: &RootDatabase,
         listed: &Listed,
         files: Vec<FileId>,
-    ) -> Vec<(FileId, bool)> {
+    ) -> Vec<(FileId, bool, Option<ChangedFunctions>)> {
         let off = std::env::var_os("RUSTD_NO_BODIES").is_some();
         let outlines = outlines(db, listed, &files);
         let files: Vec<_> = files
             .into_iter()
             .zip(outlines)
             .map(|(file, now)| {
-                let was = self.files.insert(file, now);
-                (file, !off && now.is_some() && was == Some(now))
+                let was = self.files.remove(&file).flatten();
+                let bodies_only = !off
+                    && now
+                        .as_ref()
+                        .zip(was.as_ref())
+                        .is_some_and(|(now, was)| now.outside == was.outside);
+                let functions = bodies_only
+                    .then(|| {
+                        let now = now.as_ref()?.functions.as_ref()?;
+                        let was = was.as_ref()?.functions.as_ref()?;
+                        let (code, locations) = function_changes(was, now)?;
+                        Some(ChangedFunctions { code, locations })
+                    })
+                    .flatten();
+                self.files.insert(file, now);
+                (file, bodies_only, functions)
             })
             .collect();
         // An edit to more than bodies can change which functions there are, in any file, and
         // what is kept here was found by asking the ones listed before it.
-        if files.iter().any(|&(_, bodies_only)| !bodies_only) {
+        if files.iter().any(|(_, bodies_only, _)| !bodies_only) {
             self.files.clear();
         }
         files
@@ -82,7 +131,8 @@ impl Outlines {
 
 /// The [`outline`] of each file. A wide edit is of thousands of files: their bodies are
 /// lowered together and the files are hashed on all threads.
-fn outlines(db: &RootDatabase, listed: &Listed, files: &[FileId]) -> Vec<Option<u64>> {
+fn outlines(db: &RootDatabase, listed: &Listed, files: &[FileId]) -> Vec<Option<Outline>> {
+    let start = Instant::now();
     let stats = std::env::var_os("RUSTD_STATS").is_some();
     if files.len() > 1 {
         let mut crates: Vec<_> =
@@ -93,7 +143,9 @@ fn outlines(db: &RootDatabase, listed: &Listed, files: &[FileId]) -> Vec<Option<
     }
     let functions = listed.in_files(db, files);
     let bodies = functions.iter().flatten().flatten().map(|&it| it.into()).collect();
+    let functions_time = start.elapsed();
     crate::lower(db, bodies);
+    let lowered = start.elapsed();
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     let mut outlines = vec![None; files.len()];
     std::thread::scope(|scope| {
@@ -126,12 +178,21 @@ fn outlines(db: &RootDatabase, listed: &Listed, files: &[FileId]) -> Vec<Option<
             outlines[at] = outline;
         }
     });
+    if stats {
+        eprintln!(
+            "outlines-us: functions={} lower={} hash={}; files={}",
+            functions_time.as_micros(),
+            (lowered - functions_time).as_micros(),
+            (start.elapsed() - lowered).as_micros(),
+            files.len(),
+        );
+    }
     outlines
 }
 
 /// A hash of everything in the file but the bodies nothing else sees into, or `None` when
 /// the file is not read as a file of its own. `functions` are those written in it.
-fn outline(db: &RootDatabase, file: FileId, functions: &[FunctionId]) -> Option<u64> {
+fn outline(db: &RootDatabase, file: FileId, functions: &[FunctionId]) -> Option<Outline> {
     let Some(seen) = Written::of(db, functions) else {
         if std::env::var_os("RUSTD_STATS").is_some() {
             eprintln!("outline: {file:?} is included in another file");
@@ -144,7 +205,43 @@ fn outline(db: &RootDatabase, file: FileId, functions: &[FunctionId]) -> Option<
     let tree = EditionedFileId::new(db, file, edition).parse(db).syntax_node();
     let (hash, found) = hash_outside_bodies(&tree, &seen.declaring);
     // Each of them has to be one of the bodies that were kept in.
-    (found == seen.declaring.len()).then_some(hash)
+    if found != seen.declaring.len() {
+        return None;
+    }
+    let text = tree.text().to_string();
+    let lines = ide_db::line_index(db, file);
+    let functions = functions
+        .iter()
+        .map(|&func| {
+            let at = func.lookup(db).id;
+            if at.file_id.original_file(db).file_id(db) != file {
+                return None;
+            }
+            let mut hash = FxHasher::default();
+            let range = if at.file_id.is_macro() {
+                at.to_node(db).syntax().text().to_string().hash(&mut hash);
+                let call = at.file_id.original_call_node(db)?;
+                if call.file_id.file_id(db) != file {
+                    return None;
+                }
+                call.value
+                    .ancestors()
+                    .find_map(ast::Item::cast)?
+                    .syntax()
+                    .text()
+                    .to_string()
+                    .hash(&mut hash);
+                call.value.text_range()
+            } else {
+                let range = at.to_range(db);
+                text.get(std::ops::Range::<usize>::from(range))?.hash(&mut hash);
+                range
+            };
+            let start = lines.try_line_col(range.start())?;
+            Some((func, (hash.finish(), start.line, start.col)))
+        })
+        .collect();
+    Some(Outline { outside: hash, functions })
 }
 
 /// What looking at the functions written in a file tells that how they are written does not.
@@ -374,6 +471,25 @@ impl Listed {
 mod tests {
     use super::*;
     use syntax::SourceFile;
+
+    #[test]
+    fn changed_function_sources() {
+        let was = FxHashMap::from_iter([(1, (10, 0, 0)), (2, (20, 1, 0))]);
+        let now = FxHashMap::from_iter([(1, (11, 0, 0)), (2, (20, 2, 0))]);
+        assert_eq!(function_changes(&was, &now), Some((vec![1], vec![2])));
+        assert_eq!(function_changes(&was, &was), Some((vec![], vec![])));
+        assert_eq!(
+            function_changes::<u32>(&FxHashMap::default(), &FxHashMap::default()),
+            Some((vec![], vec![]))
+        );
+        assert_eq!(function_changes(&was, &FxHashMap::from_iter([(1, (10, 0, 0))])), None);
+        assert_eq!(
+            function_changes(&was, &FxHashMap::from_iter([(1, (10, 0, 0)), (3, (20, 1, 0))])),
+            None
+        );
+        let now = FxHashMap::from_iter([(1, (10, 0, 1)), (2, (20, 1, 0))]);
+        assert_eq!(function_changes(&was, &now), Some((vec![], vec![1])));
+    }
 
     fn hash(text: &str) -> u64 {
         let tree = SourceFile::parse(text, Edition::CURRENT).syntax_node();

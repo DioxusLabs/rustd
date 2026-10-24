@@ -122,6 +122,11 @@ pub fn body_files(db: &dyn HirDatabase, instance: &Instance) -> Option<Box<[File
     Some(files.into())
 }
 
+pub(super) fn body_owners(db: &dyn HirDatabase, instance: &Instance) -> Option<Vec<DefWithBodyId>> {
+    let mentions = Mentions::of(db, instance);
+    (!mentions.opaque).then_some(mentions.bodies)
+}
+
 /// The file a body is written in, which for one a macro makes is where the macro is called.
 pub fn body_file(db: &dyn HirDatabase, body: DefWithBodyId) -> FileId {
     let file = match body {
@@ -171,7 +176,12 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Mentions<'db> {
 #[derive(Default)]
 pub(super) struct Homes {
     /// What each crate can see: itself and the crates whose impls it knows.
-    sees: FxHashMap<Crate, FxHashSet<Crate>>,
+    sees: FxHashMap<Crate, triomphe::Arc<FxHashSet<Crate>>>,
+}
+
+#[salsa::tracked(returns(clone))]
+fn visibility(db: &dyn HirDatabase, krate: Crate) -> triomphe::Arc<FxHashSet<Crate>> {
+    triomphe::Arc::new(loaded_crates(db, krate).iter().copied().collect())
 }
 
 impl Homes {
@@ -192,10 +202,7 @@ impl Homes {
             return asked.clone();
         }
         let home = mentions.crates.iter().copied().find(|&krate| {
-            let sees = self
-                .sees
-                .entry(krate)
-                .or_insert_with(|| loaded_crates(db, krate).iter().copied().collect());
+            let sees = self.sees.entry(krate).or_insert_with(|| visibility(db, krate));
             mentions.crates.iter().all(|it| sees.contains(it))
         });
         match home {
