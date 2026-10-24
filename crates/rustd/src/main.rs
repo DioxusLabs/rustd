@@ -3056,6 +3056,21 @@ fn declared_in(db: &RootDatabase, krate: Crate) -> Declared {
 fn functions_of_modules(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
     let mut declared = Declared::default();
     declared.in_modules(db, krate);
+    let mut modules = vec![krate.root_module(db)];
+    while let Some(module) = modules.pop() {
+        modules.extend(module.children(db));
+        for def in module.declarations(db) {
+            if let hir::ModuleDef::Trait(trait_) = def {
+                let trait_: hir_def::TraitId = trait_.into();
+                declared.functions.extend(trait_.trait_items(db).items.iter().filter_map(
+                    |&(_, item)| match item {
+                        AssocItemId::FunctionId(func) => Some(func),
+                        _ => None,
+                    },
+                ));
+            }
+        }
+    }
     declared.functions
 }
 
