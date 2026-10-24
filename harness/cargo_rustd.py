@@ -1726,7 +1726,8 @@ pub fn total() -> u64 {{ {total} }}
                 name = f"cfg sharing: {mode} {prime}-prime edge edit leaves unrelated roots cached"
                 topology_ran = sum(map(int, re.findall(r"\breach_topology=(\d+)", fresh)))
                 roots_ran = sum(map(int, re.findall(r"\breach_root_code=(\d+)", fresh)))
-                held = edge_edit.returncode == 0 and topology_ran == 1 and roots_ran == 1 and "reach full path" in fresh
+                held = (edge_edit.returncode == 0 and topology_ran == 1 and roots_ran == 1
+                        and "reach fast path: updated edges" in fresh and "reach full path" not in fresh)
                 detail = f"topology {topology_ran}, roots {roots_ran}"
                 checks.append((name, held, detail))
                 print(f"  {'ok ' if held else 'NOT'} {name}: {detail}", flush=True)
@@ -1738,6 +1739,22 @@ pub fn total() -> u64 {{ {total} }}
                 held = new_callee_edit.returncode == 0 and "reach fast path: unchanged edges" in fresh
                 checks.append((name, held, fresh[-700:]))
                 print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                for case, text in [
+                    ("remove a call", feature),
+                    ("create a cycle", feature.replace("x != 0", "identity(x) != 0").replace(
+                        "fn identity(x: u64) -> u64 { x }",
+                        "fn identity(x: u64) -> u64 { if x == 0 { enabled(1) as u64 } else { x } }")),
+                    ("break a cycle", feature.replace("x != 0", "identity(x) != 0")),
+                ]:
+                    before = logs()
+                    pathlib.Path(ws, "src/features.rs").write_text(text)
+                    _, edge_change = side.cargo("test", "--lib")
+                    fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                    name = f"cfg sharing: {mode} {prime}-prime verified reach {case}"
+                    held = (edge_change.returncode == 0 and "reach fast path: updated edges" in fresh
+                            and "reach full path" not in fresh)
+                    checks.append((name, held, fresh[-700:]))
+                    print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
                 nested_feature = feature.replace("impl Flag {", "const _: () = { impl Flag {").replace("enabled(x) } }", "enabled(x) } } };")
                 pathlib.Path(ws, "src/features.rs").write_text(nested_feature)
                 _, nested_prime = side.cargo("test", "--lib")

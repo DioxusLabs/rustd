@@ -157,10 +157,18 @@ try:
         source.write_bytes(original)
         run('restore-before-reference')
         replacement = b'        self.enabled.contains(&f) && !f.key().is_empty()'
-        source.write_bytes(original.replace(old, replacement))
         (root / 'reference-edit.patch').write_text(
             '- ' + old.decode() + '\n+ ' + replacement.decode() + '\n')
-        run('reference-edit')
+        references = []
+        for repeat in range(5):
+            source.write_bytes(original.replace(old, replacement) if repeat % 2 == 0 else original)
+            label = 'reference-edit' if repeat == 0 else 'reference-edit-' + str(repeat + 1)
+            run(label)
+            references.append(dict(json.loads((root / (label + '.summary.json')).read_text()),
+                                   log=(root / (label + '.worker.log')).read_text()))
+        reference_summary = summarize(references)
+        (root / 'reference-edits.summary.json').write_text(json.dumps(reference_summary, indent=2))
+        print(mode, 'reference-edits', json.dumps(reference_summary), flush=True)
 finally:
     source.write_bytes(original)
     assert source.read_bytes() == original

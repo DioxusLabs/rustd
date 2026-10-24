@@ -23,6 +23,9 @@ use super::{
     print_of, static_serial,
 };
 
+#[path = "reach_dynamic.rs"]
+mod dynamic;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Node {
     Root(FunctionId),
@@ -300,7 +303,7 @@ impl Graph {
     /// component of each node.
     fn components(&self) -> (Vec<Vec<usize>>, Vec<usize>) {
         const NONE: usize = usize::MAX;
-        let count = self.nodes.len();
+        let count = self.edges.len();
         let (mut index, mut low) = (vec![NONE; count], vec![0; count]);
         let mut of = vec![NONE; count];
         let mut components: Vec<Vec<usize>> = Vec::new();
@@ -346,6 +349,9 @@ impl Graph {
 struct Bits(Vec<u64>);
 
 impl Bits {
+    fn contains(&self, at: usize) -> bool {
+        self.0.get(at / 64).is_some_and(|word| word >> (at % 64) & 1 == 1)
+    }
     fn insert(&mut self, at: usize) {
         if self.0.len() <= at / 64 {
             self.0.resize(at / 64 + 1, 0);
@@ -576,6 +582,18 @@ struct Snapshot {
     alone: Vec<Option<u128>>,
     groups: Arc<FxHashMap<usize, Vec<usize>>>,
     answer: Answer,
+    dynamic: Option<DynamicSnapshot>,
+    edges_changed: bool,
+}
+
+#[derive(Clone)]
+struct DynamicSnapshot {
+    graph: Graph,
+    engine: dynamic::Dynamic,
+    edges: Vec<Edges>,
+    roots: Vec<(usize, usize)>,
+    groups: Vec<usize>,
+    unknown: FxHashSet<usize>,
 }
 
 impl Cache {
@@ -648,7 +666,8 @@ impl Cache {
                 assert_eq!(&state.answer, reach_program(db, input), "reach fast path");
             }
             if std::env::var_os("RUSTD_STATS").is_some() {
-                eprintln!("reach fast path: unchanged edges; program={program}");
+                let path = if state.edges_changed { "updated edges" } else { "unchanged edges" };
+                eprintln!("reach fast path: {path}; program={program}");
             }
             return state.answer.clone();
         }
@@ -742,7 +761,194 @@ impl Snapshot {
             alone,
             groups: Arc::new(groups),
             answer,
+            dynamic: None,
+            edges_changed: false,
         }
+    }
+
+    fn update_dynamic(
+        &mut self,
+        db: &dyn HirDatabase,
+        candidates: &FxHashSet<usize>,
+        program: &str,
+    ) {
+        let data = self.input.data(db);
+        let count = data.tests.len();
+        let state = self.dynamic.get_or_insert_with(|| {
+            let graph = self.topology.graph.clone();
+            let mut roots: Vec<_> = self
+                .topology
+                .tests
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(root, node)| (node, root))
+                .collect();
+            roots.extend(self.topology.ambient.iter().map(|&node| (node, count)));
+            let engine =
+                dynamic::Dynamic::new(graph.edges.clone(), self.own.clone(), &roots, count + 1);
+            DynamicSnapshot {
+                graph,
+                engine,
+                edges: self.edges.as_ref().clone(),
+                roots,
+                groups: self.topology.groups.clone(),
+                unknown: self
+                    .edges
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(id, edges)| edges.unknown.is_some().then_some(id))
+                    .collect(),
+            }
+        });
+        state.engine.affected = Bits::default();
+        let mut pending: Vec<_> = candidates.iter().copied().collect();
+        let mut pulled = FxHashSet::default();
+        let mut changes = Vec::new();
+        let mut added = state.graph.nodes.len();
+        while let Some(id) = pending.pop() {
+            if !pulled.insert(id) {
+                continue;
+            }
+            let node = state.graph.nodes[id].clone();
+            let edges =
+                reach_edges(db, node.clone(), data.sharing.clone(), data.edited.clone()).clone();
+            let own = reach_own(db, node, data.sharing.clone(), data.edited.clone());
+            let targets: Vec<_> =
+                edges.targets.iter().map(|node| state.graph.node(db, node.clone())).collect();
+            while added < state.graph.nodes.len() {
+                let node = state.graph.nodes[added].clone();
+                let edges =
+                    reach_edges(db, node.clone(), data.sharing.clone(), data.edited.clone())
+                        .clone();
+                let own = reach_own(db, node.clone(), data.sharing.clone(), data.edited.clone());
+                assert_eq!(state.engine.add_node(own), added);
+                if edges.unknown.is_some() {
+                    state.unknown.insert(added);
+                }
+                state.edges.push(edges);
+                let (key, func) = match node {
+                    Node::Root(id) => (super::patch::Node::Root(id), Some(id)),
+                    Node::Instance(instance, _) => {
+                        let func = super::home::written_in(db, &instance);
+                        (super::patch::Node::Instance(instance), func)
+                    }
+                    Node::Static(id) => (super::patch::Node::Static(id), None),
+                };
+                Arc::make_mut(&mut self.nodes).entry(key).or_default().push(added);
+                if let Some(func) = func.filter(|&func| FunctionSignature::of(db, func).has_body())
+                {
+                    let bodies = Arc::make_mut(&mut self.bodies)
+                        .entry(super::home::body_file(db, func.into()))
+                        .or_default();
+                    if !bodies.iter().any(|&(id, _)| id == func) {
+                        bodies.push((func, crate::sharing::body_item_inventory(db, func).clone()));
+                    }
+                }
+                pending.push(added);
+                added += 1;
+            }
+            if state.engine.edges[id] != targets
+                || state.edges[id].written != edges.written
+                || state.edges[id].unknown != edges.unknown
+            {
+                self.edges_changed = true;
+            }
+            if edges.unknown.is_some() {
+                state.unknown.insert(id);
+            } else {
+                state.unknown.remove(&id);
+            }
+            for &target in &targets {
+                if state.engine.masks[state.engine.owner[target]].iter().next().is_none() {
+                    pending.push(target);
+                }
+            }
+            if edges.written != state.edges[id].written {
+                state.graph.written.retain(|&node| node != id);
+                if edges.written {
+                    state.graph.written.push(id);
+                }
+            }
+            state.graph.edges[id] = targets.clone();
+            state.edges[id] = edges;
+            state.engine.set_own(id, own);
+            changes.push((id, targets));
+        }
+        let mut seeds = Vec::new();
+        for (id, targets) in changes {
+            state.engine.change_edges(id, targets, &state.roots, &mut seeds);
+        }
+        state.engine.settle(seeds);
+        let mut changed_groups = FxHashSet::default();
+        if self.edges_changed {
+            let new_groups = dynamic_groups(&state.graph.written, &state.engine, count);
+            for (root, (&old, &new)) in state.groups.iter().zip(&new_groups).enumerate() {
+                if old != new || state.engine.affected.contains(root) {
+                    changed_groups.insert(old);
+                    changed_groups.insert(new);
+                }
+            }
+            state.groups = new_groups;
+            let mut groups: FxHashMap<_, Vec<_>> = FxHashMap::default();
+            for (root, &group) in state.groups.iter().enumerate() {
+                groups.entry(group).or_default().push(root);
+            }
+            self.groups = Arc::new(groups);
+            self.answer
+                .0
+                .iter_mut()
+                .zip(&state.groups)
+                .for_each(|(answer, &group)| answer.group = group);
+            if !self.answer.2.is_empty() || !state.unknown.is_empty() {
+                let mut seen = FxHashSet::default();
+                let mut pending: Vec<_> = self
+                    .topology
+                    .tests
+                    .iter()
+                    .chain(&self.topology.ambient)
+                    .copied()
+                    .rev()
+                    .collect();
+                self.answer.2.clear();
+                while let Some(id) = pending.pop() {
+                    if !seen.insert(id) {
+                        continue;
+                    }
+                    if let Some(unknown) = &state.edges[id].unknown {
+                        self.answer.2.push(unknown.clone());
+                        if self.answer.2.len() == 8 {
+                            break;
+                        }
+                    }
+                    pending.extend(state.graph.edges[id].iter().rev().copied());
+                }
+            }
+        }
+        let ambient = state.engine.code(count).map(|code| vec![code]);
+        let ambient_changed = self.answer.1 != ambient.as_ref().map(print_of);
+        let affected: Vec<_> = if ambient_changed {
+            (0..count).collect()
+        } else {
+            state.engine.affected.iter().filter(|&root| root < count).collect()
+        };
+        let mut groups: FxHashSet<_> =
+            changed_groups.into_iter().filter(|group| self.groups.contains_key(group)).collect();
+        for &root in &affected {
+            self.alone[root] =
+                state.engine.code(root).zip(ambient.as_ref()).map(|it| print_of(&it));
+            groups.insert(state.groups[root]);
+        }
+        if std::env::var_os("RUSTD_STATS").is_some() {
+            eprintln!(
+                "reach incremental graph: pulled={} roots={} groups={}; program={program}",
+                pulled.len(),
+                affected.len(),
+                groups.len()
+            );
+        }
+        refresh_groups(&self.groups, &self.alone, groups, &mut self.answer.0);
+        self.answer.1 = ambient.as_ref().map(print_of);
     }
 
     fn update(
@@ -752,6 +958,7 @@ impl Snapshot {
         patch: Option<&FxHashSet<super::patch::Node>>,
         program: &str,
     ) -> Result<(), &'static str> {
+        self.edges_changed = false;
         let data = self.input.data(db);
         if !files.is_empty() && patch.is_none() {
             return Err("patch candidates unavailable");
@@ -775,14 +982,22 @@ impl Snapshot {
         if std::env::var_os("RUSTD_STATS").is_some() {
             eprintln!("reach patch candidates: {}; program={program}", candidates.len());
         }
+        if self.dynamic.is_some()
+            || candidates.iter().any(|&id| {
+                reach_edges(
+                    db,
+                    self.topology.graph.nodes[id].clone(),
+                    data.sharing.clone(),
+                    data.edited.clone(),
+                ) != &self.edges[id]
+            })
+        {
+            self.update_dynamic(db, &candidates, program);
+            return Ok(());
+        }
         let mut changed = FxHashSet::default();
         for id in candidates {
             let node = &self.topology.graph.nodes[id];
-            if reach_edges(db, node.clone(), data.sharing.clone(), data.edited.clone())
-                != &self.edges[id]
-            {
-                return Err("outgoing edges changed");
-            }
             let own = reach_own(db, node.clone(), data.sharing.clone(), data.edited.clone());
             if own != self.own[id] {
                 self.own[id] = own;
@@ -851,6 +1066,32 @@ impl Snapshot {
     }
 }
 
+fn dynamic_groups(written: &[usize], graph: &dynamic::Dynamic, count: usize) -> Vec<usize> {
+    let mut groups: Vec<_> = (0..count).collect();
+    fn find(groups: &mut [usize], mut at: usize) -> usize {
+        while groups[at] != at {
+            groups[at] = groups[groups[at]];
+            at = groups[at];
+        }
+        at
+    }
+    for &node in written {
+        let mask = &graph.masks[graph.owner[node]];
+        let roots: Vec<_> = if mask.contains(count) {
+            (0..count).collect()
+        } else {
+            mask.iter().filter(|&root| root < count).collect()
+        };
+        if let Some(&first) = roots.first() {
+            for &root in &roots[1..] {
+                let (a, b) = (find(&mut groups, first), find(&mut groups, root));
+                groups[a.max(b)] = a.min(b);
+            }
+        }
+    }
+    (0..count).map(|root| find(&mut groups, root)).collect()
+}
+
 fn refresh_groups(
     members: &FxHashMap<usize, Vec<usize>>,
     alone: &[Option<u128>],
@@ -905,6 +1146,30 @@ fn finish(topology: &Topology, alone: Vec<Option<u128>>, ambient: Option<u128>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edge_updates_split_static_groups_and_include_ambient_writes() {
+        let roots = [(0, 0), (1, 1), (3, 2)];
+        let mut graph = dynamic::Dynamic::new(
+            vec![vec![2], vec![2], vec![], vec![]],
+            vec![Some(1); 4],
+            &roots,
+            3,
+        );
+        assert_eq!(dynamic_groups(&[2], &graph, 2), vec![0, 0]);
+        for (node, edges, expected) in [
+            (0, vec![], vec![0, 1]),
+            (3, vec![2], vec![0, 0]),
+            (3, vec![], vec![0, 1]),
+            (0, vec![2], vec![0, 0]),
+        ] {
+            let mut seeds = Vec::new();
+            graph.change_edges(node, edges, &roots, &mut seeds);
+            graph.settle(seeds);
+            assert_eq!(dynamic_groups(&[2], &graph, 2), expected);
+        }
+        assert_eq!(dynamic_groups(&[], &graph, 2), vec![0, 1]);
+    }
 
     #[test]
     fn refreshing_groups_matches_full_aggregation() {
