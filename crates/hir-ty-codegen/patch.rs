@@ -347,6 +347,8 @@ struct Homes {
     roots_of_other_body: FxHashMap<FileId, Vec<u32>>,
     instances_of_crate: FxHashMap<Crate, Vec<u32>>,
     instances_of_file: FxHashMap<FileId, Vec<u32>>,
+    instances_of_function: FxHashMap<FunctionId, Vec<u32>>,
+    instances_of_other_body: FxHashMap<FileId, Vec<u32>>,
     /// The instances that the bodies of any file may be part of.
     instances_of_any_file: Vec<u32>,
 }
@@ -378,12 +380,29 @@ impl Homes {
                 }
             }
         }
-        for (i, was) in instances.values().enumerate() {
+        for (i, (instance, was)) in instances.iter().enumerate() {
             homes.instances_of_crate.entry(was.env.krate).or_default().push(i as u32);
             match &was.files {
                 Some(files) => {
                     for &file in files {
                         homes.instances_of_file.entry(file).or_default().push(i as u32);
+                    }
+                }
+                None => homes.instances_of_any_file.push(i as u32),
+            }
+            match super::home::body_owners(db, instance) {
+                Some(bodies) => {
+                    for body in bodies {
+                        match body {
+                            DefWithBodyId::FunctionId(func) => {
+                                homes.instances_of_function.entry(func).or_default().push(i as u32)
+                            }
+                            _ => homes
+                                .instances_of_other_body
+                                .entry(body_file(db, body))
+                                .or_default()
+                                .push(i as u32),
+                        }
                     }
                 }
                 None => homes.instances_of_any_file.push(i as u32),
@@ -728,6 +747,10 @@ impl Base {
         self.outdated
     }
 
+    pub(super) fn impls_changed(&self) -> bool {
+        self.touched.any || !self.touched.crates.is_empty()
+    }
+
     fn decisions_changed(&self, db: &dyn HirDatabase) -> bool {
         self.decisions != self.sharing.decisions(db)
     }
@@ -842,8 +865,14 @@ impl Base {
         }
         let homes = &self.homes;
         let of_crates = touched.crates.iter().filter_map(|it| homes.instances_of_crate.get(it));
-        let of_files = touched.bodies.iter().filter_map(|it| homes.instances_of_file.get(it));
+        let of_files = touched.wide_bodies.iter().filter_map(|it| homes.instances_of_file.get(it));
         let mut asked: Vec<u32> = of_crates.chain(of_files).flatten().copied().collect();
+        asked.extend(
+            touched.functions.iter().filter_map(|it| homes.instances_of_function.get(it)).flatten(),
+        );
+        asked.extend(
+            touched.bodies.iter().filter_map(|it| homes.instances_of_other_body.get(it)).flatten(),
+        );
         if !touched.bodies.is_empty() {
             asked.extend(&homes.instances_of_any_file);
         }
@@ -892,6 +921,11 @@ impl Base {
                 self.roots_to_ask(false, 0, 1).count(),
                 self.compiled.len()
             );
+            eprintln!(
+                "patch instance candidates: {} of {}",
+                self.instances_to_ask(false, 0, 1).count(),
+                self.instances.len()
+            );
         }
         for i in self.roots_to_ask(check_all, part, parts) {
             let root = self.compiled[i].0;
@@ -936,11 +970,11 @@ impl Base {
             }
         }
         stale.steps.roots = start.elapsed();
+        let selected: Vec<_> =
+            if check_all { self.instances_to_ask(false, 0, 1).collect() } else { Vec::new() };
         for i in self.instances_to_ask(check_all, part, parts) {
             let Some((instance, was)) = self.instances.get_index(i) else { continue };
-            let touched = self.touched.reaches(was.env.krate)
-                || self.touched.reaches_bodies(was.files.as_deref())
-                || self.touched.instances.contains(instance);
+            let touched = !check_all || selected.binary_search(&i).is_ok();
             if !touched && !check_all {
                 continue;
             }
@@ -967,6 +1001,7 @@ impl Base {
                 Some(mark) if mark == was.mark => {}
                 _ if !touched => {
                     eprintln!("check-all: MISSED instance {instance:?} of {:?}", was.env.krate);
+                    assert!(!verify, "instance invalidation fast path missed {instance:?}");
                     continue;
                 }
                 Some(Some(mark)) if !was.forwarded => {
@@ -999,6 +1034,7 @@ impl Base {
             }
             if !touched {
                 eprintln!("check-all: MISSED static {id:?} of {:?}", was.krate);
+                assert!(!verify, "static invalidation fast path missed {id:?}");
                 continue;
             }
             stale.their_walk_changed |= was.theirs;

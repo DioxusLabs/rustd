@@ -1567,7 +1567,7 @@ def test_graph_sharing_incremental(work):
         ws = os.path.realpath(os.path.join(work, "sharing-incremental-" + mode))
         functions = "\n".join(f"pub fn f{i}<T: Copy>(x: T) -> (T, u64) {{ (x, if enabled(1) {{ {i} }} else {{ 0 }}) }}" for i in range(400))
         total = "+".join(f"f{i}(1u64).1" for i in range(400))
-        feature = "pub fn enabled(x: u64) -> bool { x != 0 }\nfn identity(x: u64) -> u64 { x }\npub struct Flag;\nimpl Flag { pub fn check(x: u64) -> bool { enabled(x) } }\npub fn dependency_value() -> u64 { named_dependency::value() }\npub fn schema_value() -> u64 { schema_probe::value() }\npub fn policy_value() -> u64 { policy_cycle(0) }\nfn policy_cycle(x: u8) -> u64 { if x == 0 { 7 } else { policy_value() } }\n" + functions + "\n"
+        feature = "pub fn enabled(x: u64) -> bool { x != 0 }\nfn identity(x: u64) -> u64 { x }\n#[derive(Clone)] pub struct Flag;\nmacro_rules! generated { () => { pub fn generated_value() -> u64 { 7 } } }\ngenerated!();\nimpl Flag { pub fn check(x: u64) -> bool { enabled(x) } }\npub fn dependency_value() -> u64 { named_dependency::value() }\npub fn schema_value() -> u64 { schema_probe::value() }\npub fn policy_value() -> u64 { policy_cycle(0) }\nfn policy_cycle(x: u8) -> u64 { if x == 0 { 7 } else { policy_value() } }\n" + functions + "\n"
         reports = "\n".join(f'#[test] fn report{i}() -> Result<(), &\'static str> {{ Ok(()) }}' for i in range(20))
         files = {
             "Cargo.toml": '[package]\nname="sharing_incremental"\nversion="0.1.0"\nedition="2021"\n[workspace]\nmembers=["probe", "named_dependency", "schema"]\n[dependencies]\nnamed_dependency={path="named_dependency"}\nschema_probe={path="schema"}\n[dev-dependencies]\nprobe={path="probe"}\n',
@@ -1589,6 +1589,8 @@ pub fn total() -> u64 {{ {total} }}
     {reports}
     #[test] fn copies() {{
         assert!(super::Flag::check(1));
+        let _ = super::Flag.clone();
+        assert_eq!(super::generated_value(), 7);
         assert_eq!(super::macro_local(), 3);
         assert_eq!(super::total(), 79800);
         assert_eq!(super::total(), probe::total());
@@ -1681,9 +1683,19 @@ pub fn total() -> u64 {{ {total} }}
                     checks.append((name, held, fresh[-700:]))
                     print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
                     if case == "restored code":
+                        name = f"cfg sharing: {mode} {prime}-prime body edits skip impl prewarm"
+                        prewarm = re.findall(r"check impls prewarm: (\w+);", fresh)
+                        held = bool(prewarm) and all(value == "skipped" for value in prewarm)
+                        checks.append((name, held, str(prewarm)))
+                        print(f"  {'ok ' if held else 'NOT'} {name}: {prewarm}", flush=True)
                         name = f"cfg sharing: {mode} {prime}-prime root checks follow changed functions"
                         candidates = re.findall(r"patch root candidates: (\d+) of (\d+)", fresh)
                         held = bool(candidates) and all(int(selected) <= 4 for selected, total in candidates)
+                        checks.append((name, held, str(candidates)))
+                        print(f"  {'ok ' if held else 'NOT'} {name}: {candidates}", flush=True)
+                        name = f"cfg sharing: {mode} {prime}-prime instance checks follow changed functions"
+                        candidates = re.findall(r"patch instance candidates: (\d+) of (\d+)", fresh)
+                        held = bool(candidates) and all(int(selected) < int(total) or int(total) == 0 for selected, total in candidates)
                         checks.append((name, held, str(candidates)))
                         print(f"  {'ok ' if held else 'NOT'} {name}: {candidates}", flush=True)
                         name = f"cfg sharing: {mode} {prime}-prime retains diagnostics and harness text"
@@ -1756,8 +1768,14 @@ pub fn total() -> u64 {{ {total} }}
                     checks.append((name, held, fresh[-700:]))
                     print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
                 nested_feature = feature.replace("impl Flag {", "const _: () = { impl Flag {").replace("enabled(x) } }", "enabled(x) } } };")
+                before = logs()
                 pathlib.Path(ws, "src/features.rs").write_text(nested_feature)
                 _, nested_prime = side.cargo("test", "--lib")
+                broad = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                name = f"cfg sharing: {mode} {prime}-prime impl edits retain impl prewarm"
+                held = nested_prime.returncode == 0 and "check impls prewarm: enabled;" in broad
+                checks.append((name, held, broad[-700:]))
+                print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
                 before = logs()
                 pathlib.Path(ws, "src/features.rs").write_text(nested_feature.replace("x != 0", "x != 2"))
                 _, nested_edit = side.cargo("test", "--lib")

@@ -214,12 +214,29 @@ fn outline(db: &RootDatabase, file: FileId, functions: &[FunctionId]) -> Option<
         .iter()
         .map(|&func| {
             let at = func.lookup(db).id;
-            if at.file_id.is_macro() || at.file_id.original_file(db).file_id(db) != file {
+            if at.file_id.original_file(db).file_id(db) != file {
                 return None;
             }
-            let range = at.to_range(db);
             let mut hash = FxHasher::default();
-            text.get(std::ops::Range::<usize>::from(range))?.hash(&mut hash);
+            let range = if at.file_id.is_macro() {
+                at.to_node(db).syntax().text().to_string().hash(&mut hash);
+                let call = at.file_id.original_call_node(db)?;
+                if call.file_id.file_id(db) != file {
+                    return None;
+                }
+                call.value
+                    .ancestors()
+                    .find_map(ast::Item::cast)?
+                    .syntax()
+                    .text()
+                    .to_string()
+                    .hash(&mut hash);
+                call.value.text_range()
+            } else {
+                let range = at.to_range(db);
+                text.get(std::ops::Range::<usize>::from(range))?.hash(&mut hash);
+                range
+            };
             let start = lines.try_line_col(range.start())?;
             Some((func, (hash.finish(), start.line, start.col)))
         })

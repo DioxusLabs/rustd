@@ -1160,6 +1160,10 @@ impl Rejections {
         self.base.is_some()
     }
 
+    pub fn impls_changed(&self) -> bool {
+        self.base.as_ref().is_none_or(|base| base.impls_changed())
+    }
+
     /// Makes the next build a full one. A patch looks at everything the last build compiled,
     /// and what an edit took away can only be looked at where a panic can be caught.
     pub fn forget_base(&mut self) {

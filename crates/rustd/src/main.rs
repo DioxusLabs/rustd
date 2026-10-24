@@ -3289,10 +3289,13 @@ fn build(
     // thread: left to the questions, whichever gets there has the others wait for all of it.
     let next = std::sync::atomic::AtomicUsize::new(0);
     let impls = std::sync::atomic::AtomicU64::new(0);
+    let prewarm = known.impls_changed();
+    let impl_crates = if prewarm { local.as_slice() } else { &[] };
     let stale: Option<Vec<_>> = std::thread::scope(|scope| {
         let parts: Vec<_> = (0..threads)
             .map(|part| {
-                let (db, known, local, next, impls) = (db.clone(), &*known, &local, &next, &impls);
+                let (db, known, local, next, impls) =
+                    (db.clone(), &*known, impl_crates, &next, &impls);
                 scope.spawn(move || {
                     PROBING.set(true);
                     hir::attach_db(&db, || {
@@ -3316,6 +3319,11 @@ fn build(
     });
     hir::attach_db(db, || known.set_stale(hir_db, stale.unwrap_or_default()));
     if std::env::var_os("RUSTD_STATS").is_some() {
+        eprintln!(
+            "check impls prewarm: {}; program={}",
+            if prewarm { "enabled" } else { "skipped" },
+            args.out.display()
+        );
         eprintln!(
             "check impls longest-thread-us: {}; program={}",
             impls.load(std::sync::atomic::Ordering::Relaxed),

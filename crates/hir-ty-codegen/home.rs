@@ -122,6 +122,11 @@ pub fn body_files(db: &dyn HirDatabase, instance: &Instance) -> Option<Box<[File
     Some(files.into())
 }
 
+pub(super) fn body_owners(db: &dyn HirDatabase, instance: &Instance) -> Option<Vec<DefWithBodyId>> {
+    let mentions = Mentions::of(db, instance);
+    (!mentions.opaque).then_some(mentions.bodies)
+}
+
 /// The file a body is written in, which for one a macro makes is where the macro is called.
 pub fn body_file(db: &dyn HirDatabase, body: DefWithBodyId) -> FileId {
     let file = match body {
