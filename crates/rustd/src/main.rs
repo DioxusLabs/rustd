@@ -2741,6 +2741,9 @@ fn dump_twins(db: &RootDatabase, args: &Args) {
         let both = present.contains(&normal) && present.contains(&test);
         if std::env::var_os("RUSTD_CFG_SHARING").is_some_and(|it| it == "local") {
             let mut counts = std::collections::BTreeMap::new();
+            let verify = std::env::var_os("RUSTD_CFG_VERIFY").is_some();
+            let sharing = hir_ty::mir::codegen::Sharing::new(vec![(normal, test, both)]);
+            let mut verified = std::collections::BTreeMap::new();
             for &item in &index.function_items {
                 let hir_def::AttrDefId::FunctionId(id) = item else { continue };
                 if !index.twins.contains_key(&item) {
@@ -2748,6 +2751,26 @@ fn dump_twins(db: &RootDatabase, args: &Args) {
                 }
                 let outcome = hir_ty::sharing::local_analysis(db, normal, test, id)
                     .map_or("analysis-shared", |reason| reason.class());
+                if verify
+                    && let Some(&hir_def::AttrDefId::FunctionId(source)) = index.twins.get(&item)
+                {
+                    let verdict =
+                        hir_ty::mir::codegen::compare_body(db, &sharing, source, id);
+                    let label = match verdict {
+                        hir_ty::mir::codegen::BodyComparison::Same => "same",
+                        hir_ty::mir::codegen::BodyComparison::BothFail => "both-fail",
+                        hir_ty::mir::codegen::BodyComparison::Differs(what) => what,
+                    };
+                    *verified.entry((outcome, label)).or_insert(0usize) += 1;
+                    if outcome == "analysis-shared"
+                        && matches!(verdict, hir_ty::mir::codegen::BodyComparison::Differs(_))
+                    {
+                        eprintln!(
+                            "cfg verify MISMATCH: {name}::{}: {label}",
+                            hir::Function::from(id).name(db).as_str()
+                        );
+                    }
+                }
                 *counts.entry(outcome).or_insert(0usize) += 1;
                 if std::env::var("RUSTD_CFG_TWINS").is_ok_and(|value| value == "items") {
                     eprintln!(
@@ -2755,6 +2778,9 @@ fn dump_twins(db: &RootDatabase, args: &Args) {
                         hir::Function::from(id).name(db).as_str()
                     );
                 }
+            }
+            if verify {
+                eprintln!("cfg verify: {name}: {verified:?}");
             }
             let safety = hir_ty::sharing::local_pair_safety(db, normal, test);
             let veto = if safety.is_empty() { "none".to_owned() } else { safety.join(",") };

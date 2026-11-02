@@ -111,6 +111,7 @@ mod promote;
 mod remap;
 mod settled;
 mod sharing;
+pub use remap::{BodyComparison, compare_body};
 pub use sharing::Sharing;
 
 pub(crate) fn trace_analysis_query(db: &dyn HirDatabase, owner: InferBodyId<'_>, phase: &str) {

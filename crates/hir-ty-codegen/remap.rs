@@ -318,3 +318,73 @@ fn mapped_body<'db>(
     }
     Ok(body)
 }
+
+/// What comparing a body's own MIR with the remapped MIR of its twin found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BodyComparison {
+    Same,
+    Differs(&'static str),
+    BothFail,
+}
+
+/// Lowers `func` for itself and compares it with `source` remapped onto `func`'s crate. This is
+/// the ground truth for a reuse decision: a shared body that differs here would be miscompiled.
+/// It recomputes everything sharing avoids, so it only runs under `RUSTD_CFG_VERIFY`.
+pub fn compare_body(
+    db: &dyn HirDatabase,
+    sharing: &Sharing,
+    source: FunctionId,
+    func: FunctionId,
+) -> BodyComparison {
+    match (db.mir_body(source.into()), db.mir_body(func.into())) {
+        (Ok(raw), Ok(own)) => compare_mir(db, sharing, source, &raw, &own),
+        (Err(_), Err(_)) => BodyComparison::BothFail,
+        _ => BodyComparison::Differs("lowering result"),
+    }
+}
+
+fn compare_mir<'db>(
+    db: &'db dyn HirDatabase,
+    sharing: &Sharing,
+    source: FunctionId,
+    raw: &MirBody<'db>,
+    own: &MirBody<'db>,
+) -> BodyComparison {
+    let Ok(mapped) = body(db, sharing, source, raw) else {
+        return BodyComparison::Differs("unmappable");
+    };
+    if mapped.locals != own.locals {
+        if std::env::var("RUSTD_CFG_VERIFY").is_ok_and(|it| it == "items") {
+            for ((_, a), (_, b)) in mapped.locals.iter().zip(own.locals.iter()) {
+                if a != b {
+                    eprintln!("cfg verify local: {:?} vs {:?}", a.ty.as_ref(), b.ty.as_ref());
+                    break;
+                }
+            }
+        }
+        return BodyComparison::Differs("locals");
+    }
+    if mapped.basic_blocks != own.basic_blocks {
+        return BodyComparison::Differs("blocks");
+    }
+    if (&mapped.binding_locals, &mapped.param_locals, &mapped.promoted_locals, &mapped.scope_ends)
+        != (&own.binding_locals, &own.param_locals, &own.promoted_locals, &own.scope_ends)
+    {
+        return BodyComparison::Differs("local tables");
+    }
+    if mapped.closures.len() != own.closures.len() {
+        return BodyComparison::Differs("closure count");
+    }
+    for (&raw_closure, &own_closure) in raw.closures.iter().zip(&own.closures) {
+        let verdict = match (db.mir_body_for_closure(raw_closure), db.mir_body_for_closure(own_closure))
+        {
+            (Ok(raw), Ok(own)) => compare_mir(db, sharing, source, &raw, &own),
+            (Err(_), Err(_)) => BodyComparison::BothFail,
+            _ => BodyComparison::Differs("closure lowering"),
+        };
+        if let BodyComparison::Differs(_) = verdict {
+            return verdict;
+        }
+    }
+    BodyComparison::Same
+}

@@ -887,6 +887,33 @@ struct Canonical<'a, 'db> {
 }
 
 impl<'db> Canonical<'_, 'db> {
+    /// The owner of a generic parameter in the copy a shared body is mapped onto.
+    fn generic_parent(&self, parent: hir_def::GenericDefId) -> hir_def::GenericDefId {
+        use hir_def::GenericDefId as G;
+        if self.analysis.is_none() {
+            return parent;
+        }
+        let item = match parent {
+            G::AdtId(id) => AttrDefId::AdtId(id),
+            G::ConstId(id) => id.into(),
+            G::FunctionId(id) => id.into(),
+            G::ImplId(id) => id.into(),
+            G::StaticId(id) => id.into(),
+            G::TraitId(id) => id.into(),
+            G::TypeAliasId(id) => id.into(),
+        };
+        match self.item(item) {
+            AttrDefId::AdtId(id) => id.into(),
+            AttrDefId::ConstId(id) => id.into(),
+            AttrDefId::FunctionId(id) => id.into(),
+            AttrDefId::ImplId(id) => id.into(),
+            AttrDefId::StaticId(id) => id.into(),
+            AttrDefId::TraitId(id) => id.into(),
+            AttrDefId::TypeAliasId(id) => id.into(),
+            _ => parent,
+        }
+    }
+
     fn item(&self, item: AttrDefId) -> AttrDefId {
         if self.opaque_only {
             return item;
@@ -973,6 +1000,13 @@ impl<'db> TypeFolder<DbInterner<'db>> for Canonical<'_, 'db> {
             next_solver::{Const, ConstKind},
         };
         let value = value.super_fold_with(self);
+        if let ConstKind::Param(mut param) = value.kind() {
+            param.id = hir_def::ConstParamId::from_unchecked(hir_def::TypeOrConstParamId {
+                parent: self.generic_parent(param.id.parent()),
+                local_id: param.id.local_id(),
+            });
+            return Const::new_param(self.interner, param);
+        }
         if let ConstKind::Unevaluated(mut unevaluated) = value.kind()
             && let GeneralConstId::ConstId(id) = unevaluated.def.0
             && let AttrDefId::ConstId(id) = self.item(id.into())
@@ -1009,6 +1043,13 @@ impl<'db> TypeFolder<DbInterner<'db>> for Canonical<'_, 'db> {
 
     fn fold_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
         match ty.kind() {
+            TyKind::Param(param) => {
+                let id = hir_def::TypeParamId::from_unchecked(hir_def::TypeOrConstParamId {
+                    parent: self.generic_parent(param.id.parent()),
+                    local_id: param.id.local_id(),
+                });
+                return Ty::new_param(self.interner, id, param.index);
+            }
             TyKind::Adt(adt, args) => {
                 if let AttrDefId::AdtId(id) = self.item(adt.def_id().into()) {
                     return Ty::new_adt(self.interner, id, args.fold_with(self));
