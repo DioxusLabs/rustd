@@ -1598,16 +1598,19 @@ def test_graph_sharing_incremental(work):
         ws = os.path.realpath(os.path.join(work, "sharing-incremental-" + mode))
         functions = "\n".join(f"pub fn f{i}<T: Copy>(x: T) -> (T, u64) {{ (x, if enabled(1) {{ {i} }} else {{ 0 }}) }}" for i in range(400))
         total = "+".join(f"f{i}(1u64).1" for i in range(400))
-        feature = "pub fn enabled(x: u64) -> bool { x != 0 }\nfn identity(x: u64) -> u64 { x }\npub struct Flag;\nimpl Flag { pub fn check(x: u64) -> bool { enabled(x) } }\npub fn dependency_value() -> u64 { named_dependency::value() }\npub fn schema_value() -> u64 { schema_probe::value() }\n" + functions + "\n"
+        feature = "pub fn enabled(x: u64) -> bool { x != 0 }\nfn identity(x: u64) -> u64 { x }\n#[derive(Clone)] pub struct Flag;\nmacro_rules! generated { () => { pub fn generated_value() -> u64 { 7 } } }\ngenerated!();\nimpl Flag { pub fn check(x: u64) -> bool { enabled(x) } }\npub fn dependency_value() -> u64 { named_dependency::value() }\npub fn schema_value() -> u64 { schema_probe::value() }\npub fn policy_value() -> u64 { policy_cycle(0) }\nfn policy_cycle(x: u8) -> u64 { if x == 0 { 7 } else { policy_value() } }\n" + functions + "\n"
+        feature += "named_dependency::macro_value!(0);\n"
         reports = "\n".join(f'#[test] fn report{i}() -> Result<(), &\'static str> {{ Ok(()) }}' for i in range(20))
         files = {
-            "Cargo.toml": '[package]\nname="sharing_incremental"\nversion="0.1.0"\nedition="2021"\n[workspace]\nmembers=["probe", "named_dependency", "schema"]\n[dependencies]\nnamed_dependency={path="named_dependency"}\nschema_probe={path="schema"}\n[dev-dependencies]\nprobe={path="probe"}\n',
+            "Cargo.toml": '[package]\nname="sharing_incremental"\nversion="0.1.0"\nedition="2021"\n[workspace]\nmembers=["probe", "named_dependency", "schema", "unused_dependency"]\n[dependencies]\nnamed_dependency={path="named_dependency"}\nschema_probe={path="schema"}\nunused_dependency={path="unused_dependency"}\n[dev-dependencies]\nprobe={path="probe"}\n',
             "schema/Cargo.toml": '[package]\nname="schema_probe"\nversion="0.1.0"\nedition="2021"\n[dev-dependencies]\nsharing_incremental={path=".."}\n',
             "schema/src/lib.rs": 'pub fn value() -> u64 { 7 }\n#[cfg(test)] mod tests { #[test] fn dependency() { assert_eq!(sharing_incremental::schema_value(), 7); } }\n',
             "named_dependency/Cargo.toml": '[package]\nname="named_dependency"\nversion="0.1.0"\nedition="2021"\n',
-            "named_dependency/src/lib.rs": 'pub fn value() -> u64 { 7 }\n',
+            "named_dependency/src/lib.rs": 'pub fn value() -> u64 { 7 }\npub static VALUE: u64 = 7;\n#[macro_export] macro_rules! macro_value { (0) => { pub fn macro_dependency_value() -> u64 { 7 } }; (1) => { pub fn macro_dependency_value() -> u64 { unused_dependency::value() } }; }\n',
+            "unused_dependency/Cargo.toml": '[package]\nname="unused_dependency"\nversion="0.1.0"\nedition="2021"\n',
+            "unused_dependency/src/lib.rs": 'pub fn value() -> u64 { 7 }\n',
             "probe/Cargo.toml": '[package]\nname="probe"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nsharing_incremental={path=".."}\n',
-            "probe/src/lib.rs": 'pub fn total() -> u64 { sharing_incremental::total() }\npub fn different() -> u64 { sharing_incremental::different() }\n',
+            "probe/src/lib.rs": 'pub fn total() -> u64 { sharing_incremental::total() }\npub fn different() -> u64 { sharing_incremental::different() }\npub fn policy_value() -> u64 { sharing_incremental::policy_value() }\n',
             "src/features.rs": feature,
             "src/lib.rs": f'''mod features;
 pub use features::*;
@@ -1620,11 +1623,21 @@ pub fn total() -> u64 {{ {total} }}
     {reports}
     #[test] fn copies() {{
         assert!(super::Flag::check(1));
+        let _ = super::Flag.clone();
+        assert_eq!(super::generated_value(), 7);
+        assert_eq!(super::macro_dependency_value(), 7);
         assert_eq!(super::macro_local(), 3);
         assert_eq!(super::total(), 79800);
         assert_eq!(super::total(), probe::total());
         assert_eq!(super::different(), 1);
         assert_eq!(probe::different(), 2);
+    }}
+    #[test] fn policy_values() {{
+        let local = super::policy_value();
+        let normal = probe::policy_value();
+        println!("policy-values: {{local}}/{{normal}}");
+        if local == 7 {{ assert_eq!(normal, 7); }}
+        else {{ assert_eq!(local, 1); assert_eq!(normal, 2); }}
     }}
 }}
 ''',
@@ -1671,15 +1684,22 @@ pub fn total() -> u64 {{ {total} }}
                 held = bool(candidates) and max(candidates) <= 4
                 checks.append((name, held, str(candidates)))
                 print(f"  {'ok ' if held else 'NOT'} {name}: {candidates}", flush=True)
+                if mode == "on":
+                    name = f"cfg sharing: {prime}-prime policy checks only edited function facts"
+                    candidates = list(map(int, re.findall(r"sharing candidates: bodies=(\d+)", fresh)))
+                    held = bool(candidates) and max(candidates) <= 2
+                    checks.append((name, held, str(candidates)))
+                    print(f"  {'ok ' if held else 'NOT'} {name}: {candidates}", flush=True)
                 name = f"cfg sharing: {mode} {prime}-prime path diagnostics identify the program"
                 paths = re.findall(r"^(?:reach|sharing) (?:fast|full) path:?.*$", fresh, re.M)
                 held = bool(paths) and all("; program=" in line for line in paths)
                 checks.append((name, held, str(paths)))
                 print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
-                for query, limit in [("reach_topology", 0), ("reach_component_print", 2), ("reach_root_code", 1), ("loaded_crates", 0)] + ([("twin_index", 0), ("pair_safety", 0), ("pair_eligibility", 0), ("decision_serial", 0), ("applicable_adt_impls", 0), ("local_trait_impls", 0)] if mode == "on" else []):
+                for query, limit in [("reach_topology", 0), ("reach_component_print", 2), ("reach_root_code", 1), ("loaded_crates", 0)] + ([("twin_index", 0), ("pair_safety", 0), ("pair_eligibility", 0), ("decision_serial", 0), ("applicable_adt_impls", 0), ("local_trait_impls", 0)] if mode == "on" else [("pair_eligibility", 0), ("eligibility_facts", 0)]):
                     name = f"cfg sharing: {mode} {prime}-prime {query} executions <= {limit}"
-                    count_ran = sum(map(int, re.findall(rf"\b{query}=(\d+)", fresh)))
-                    held = ("queries:" in fresh and re.search(rf"\b{query}=\d+", primed) is not None
+                    disabled_policy = mode == "off" and query in ("pair_eligibility", "eligibility_facts")
+                    count_ran = sum(map(int, re.findall(rf"\b{query}=(\d+)", primed + fresh if disabled_policy else fresh)))
+                    held = ("queries:" in fresh and ("queries:" in primed if disabled_policy else re.search(rf"\b{query}=\d+", primed) is not None)
                             and count_ran <= limit)
                     checks.append((name, held, f"executed {count_ran}"))
                     print(f"  {'ok ' if held else 'NOT'} {name}: {count_ran}", flush=True)
@@ -1688,7 +1708,7 @@ pub fn total() -> u64 {{ {total} }}
                 held = projected > 0 and re.search(r"\bloaded_crates=\d+", primed) is not None
                 checks.append((name, held, f"executed {projected}"))
                 print(f"  {'ok ' if held else 'NOT'} {name}: {projected}", flush=True)
-                for case, text in [("code-only edit", feature.replace("x != 0", "x != 3")), ("restored code", feature)]:
+                for case, text in [("code-only edit", feature.replace("x != 0", "x != 3")), ("restored code", feature), ("relocated source", feature.replace("x != 0", "{\n x != 0\n}"))]:
                     before = logs()
                     pathlib.Path(ws, "src/features.rs").write_text(text)
                     _, result = side.cargo("test", "--lib")
@@ -1697,6 +1717,65 @@ pub fn total() -> u64 {{ {total} }}
                     held = result.returncode == 0 and "reach fast path: unchanged edges" in fresh
                     checks.append((name, held, fresh[-700:]))
                     print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                    if case == "restored code":
+                        name = f"cfg sharing: {mode} {prime}-prime body edits skip impl prewarm"
+                        prewarm = re.findall(r"check impls prewarm: (\w+);", fresh)
+                        held = bool(prewarm) and all(value == "skipped" for value in prewarm)
+                        checks.append((name, held, str(prewarm)))
+                        print(f"  {'ok ' if held else 'NOT'} {name}: {prewarm}", flush=True)
+                        name = f"cfg sharing: {mode} {prime}-prime root checks follow changed functions"
+                        candidates = re.findall(r"patch root candidates: (\d+) of (\d+)", fresh)
+                        held = bool(candidates) and all(int(selected) <= 4 for selected, total in candidates)
+                        checks.append((name, held, str(candidates)))
+                        print(f"  {'ok ' if held else 'NOT'} {name}: {candidates}", flush=True)
+                        name = f"cfg sharing: {mode} {prime}-prime instance checks follow changed functions"
+                        candidates = re.findall(r"patch instance candidates: (\d+) of (\d+)", fresh)
+                        held = bool(candidates) and all(int(selected) < int(total) or int(total) == 0 for selected, total in candidates)
+                        checks.append((name, held, str(candidates)))
+                        print(f"  {'ok ' if held else 'NOT'} {name}: {candidates}", flush=True)
+                        name = f"cfg sharing: {mode} {prime}-prime retains diagnostics and harness text"
+                        held = "write text: retained skipped=true harness=true" in fresh
+                        checks.append((name, held, fresh[-700:]))
+                        print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                for case, text in [("added", feature.replace("macro_value!(0)", "macro_value!(1)")), ("removed", feature)]:
+                    before = logs()
+                    pathlib.Path(ws, "src/features.rs").write_text(text)
+                    _, result = side.cargo("test", "--lib")
+                    fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                    name = f"cfg sharing: {mode} {prime}-prime {case} macro dependency invalidates loaded crates"
+                    ran = sum(map(int, re.findall(r"\bloaded_crates=(\d+)", fresh)))
+                    held = result.returncode == 0 and ran > 0
+                    checks.append((name, held, f"executed {ran}"))
+                    print(f"  {'ok ' if held else 'NOT'} {name}: {ran}", flush=True)
+                if mode == "on":
+                    before = logs()
+                    pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "let _ = std::any::TypeId::of::<u64>(); let _ = named_dependency::VALUE; !std::ops::Not::not(x != 0)"))
+                    _, foreign_edit = side.cargo("test", "--lib")
+                    fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                    name = f"cfg sharing: {prime}-prime foreign trait reference keeps policy fast path"
+                    held = (foreign_edit.returncode == 0 and "field=references.items" in fresh
+                            and "sharing fast path" in fresh and "sharing full path" not in fresh
+                            and "sharing incremental path" not in fresh)
+                    checks.append((name, held, fresh[-700:]))
+                    print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                    for case, text in [
+                        ("rejection", feature.replace("if x == 0 { 7 }", "if x == 0 { super::different() }")),
+                        ("un-rejection", feature),
+                    ]:
+                        before = logs()
+                        pathlib.Path(ws, "src/features.rs").write_text(text)
+                        _, policy_edit = side.cargo("test", "--lib", "--", "--nocapture")
+                        fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                        updates = re.findall(r"sharing incremental path: bodies=(\d+) affected=(\d+) rejected=(\d+)->(\d+)", fresh)
+                        name = f"cfg sharing: {prime}-prime SCC incremental {case}"
+                        values = "policy-values: 1/2" if case == "rejection" else "policy-values: 7/7"
+                        held = (policy_edit.returncode == 0 and values in policy_edit.stdout
+                                and bool(updates) and "sharing full path" not in fresh
+                                and all(int(bodies) == 1 and 2 <= int(affected) <= 8
+                                        and (int(new) > int(old) if case == "rejection" else int(new) < int(old))
+                                        for bodies, affected, old, new in updates))
+                        checks.append((name, held, str(updates) + fresh[-700:]))
+                        print(f"  {'ok ' if held else 'NOT'} {name}: {updates}", flush=True)
                 before = logs()
                 pathlib.Path(ws, "src/features.rs").write_text(feature.replace("x != 0", "identity(x) != 0"))
                 _, edge_edit = side.cargo("test", "--lib")
@@ -1704,7 +1783,8 @@ pub fn total() -> u64 {{ {total} }}
                 name = f"cfg sharing: {mode} {prime}-prime edge edit leaves unrelated roots cached"
                 topology_ran = sum(map(int, re.findall(r"\breach_topology=(\d+)", fresh)))
                 roots_ran = sum(map(int, re.findall(r"\breach_root_code=(\d+)", fresh)))
-                held = edge_edit.returncode == 0 and topology_ran == 1 and roots_ran == 1 and "reach full path" in fresh
+                held = (edge_edit.returncode == 0 and topology_ran == 1 and roots_ran == 1
+                        and "reach fast path: updated edges" in fresh and "reach full path" not in fresh)
                 detail = f"topology {topology_ran}, roots {roots_ran}"
                 checks.append((name, held, detail))
                 print(f"  {'ok ' if held else 'NOT'} {name}: {detail}", flush=True)
@@ -1716,9 +1796,31 @@ pub fn total() -> u64 {{ {total} }}
                 held = new_callee_edit.returncode == 0 and "reach fast path: unchanged edges" in fresh
                 checks.append((name, held, fresh[-700:]))
                 print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
+                for case, text in [
+                    ("remove a call", feature),
+                    ("create a cycle", feature.replace("x != 0", "identity(x) != 0").replace(
+                        "fn identity(x: u64) -> u64 { x }",
+                        "fn identity(x: u64) -> u64 { if x == 0 { enabled(1) as u64 } else { x } }")),
+                    ("break a cycle", feature.replace("x != 0", "identity(x) != 0")),
+                ]:
+                    before = logs()
+                    pathlib.Path(ws, "src/features.rs").write_text(text)
+                    _, edge_change = side.cargo("test", "--lib")
+                    fresh = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                    name = f"cfg sharing: {mode} {prime}-prime verified reach {case}"
+                    held = (edge_change.returncode == 0 and "reach fast path: updated edges" in fresh
+                            and "reach full path" not in fresh)
+                    checks.append((name, held, fresh[-700:]))
+                    print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
                 nested_feature = feature.replace("impl Flag {", "const _: () = { impl Flag {").replace("enabled(x) } }", "enabled(x) } } };")
+                before = logs()
                 pathlib.Path(ws, "src/features.rs").write_text(nested_feature)
                 _, nested_prime = side.cargo("test", "--lib")
+                broad = "\n".join(text[len(before.get(path, "")):] for path, text in logs().items())
+                name = f"cfg sharing: {mode} {prime}-prime impl edits retain impl prewarm"
+                held = nested_prime.returncode == 0 and "check impls prewarm: enabled;" in broad
+                checks.append((name, held, broad[-700:]))
+                print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
                 before = logs()
                 pathlib.Path(ws, "src/features.rs").write_text(nested_feature.replace("x != 0", "x != 2"))
                 _, nested_edit = side.cargo("test", "--lib")

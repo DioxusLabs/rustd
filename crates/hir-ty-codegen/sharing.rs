@@ -33,6 +33,13 @@ fn reverse_twins(
 fn decision_serial(db: &dyn HirDatabase, normal: Crate, test: Crate, both: bool) -> u128 {
     let twins = reverse_twins(db, normal, test);
     let eligibility = crate::sharing::pair_eligibility(db, normal, test, both);
+    policy_serial(twins, eligibility)
+}
+
+fn policy_serial(
+    twins: &FxHashMap<AttrDefId, AttrDefId>,
+    eligibility: &crate::sharing::Eligibility,
+) -> u128 {
     let mut twins: Vec<_> = twins.iter().map(|(&n, &t)| super::print_of(&(&t, &n))).collect();
     let mut full: Vec<_> = eligibility.candidates.iter().map(super::print_of).collect();
     let mut analysis: Vec<_> = eligibility.analysis_shared.iter().map(super::print_of).collect();
@@ -82,13 +89,22 @@ pub(super) struct Cache {
     input: Option<Sharing>,
     shared: Option<Sharing>,
     files: FxHashMap<base_db::FileId, FileFacts>,
-    changed: FxHashSet<base_db::FileId>,
+    changed: FxHashMap<base_db::FileId, Option<FxHashSet<FunctionId>>>,
+    eligibility: Vec<((Crate, Crate, bool), crate::sharing::EligibilityState)>,
 }
 
 #[derive(Default, Clone)]
 struct FileFacts {
     trees: Vec<(Crate, hir_expand::HirFileId, Option<Arc<hir_def::item_tree::ItemTree>>)>,
     bodies: Vec<(FunctionId, bool, crate::sharing::BodySharingFacts)>,
+    by_function: FxHashMap<FunctionId, usize>,
+}
+
+impl FileFacts {
+    fn push(&mut self, func: FunctionId, normal: bool, facts: crate::sharing::BodySharingFacts) {
+        self.by_function.insert(func, self.bodies.len());
+        self.bodies.push((func, normal, facts));
+    }
 }
 
 impl Cache {
@@ -96,8 +112,15 @@ impl Cache {
         *self = Self::default();
     }
 
-    pub(super) fn touch(&mut self, file: base_db::FileId) {
-        self.changed.insert(file);
+    pub(super) fn touch(&mut self, file: base_db::FileId, functions: Option<&[FunctionId]>) {
+        let functions = functions.map(|it| it.iter().copied().collect::<FxHashSet<_>>());
+        self.changed
+            .entry(file)
+            .and_modify(|was| match (was.as_mut(), functions.as_ref()) {
+                (Some(was), Some(now)) => was.extend(now),
+                _ => *was = None,
+            })
+            .or_insert(functions);
     }
 
     pub(super) fn needs_before_edit(&self, files: &[base_db::FileId]) -> bool {
@@ -131,11 +154,7 @@ impl Cache {
                 ));
             }
             if hir_def::signatures::FunctionSignature::of(db, func).has_body() {
-                facts.bodies.push((
-                    func,
-                    true,
-                    crate::sharing::body_sharing_facts(db, func, true).clone(),
-                ));
+                facts.push(func, true, crate::sharing::body_sharing_facts(db, func, true).clone());
             }
         }
         self.files.insert(file, facts);
@@ -154,16 +173,25 @@ impl Cache {
         let start = Instant::now();
         let changed = std::mem::take(&mut self.changed);
         let mut reason = "policy input changed";
-        let same = self.input.as_ref() == Some(&input)
-            && changed.iter().all(|file| {
+        let mut updates = Vec::new();
+        let mut checked = 0;
+        let mut bodies = FxHashSet::default();
+        let stable = self.input.as_ref() == Some(&input)
+            && changed.iter().all(|(file, functions)| {
                 let Some(facts) = self.files.get(file) else {
                     reason = "changed file has no retained facts";
                     return false;
                 };
+                let indexes: Vec<_> = match functions {
+                    Some(functions) => functions.iter().filter_map(|func| facts.by_function.get(func).copied()).collect(),
+                    None => (0..facts.bodies.len()).collect(),
+                };
                 facts.trees.iter().all(|(krate, file, tree)| {
                     reason = "item tree changed";
                     &hir_def::item_tree::file_item_tree_snapshot(db, *file, *krate) == tree
-                }) && facts.bodies.iter().all(|(func, normal, facts)| {
+                }) && indexes.into_iter().all(|index| {
+                    let (func, normal, facts) = &facts.bodies[index];
+                    checked += 1;
                     reason = "body facts changed";
                     let new = crate::sharing::body_sharing_facts(db, *func, *normal);
                     if new == facts {
@@ -177,11 +205,68 @@ impl Cache {
                             );
                         }
                     }
-                    false
+                    if !facts.same_structure(new) {
+                        return false;
+                    }
+                    let krate = func.krate(db);
+                    let crates: Vec<_> = input
+                        .pairs
+                        .iter()
+                        .filter(|&&(normal, _, _)| normal == krate)
+                        .flat_map(|&(normal, test, _)| [normal, test])
+                        .collect();
+                    if facts.policy_projection(db, &crates) != new.policy_projection(db, &crates) {
+                        bodies.insert(*func);
+                    }
+                    updates.push((*file, index, new.clone()));
+                    true
                 })
             });
         let validated = start.elapsed();
-        if same && let Some(shared) = &self.shared {
+        if !input.is_empty() && std::env::var_os("RUSTD_STATS").is_some() {
+            eprintln!("sharing candidates: bodies={checked}; program={program}");
+        }
+        let rejected_before: usize = self
+            .shared
+            .as_ref()
+            .into_iter()
+            .flat_map(|it| it.snapshot.iter())
+            .flat_map(|it| &it.0)
+            .map(|it| it.eligibility.rejected.len())
+            .sum();
+        let retained = if stable { self.shared.clone() } else { None };
+        let mut affected = 0;
+        let retained = retained.and_then(|mut shared| {
+            if bodies.is_empty() {
+                return Some(shared);
+            }
+            let mut policy = shared.snapshot.as_deref()?.clone();
+            let mut handled = FxHashSet::default();
+            for ((normal, test, both), state) in &mut self.eligibility {
+                let changed: Vec<_> =
+                    bodies.iter().copied().filter(|func| func.krate(db) == *normal).collect();
+                if changed.is_empty() {
+                    continue;
+                }
+                affected += state.update(db, *normal, *test, *both, &changed)?;
+                handled.extend(changed);
+                let pair = policy
+                    .0
+                    .iter_mut()
+                    .find(|pair| (pair.key.0, pair.key.1, pair.key.2) == (*normal, *test, *both))?;
+                if &pair.eligibility != state.result() {
+                    pair.eligibility = state.result().clone();
+                    pair.key.3 = policy_serial(&pair.reverse, &pair.eligibility);
+                }
+            }
+            if handled != bodies {
+                reason = "changed body is outside retained eligibility graph";
+                return None;
+            }
+            shared.snapshot = Some(Arc::new(policy));
+            Some(shared)
+        });
+        if let Some(shared) = retained {
             if std::env::var_os("RUSTD_VERIFY_FASTPATH").is_some_and(|it| it == "1") {
                 let full = input.clone().capture(db);
                 for (cached, full) in shared
@@ -203,18 +288,49 @@ impl Cache {
                 );
             }
             if !input.is_empty() && std::env::var_os("RUSTD_STATS").is_some() {
-                eprintln!("sharing fast path: unchanged facts; program={program}");
+                if bodies.is_empty() {
+                    eprintln!("sharing fast path: unchanged facts; program={program}");
+                } else {
+                    let rejected: usize = shared
+                        .snapshot
+                        .iter()
+                        .flat_map(|it| &it.0)
+                        .map(|it| it.eligibility.rejected.len())
+                        .sum();
+                    eprintln!(
+                        "sharing incremental path: bodies={} affected={affected} rejected={rejected_before}->{rejected}; program={program}",
+                        bodies.len()
+                    );
+                }
                 eprintln!("sharing validate-us: {}; program={program}", validated.as_micros());
             }
-            return shared.clone();
+            for (file, index, facts) in updates {
+                self.files.get_mut(&file).unwrap().bodies[index].2 = facts;
+            }
+            self.shared = Some(shared.clone());
+            return shared;
         }
         if !input.is_empty() && std::env::var_os("RUSTD_STATS").is_some() {
             eprintln!("sharing full path: {reason}; program={program}");
         }
         let shared = input.clone().capture(db);
         let captured = start.elapsed();
+        self.eligibility.clear();
         self.files.clear();
         if !input.is_empty() {
+            self.eligibility = input
+                .pairs
+                .iter()
+                .map(|&(normal, test, both)| {
+                    let state = crate::sharing::EligibilityState::new(db, normal, test, both);
+                    assert_eq!(
+                        state.result(),
+                        crate::sharing::pair_eligibility(db, normal, test, both),
+                        "sharing retained evaluator initialization"
+                    );
+                    ((normal, test, both), state)
+                })
+                .collect();
             let mut crates = FxHashMap::default();
             for &(normal, test, _) in &input.pairs {
                 crates.insert(normal, true);
@@ -238,11 +354,11 @@ impl Cache {
                             hir_def::item_tree::file_item_tree_snapshot(db, source, krate),
                         ));
                     }
-                    facts.bodies.push((
+                    facts.push(
                         func,
                         normal,
                         crate::sharing::body_sharing_facts(db, func, normal).clone(),
-                    ));
+                    );
                 }
             }
         }
