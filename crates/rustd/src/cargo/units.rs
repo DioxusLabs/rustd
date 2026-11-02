@@ -73,12 +73,9 @@ impl Record {
         records.iter().find(|record| record.wrote(artifact))
     }
 
-    /// Whether `artifact` is a file the unit wrote, as cargo names it: its hard link to the
-    /// file, or its copy of it, which is what cargo makes of an executable on macOS.
+    /// Whether `artifact` is a file the unit wrote, as cargo names it.
     pub(crate) fn wrote(&self, artifact: &Path) -> bool {
-        let outputs = self.outputs();
-        outputs.iter().any(|it| same_file::is_same_file(it, artifact).unwrap_or(false))
-            || outputs.iter().any(|it| is_copy(it, artifact))
+        self.outputs().iter().any(|it| is_cargos_name(artifact, it))
     }
 
     /// Every record in `dir`.
@@ -150,6 +147,33 @@ impl Record {
         !self.is_test() && self.crate_types().iter().any(|it| matches!(*it, "lib" | "rlib"))
     }
 
+    /// The C library linked of the crate as a shared one, when rustc links it.
+    pub(crate) fn shared_library(&self) -> Option<PathBuf> {
+        let kinds = self.crate_types();
+        if self.is_test() || !kinds.contains(&"cdylib") {
+            return None;
+        }
+        let (prefix, suffix) = (std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX);
+        Some(self.out_dir()?.join(format!(
+            "{prefix}{}{}{suffix}",
+            self.crate_name,
+            self.extra_filename()
+        )))
+    }
+
+    /// The archive of the crate as a static C library, when rustc writes it.
+    pub(crate) fn static_library(&self) -> Option<PathBuf> {
+        if self.is_test() || !self.crate_types().contains(&"staticlib") {
+            return None;
+        }
+        let (name, extra) = (&self.crate_name, self.extra_filename());
+        let file = match cfg!(target_env = "msvc") {
+            true => format!("{name}{extra}.lib"),
+            false => format!("lib{name}{extra}.a"),
+        };
+        Some(self.out_dir()?.join(file))
+    }
+
     pub(crate) fn is_build_script(&self) -> bool {
         self.crate_name.starts_with("build_script_")
     }
@@ -174,6 +198,8 @@ impl Record {
             let (prefix, suffix) = (std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX);
             outputs.push(out_dir.join(format!("{prefix}{name}{extra}{suffix}")));
         }
+        outputs.extend(self.shared_library());
+        outputs.extend(self.static_library());
         outputs
     }
 
@@ -286,6 +312,12 @@ pub(crate) fn collect_garbage(dir: &Path, used: &[PathBuf]) -> anyhow::Result<()
         }
     }
     Ok(())
+}
+
+/// Whether `artifact` is the file `output` as cargo names it: its hard link to the file, or
+/// its copy of it, which is what cargo makes of an executable or a C library on macOS.
+pub(crate) fn is_cargos_name(artifact: &Path, output: &Path) -> bool {
+    same_file::is_same_file(output, artifact).unwrap_or(false) || is_copy(output, artifact)
 }
 
 /// Whether one file has the bytes of the other.

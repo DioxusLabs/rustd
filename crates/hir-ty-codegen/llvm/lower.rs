@@ -180,7 +180,10 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         });
         let target = crate::mir::codegen::Target::selected().map_err(Unhandled::Llvm)?;
         let probe = target.stack_probe().map(|probe| ("probe-stack", probe));
-        for (name, value) in [("target-cpu", target.cpu())].into_iter().chain(probe) {
+        // No call becomes a jump: a backtrace shows every function on the way, as one of
+        // rustc's unoptimized builds does (backtrace's `smoke_test_frames`).
+        let attributes = [("target-cpu", target.cpu()), ("disable-tail-calls", "true")];
+        for (name, value) in attributes.into_iter().chain(probe) {
             let attribute = context.create_string_attribute(name, value);
             function.add_attribute(AttributeLoc::Function, attribute);
         }

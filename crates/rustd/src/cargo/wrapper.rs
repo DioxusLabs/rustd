@@ -117,9 +117,12 @@ mod tests {
             (vec!["lib"], false),
             (vec!["rlib"], false),
             (vec!["bin"], false),
-            (vec!["cdylib"], true),
-            (vec!["cdylib", "rlib"], true),
-            (vec!["staticlib"], true),
+            (vec!["cdylib"], false),
+            (vec!["cdylib", "rlib"], false),
+            (vec!["staticlib"], false),
+            (vec!["lib", "cdylib", "staticlib"], false),
+            (vec!["dylib"], true),
+            (vec!["dylib", "rlib"], true),
         ] {
             let mut args =
                 vec!["--crate-name", "sample", "--out-dir", "target", "--emit=link", "src/lib.rs"];
@@ -227,7 +230,7 @@ impl Unit {
             let kinds = kinds.map(|it| format!("`{}`", it[1])).collect::<Vec<_>>().join(" and ");
             format!(
                 "`{}` is built as {kinds}, which the daemon does not link yet: it builds \
-                 a `lib`, an `rlib` or a `bin` alone",
+                 a `bin` alone, or a `lib`, `rlib`, `cdylib` and `staticlib`",
                 self.crate_name
             )
         })
@@ -270,7 +273,14 @@ impl Unit {
                 stand_in.arg(self.standing_in(arg).unwrap_or_else(|| arg.clone()));
             }
         }
-        if program {
+        // A shared library is linked from rustd's objects as a program is. A static one is
+        // of the crates a shared one of the crate is linked from, which rustc's line names.
+        let library = extra.shared_library().or(extra.static_library());
+        if extra.shared_library().is_none() && library.is_some() {
+            stand_in.args(["--crate-type", "cdylib"]);
+        }
+        let linked = program || library.is_some();
+        if linked {
             stand_in.arg(format!("--print=link-args={}", line.display())).arg("-Csave-temps");
         }
         let built = stand_in.stdin(Stdio::null()).output().context("running rustc")?;
@@ -284,7 +294,7 @@ impl Unit {
 
         // The crate is not checked by rustc: the daemon's front end is what checks it, and a
         // second compile beside the daemon's would only compete with it.
-        self.record(stamp, &copies, program.then_some(line), &source)?;
+        self.record(stamp, &copies, linked.then_some(line), &source)?;
         Ok(0)
     }
 
@@ -341,9 +351,12 @@ impl Unit {
         compiled: &Path,
     ) -> anyhow::Result<()> {
         let record = self.as_record(stamp, Vec::new(), link_line.clone());
-        // The executable is the daemon's to link; of the outputs it reads the libraries.
-        let libraries =
-            record.outputs().into_iter().filter(|it| it.extension().is_some_and(|it| it == "rlib"));
+        // The executable is the daemon's to link; of the outputs it reads the libraries, and
+        // writes the static one again from rustc's.
+        let archive = record.static_library();
+        let libraries = record.outputs().into_iter().filter(|it| {
+            it.extension().is_some_and(|it| it == "rlib") || Some(it) == archive.as_ref()
+        });
         let mut originals: Vec<PathBuf> = libraries.filter(|it| it.exists()).collect();
         if let Some(line) = &link_line {
             let line = std::fs::read_to_string(line)
@@ -351,9 +364,13 @@ impl Unit {
             let args = shlex::split(&line).context("the link line is not quoted as a shell's")?;
             // `symbols.o` asks for what the program needs of the libraries after it, as the
             // panic runtime, and is gone with rustc's directory.
+            // The list of what a shared library exports is of rustc's directory too.
+            let exports = super::plan::exports_list(&args).map(|it| it.2);
             let objects = args
-                .into_iter()
+                .iter()
                 .filter(|it| it.ends_with(".rcgu.o") || it.ends_with(SYMBOLS))
+                .map(String::as_str)
+                .chain(exports)
                 .map(PathBuf::from);
             originals.extend(objects.filter(|it| it.exists()));
         }

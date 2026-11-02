@@ -59,7 +59,8 @@ pub(super) struct FunctionUnwind {
 /// tells it.
 #[derive(Debug, Clone, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
 enum Frame {
-    Cranelift(cranelift_codegen::isa::unwind::systemv::UnwindInfo),
+    /// Cranelift's rules, which are of the prologue alone, and the rules at each return.
+    Cranelift(cranelift_codegen::isa::unwind::systemv::UnwindInfo, Vec<(u32, FrameRule)>),
     Rows(FrameRows),
     Windows(seh::Frame),
 }
@@ -170,7 +171,7 @@ impl FunctionUnwind {
         table.write(&mut writer, encoding).map_err(|e| e.to_string())?;
         debug_assert!(writer.relocs.is_empty());
         Ok(Some(FunctionUnwind {
-            frame: Frame::Cranelift(info),
+            frame: Frame::Cranelift(info, at_returns(isa, code.buffer.data())),
             landing_pads: Some(writer.writer.into_vec()),
         }))
     }
@@ -193,7 +194,13 @@ impl FunctionUnwind {
     fn fde(&self, address: Address) -> Option<FrameDescriptionEntry> {
         Some(match &self.frame {
             Frame::Windows(_) => return None,
-            Frame::Cranelift(info) => info.to_fde(address),
+            Frame::Cranelift(info, returns) => {
+                let mut fde = info.to_fde(address);
+                for &(offset, rule) in returns {
+                    fde.add_instruction(offset, rule.instruction());
+                }
+                fde
+            }
             Frame::Rows(FrameRows { len, rows }) => {
                 let mut fde = FrameDescriptionEntry::new(address, *len);
                 for &(offset, rule) in rows {
@@ -203,6 +210,43 @@ impl FunctionUnwind {
             }
         })
     }
+}
+
+/// The rules at each return of `code`: the epilogue has put the frame back as it was on
+/// entry, where Cranelift's rules still find it from the frame pointer, which by then is the
+/// caller's. A profiler that samples a return unwinds to whatever the caller's frame holds
+/// there otherwise. Not on Mach-O, whose linker makes compact entries of rules of the
+/// prologue alone, as Apple's compilers write them.
+fn at_returns(isa: &dyn TargetIsa, code: &[u8]) -> Vec<(u32, FrameRule)> {
+    if isa.triple().binary_format != target_lexicon::BinaryFormat::Elf {
+        return Vec::new();
+    }
+    let (returns, entry, saved): (Vec<_>, _, &[u16]) = match isa.triple().architecture {
+        // Every epilogue of a frame is `mov %rbp, %rsp; pop %rbp`, then `ret` or `ret imm16`.
+        target_lexicon::Architecture::X86_64 => {
+            let returns = code.windows(5).enumerate().filter_map(|(at, it)| match it {
+                [0x48, 0x89, 0xec, 0x5d, 0xc3] => Some((at + 4, 1)),
+                [0x48, 0x89, 0xec, 0x5d, 0xc2] => Some((at + 4, 3)),
+                _ => None,
+            });
+            (returns.collect(), FrameRule::Cfa(7, 8), &[3, 6, 12, 13, 14, 15])
+        }
+        target_lexicon::Architecture::Aarch64(_) => {
+            let ret = 0xd65f_03c0_u32.to_le_bytes();
+            let words = code.as_chunks::<4>().0.iter().enumerate();
+            let returns = words.filter(|(_, it)| **it == ret).map(|(at, _)| (at * 4, 4));
+            let saved =
+                &[19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 72, 73, 74, 75, 76, 77, 78, 79];
+            (returns.collect(), FrameRule::Cfa(31, 0), saved)
+        }
+        _ => return Vec::new(),
+    };
+    let rows = returns.into_iter().flat_map(|(at, len)| {
+        let restore = saved.iter().map(move |&reg| (at, FrameRule::Restore(reg)));
+        let after = (at + len < code.len()).then_some((at + len, FrameRule::RestoreState));
+        [(at, FrameRule::RememberState), (at, entry)].into_iter().chain(restore).chain(after)
+    });
+    rows.map(|(at, rule)| (at as u32, rule)).collect()
 }
 
 /// The function the unwinder asks about a frame with landing pads: the program's own of that

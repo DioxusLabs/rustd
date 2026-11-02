@@ -33,6 +33,7 @@ from difftest import Fixture, RUSTD, WINDOWS, sysroot_rlibs, built
 
 LLVM = os.environ.get("RUSTD_BACKEND") == "llvm"
 DWARFDUMP = shutil.which("llvm-dwarfdump") or shutil.which("llvm-dwarfdump-20") or "/usr/lib/llvm-20/bin/llvm-dwarfdump"
+OBJDUMP = shutil.which("llvm-objdump") or shutil.which("llvm-objdump-20") or "/usr/lib/llvm-20/bin/llvm-objdump"
 PDBUTIL = shutil.which("llvm-pdbutil") or os.path.join(os.environ.get("LLVM_SYS_201_PREFIX", r"C:\llvm20"), "bin", "llvm-pdbutil.exe")
 CDB = shutil.which("cdb") or r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe"
 DEBUGGER = "cdb" if WINDOWS else "gdb"
@@ -752,10 +753,41 @@ def unwinding(tally, what, binary):
     # The row a sequence ends with is of the address past its code, where another function may begin.
     lined = sorted({int(a, 16) for a in re.findall(r"^0x([0-9a-f]{16}) +[1-9](?!.*end_sequence)", rows, re.M)})
     tally.say(f"{what}: .eh_frame and the ranges", *frames_agree(ours, ends, bare, lined))
+    returns, astray = returns_unwound(binary, ours)
+    tally.say(f"{what}: .eh_frame at the returns", "OFF THE STACK" if astray else "by the stack",
+              f"{len(astray)} of {returns} returns of rustd's functions find their frame by another register"
+              + (f": {astray[0]:#x}" if astray else ""))
     gaps = unlined(binary)
     worst = ", ".join(f"{a:#x}+{b - a}" for a, b in sorted(gaps, key=lambda gap: gap[0] - gap[1])[:3])
     tally.say(f"{what}: a line for every instruction", "NO LINE" if gaps or not ours else "all",
               f"{len(gaps)} runs of {sum(b - a for a, b in gaps)} bytes without one in {len(ours)} functions" + (f": {worst}" if gaps else ""))
+
+
+def returns_unwound(binary, ours):
+    """How many returns there are in the functions `ours`, and those where the rule `.eh_frame`
+    has for them finds the frame by other than the stack pointer. At a return the epilogue has
+    put the frame back as it was on entry, and the frame pointer is the caller's: a profiler
+    that samples a return and unwinds by it reads the caller's frame for this one's."""
+    code = subprocess.run([OBJDUMP, "-d", "--no-show-raw-insn", binary], capture_output=True, text=True).stdout
+    listed = re.findall(r"^ *([0-9a-f]+):\s+(.*)$", code, re.M)
+    # On x86-64 a return that the frame pointer was just popped ahead of, which data in the
+    # code (a table of jumps) read as instructions hardly makes. An AArch64 instruction is
+    # where its word is, and there every return is one.
+    aarch64 = open(binary, "rb").read(20)[18] == 0xb7
+    found = sorted(int(listed[i][0], 16) for i in range(2, len(listed))
+                   if re.fullmatch(r"retq?\s*", listed[i][1])
+                   and (aarch64 or any(re.match(r"popq\s+%rbp", it) for _, it in listed[i - 2:i])))
+    # A `#[naked]` function is its assembly and has no frame, which `unwinding` counts.
+    ends = frames_of(binary)
+    ranges = sorted((a, min(b, ends[a])) for a, b in ours if a in ends)
+    starts = [a for a, _ in ranges]
+    mine = [r for r in found if (i := bisect.bisect_right(starts, r) - 1) >= 0 and r < ranges[i][1]]
+    table = subprocess.run([DWARFDUMP, "--eh-frame", binary], capture_output=True, text=True).stdout
+    rows = sorted((int(a, 16), cfa) for a, cfa in re.findall(r"^  0x([0-9a-f]+): CFA=([^:\n]+)", table, re.M))
+    addresses = [a for a, _ in rows]
+    by_stack = re.compile(r"(R|W)?SP(\+\d+)?$")
+    astray = [r for r in mine if not by_stack.match(rows[bisect.bisect_right(addresses, r) - 1][1])]
+    return len(mine), astray
 
 
 def frames_agree(ours, ends, bare, lined):

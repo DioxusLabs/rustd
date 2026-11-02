@@ -1,150 +1,77 @@
 # The test suites of 1100 crates.io crates through rustd
 
-Branch `rustd-sweep-2`: `rustd-collate` at `3d47ed59bf` with `rustd-sweep-1000` (`f4fca15318`)
-merged in. Measured on one 8-core, 31 GB Linux x86-64 VM with rustc 1.99.0. This file is
-updated with each push; a section that says "in progress" has numbers from a sweep that is
-still running.
+`harness/sweep1000.txt` holds 1100 `name-version` lines: the most downloaded crates on
+crates.io, each at its newest version, as the crates.io API returned them on 2026-10-17.
+`cratesweep.sh` runs each crate's tests built by rustc and built by rustd, and compares what
+they print. `.github/workflows/sweep.yaml` runs the whole list every Sunday on 16 machines,
+under both backends.
 
 ## Where this stands
 
-Work stopped at this head on request. Done: the merges, the gate below, the fix for the one
-real miscompile the sweep had found (tracing-opentelemetry), and a harness that no longer
-reports tests that differ from run to run as mismatches. Half done: the sweep. Not started:
-the LLVM pass of the sweep.
+The last full run is of `1c918a904f` (the branch of #8, before its last commits), run
+39508254606: every crate under Cranelift and under LLVM. The rows that differed were run again
+by hand on the head of #10, under both backends; the table of causes below says what each
+came to.
 
-The gate table below is for `bf8c5edbee`, the merge. The head adds the tracing-opentelemetry
-fix (`5af7f465bf`) and the harness change. On `5af7f465bf` the whole Cranelift gate passed
-again (20 stages, breakers 130 of 130), and so did the tests of `hir-ty`, `hir-def`,
-`parser`, `syntax` and `rustd`. The LLVM gate on it was stopped after its first nine stages
-(difftest, programs, stress, breakers 130 of 130, unwinds, splices, asmedits, includes,
-worktrees), all of which passed; keys, fuzz, backends, debuginfo and the store harnesses
-were not run under LLVM on that commit. `rustd-collate-next` is not merged in.
+| | Cranelift | LLVM |
+|---|---:|---:|
+| tests print the same as under rustc | 851 | 851 |
+| differ | 10 | 9 |
+| rustc's own runs differ from each other (`UNSTABLE`) | 4 | 5 |
+| untested | 232 | 232 |
+| timed out at 20 minutes | 2 | 2 |
+| the harness failed | 1 | 1 |
+| tests run and compared | 70,288 | 70,288 |
+| functions from rustd | 369,328 of 370,137 | 369,328 of 370,137 |
 
-The sweep was started again from the first crate with the binary of `5af7f465bf` and stopped
-at 43 of 1100 crates under Cranelift: 37 match, 6 untested, none differ, 2,475 tests,
-14,152 of 14,152 functions from rustd. No crate has been run under LLVM. The larger run
-under "Totals" is of an older binary.
+What this comes to on the head of #10: every row that differed is fixed or is not rustd's,
+except the text of a failed `assert!` (num_enum, proc-macro-crate). Nothing in the run was a
+wrong result that is still open. The full sweep has not been run again on this head; the
+numbers above will move when it is.
 
-What to do next, in order: finish the LLVM gate on the head; run the sweep to the end under
-Cranelift and then LLVM (the command is at the end; it skips crates that have a status
-file); reduce whatever differs; then the open causes: the text of a failed `assert!` that
-rustc breaks over lines (num_enum, proc-macro-crate; it needs rustc's pretty printer for
-expressions), the 32 functions left to rustc listed below, and the untested crates that
-only need features turned on (tokio).
+## The rows that differed, by cause
 
-## The list
+Each was run again on the head of #10 with `cratesweep.sh`, under both backends unless the
+row says otherwise.
 
-`harness/sweep1000.txt` holds 1100 `name-version` lines: the most downloaded crates on
-crates.io, each at its newest version, as the crates.io API returned them on 2026-10-17. The
-session that started this work did not commit its list, so the numbers it reported at 550
-crates (402 match, 27 mismatch, 118 untested) were measured on a list that may differ from
-this one in versions and in order.
+| crate | backend | what differed | cause | on the head of #10 |
+|---|---|---|---|---|
+| cpp_demangle, stacker | both | tests that recurse deep on a small stack overflowed under rustd only | rustd's frames were bigger than rustc's: scalar temporaries promoted to registers kept their stack slots. cpp_demangle's recursion test needed 2.19 MB of stack under rustd against 1.42 MB under rustc | fixed in `81e1afdd52`, case `frame_of_temporaries` (a frame of 7,632 bytes, 144 now, 1,312 under rustc). cpp_demangle 57 tests, stacker 7, match |
+| jsonschema | Cranelift | three `long_ref_chain_compiles_on_small_stack` tests overflowed | the same | fixed in `81e1afdd52`; 11 binaries, 2,101 tests match |
+| curve25519-dalek | both | the test binary crashed under rustd | not bisected | matches, 109 tests |
+| ron | both | typetag's tests found nothing in their registry | two `inventory` constructors of one path in one body did not get rustc's symbols, so rustc's constructor filled a registry that rustd's code never read | fixed in `f4abc71fbd`, case in `breakers`; 73 binaries, 428 tests match |
+| scc | both | the size of four futures, 8 to 16 bytes off | a value moved out of `Some` did not leave the `Option` empty, and drop flags sat in a prefix shared by every state | fixed in #8 (`92408cb314`), after the run; 119 tests match under both. One Cranelift rerun differed the other way: rustc's own build failed `insert_prune_any_async` (a shift overflow in a tokio worker) while rustd's passed, and the next rerun matched |
+| backtrace | LLVM | frames missing from a backtrace | LLVM turned calls into jumps | fixed in `31c5193005`; 8 binaries match, `sp_smoke_test` among them |
+| crc32c, web-time | both | the build of the tests failed (`can't find bench`), or the harness did | the published package lists a bench or test file it leaves out, and test builds asked cargo for `--all-targets` | fixed in `87f91963f2`; crc32c 3 tests match. web-time builds now, and its one test binary runs no test on Linux, so it is untested |
+| zbus | both | the unit tests crashed under rustd (SIGSEGV) in their first test | not bisected | matches under both: 11 binaries, 249 tests. The `e2e` test names `zbus_xml`, which the published crate does not depend on, so cargo builds it for neither side |
+| num_enum, proc-macro-crate | both | the text of a failed `assert!`; the tests run cargo on a manifest the published crate leaves out, so they fail under both | rustc prints the condition as its pretty printer breaks it over lines, rustd prints it on one line | open: breakers `assert_message` and `assert_long_expression` |
+| base64 | both | timed out at 20 minutes | its unit tests are slow in a debug build: the run on the head of #10 took 33 minutes for both builds, and which build is the slow one was not measured | matches under Cranelift with a longer limit: 3 binaries, 13 tests |
+| aws-sdk-s3 | both | timed out at 20 minutes | each test binary takes all 19,598 functions of the crate from rustd and there are many of them; one (`aws_chunked`) does not build under cargo either | not rustd; it needs a longer limit to finish |
 
-## The gate at the merge
+The `UNSTABLE` rows (colored, openssl, procfs, semver-parser, and os_pipe under LLVM) print
+something else in different runs of rustc's own binary, so the sweep does not compare them.
 
-Every harness below was run under Cranelift and then under LLVM (`RUSTD_OPT=2 RUSTD_EMIT=fast`)
-on the merge with `rustd-collate` at `3d47ed59bf` (`bf8c5edbee`), one backend at a time, with the binary of
-`LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo build -p rustd --release --features llvm`.
+## Functions left to rustc
 
-| harness | Cranelift | LLVM |
-|---|---|---|
-| `difftest.py corpus --bin runner --crate cases --layouts` | match, 0 of 893 layouts differ | match, 0 of 893 |
-| `programs.py` | 22 of 22 | 22 of 22 |
-| `stress.py` | 99 of 99, 0 restarts | 99 of 99, 0 restarts |
-| `breakers.py` | 129 of 129, 7 open or left to rustc, 0 skipped | 129 of 129, 7 open or left to rustc, 0 skipped |
-| `unwinds.py` | 8 of 8 | 8 of 8 |
-| `RUSTD_SPLICE=1 splices.py` | 71 of 71 | 71 of 71 |
-| `asmedits.py` | 10 of 10 | 10 of 10 |
-| `includes.py` | 9 of 9 | 9 of 9 |
-| `RUSTD_SPLICE=1 worktrees.py` | 62 of 62 | 62 of 62 |
-| `keys.py` | 46 of 46 | 46 of 46 |
-| `fuzz/fuzz.py smoke` | 2 programs, 505 functions, 0 differences | 2 programs, 505 functions, 0 differences |
-| `backends.py corpus runner cases --bin runner --levels 2f` | (LLVM only) | prints the same as cargo's |
-| `debuginfo.py` | all right | all right |
-| `buildmodel.py` | 194 of 194 | (runs both) |
-| `storekills.py --kills 100` | pass | pass |
-| `storecorrupts.py --rounds 4` | pass | pass |
-| `storefull.py` | pass | pass |
-| `storeshared.py` | pass, 180 builds | pass, 180 builds |
-| `storeguards.py` | all right | all right |
-| `selects.py` | 3 of 3 | 3 of 3 |
-| `cargo_rustd.py --small` | pass | (Cranelift leg only) |
-
-`cargo fmt --all -- --check` is clean and `cargo test --release -p hir-ty -p hir-def -p parser
--p syntax -p rustd` passes.
-
-Not run: `remote.py` (no minio on this machine) and `worktrees.py --join --together` and
-`--overlay`. `cargo_rustd.py --small` did not finish on the previous push (it sat idle at
-ripgrep's cold build and was stopped); it passes on this one, in 196 seconds, and the stall
-has not been seen again or explained.
-
-Clippy (`cargo clippy -p rustd --all-targets -- --cap-lints warn`) was compared with
-`rustd-collate` at `f191c6e42a` on the previous push: the same 97 kinds of warning, three more
-instances, two of which are fixed here. It was not compared again after the later merges.
-
-Where `rustd-collate` and this branch had fixed the same thing, one fix was kept:
-
-| what | kept | case |
-|---|---|---|
-| An alias that names the lifetime of a binder around it, in monomorphization | `rustd-collate`'s: normalize with placeholders and put the bound lifetimes back | `alias_under_binder` (collate's) and `alias_under_binder_projection` (this branch's, renamed) |
-| A variant reexported through a private import of its enum | this branch's: the visibility the enum is declared with, kept by the module scope | both `nameres` tests, `variant_alias_reexported` and `variant_reexported_through_private_enum_import` |
-| A tuple struct's constructor as a promotable aggregate | identical in both | `promoted_constructor` |
-
-An unset `env!` variable both records the read for the build key (collate's) and is an
-expansion error (this branch's). The file name under a stable name goes through collate's
-`stored` (a path under cargo's home is named the same on every machine), inside this branch's
-`file_name`.
-
-The open breakers are `raw_write_then_match`, `future_unwind_flags`,
-`fragment_edition_through_macro`, `assert_long_expression` and `assert_message`; rustd
-prints something else than rustc in each. `caller_in_constant` and `empty_array_by_impl` are
-left to rustc with a reason. `unreachable_arm_move` was fixed in `rustd-collate`.
-
-## Totals
-
-In progress, and not a result for this head. What follows is the Cranelift sweep on the
-binary of an earlier push (`a9b62fbfce`), stopped at 578 of the 1100 crates for this merge.
-It is run again from the first crate on this head, and LLVM after it.
-
-| | Cranelift, 578 of 1100 crates |
-|---|---|
-| tests print the same as under rustc | 443 |
-| differ | 8 |
-| untested | 126 |
-| timed out at 25 minutes | 1 (base64) |
-| tests run and compared | 36,880 |
-| functions from rustd | 130,580 of 130,612 |
-
-The 32 functions left to rustc:
+809 of 370,137, the same under both backends. 617 of them are left only because they share an
+`async` block with a function that is (zbus, async-process). The rest, by reason:
 
 | reason | functions | crates |
-|---|---|---|
-| `UnresolvedMethod`, and two layouts of `GenericArray` (the next-solver cause `harness/BREAKERS.md` has as open) | 15 | generic-array |
-| `MissingFunctionDefinition` | 6 | ring |
-| `NotSupported` | 4 | encode_unicode, ring |
+|---|---:|---|
+| `TypeId` of a type rustd does not hash as rustc does | 56 | zbus, error_chain, rusty-fork, typeid, wit-component |
+| `mir: UnresolvedMethod` | 33 | generic-array, html5ever, markup5ever, procfs |
+| a writable static without a rustc symbol (`DTORS`, `GLOBAL_PANIC_COUNT`, `__CALLSITE` and others) | 34 | async-process, zbus |
+| `mir: MissingFunctionDefinition` | 17 | async-process, ring, wide |
+| `mir: HasErrors` | 14 | html5ever, markup5ever, structopt |
+| `mir: NotSupported` | 7 | bigdecimal, html5ever, ring, zbus |
+| `mir: IncompleteExpr`, `mir: UnsizedTemporary` | 8 | zvariant |
+| a call to a trait method with no body and no rustc symbol, a builtin `Clone`, or the `fmt` of a vtable | 12 | html5ever, markup5ever |
 | LLVM intrinsic `x86.aesni.aeskeygenassist` | 3 | aes |
 | calling convention `EfiApi` | 3 | r-efi |
-| layout of an array | 1 | wit-bindgen |
+| a layout (`GenericArray`, an alias, an array) | 4 | generic-array, ron, wit-bindgen |
+| `mir: UnresolvedName` | 1 | pyo3 |
 
-The 8 that differed, by cause:
-
-| crate | what differed | cause | state |
-|---|---|---|---|
-| tracing-opentelemetry | `layer::tests::otel_context_propagation` failed under rustd only: a span id that should be zero was not | statics of one name from a macro reached through an import in a `#[test]` function were numbered in another order than rustc's, so a callsite got the metadata of another | fixed in `5af7f465bf`; cases `late_import_in_body`, `static_in_static` and `blanket/tests/late_import_in_test.rs`. All 50 tests print the same and every function is rustd's |
-| jobserver | `make-as-a-client` prints the path it runs from | rustd's binary is named `<rustc's>-rustd` | the harness now reads that name as rustc's; matches |
-| num_enum, proc-macro-crate | the text of a failed `assert!` over several lines (the tests run cargo on a manifest the published crate does not have, so they fail under both) | rustd prints the expression on one line, rustc as its pretty printer breaks it | open: breakers `assert_message` and `assert_long_expression` |
-| sysinfo | `check_refresh_process_update` fails under rustc and passes under rustd | the test counts processes of the machine; it matches when run again | not rustd |
-| hyper-timeout | `test_upload_timeout` | a timeout test; it matches when run again | not rustd |
-| openssl | a random MIME boundary and port numbers in what four failing tests print | differs between two runs of rustc's binary | not rustd |
-| semver-parser | a test that fails under both and prints how long it took | differs between two runs of rustc's binary | not rustd |
-
-`cratetest.py` now runs rustc's binary three more times when a crate differs. If those runs
-do not print the same, the crate is reported as `UNSTABLE` rather than as a mismatch, and
-`sweepreport.py` shows it as such. openssl and semver-parser are reported that way now.
-
-Of the 126 untested, 83 have no test binary at all (no tests, or the tests do not build under
-cargo either) and 42 have one in which no function of the crate is reached. tokio is the last:
-171 test binaries, all left out because they need features that are off by default.
+`harness/sweepreport.py <dir>` prints this list from a sweep's directory.
 
 ## How to rerun
 

@@ -95,7 +95,8 @@ them is built by cargo instead.
 | `RUSTC_WORKSPACE_WRAPPER` set to another wrapper | `cargo rustd` does not run rustc through it |
 | `rustd-rustc` or `rustd-rustc-first` missing | `rustd-rustc` (or `rustd-rustc-first`) is not installed next to `rustd` |
 | a toolchain other than the one rustd is pinned to | rustc 1.x is not the 1.99.0 this rustd compiles for |
-| a workspace crate built as `cdylib`, `dylib`, `staticlib`, or as more than one crate type | the daemon builds a `lib`, an `rlib` or a `bin` alone |
+| a workspace crate built as `dylib`, or as a `bin` and another crate type | the daemon builds a `bin` alone, or a `lib`, `rlib`, `cdylib` and `staticlib` |
+| a workspace `staticlib` on Windows | rustd does not write a static library for `link.exe` yet |
 | a workspace in which every crate is a build script's, a proc macro or a dependency of one | the daemon builds none of those yet |
 | `lto`, coverage or profiling flags, and what else `plan.rs` refuses | the reason, per program |
 | source in which rust-analyzer finds an error | `path:line:column: message [E0308]` |

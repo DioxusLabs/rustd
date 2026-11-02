@@ -188,7 +188,7 @@ which 92 were supported and 5 refused.
 | `panic = "abort"` | supported | unverified |
 | `lto = true`, `lto = "thin"` | refused: rustc recompiles the whole program at link time and leaves no library to link rustd's functions against | fails the build |
 | `lto = "off"` | supported | unverified |
-| crate types `bin`, `lib`, `rlib`, `dylib`, `cdylib`, `staticlib` | supported | programs only; a `cdylib` or `staticlib` that is not linked into an executable has nothing to splice into |
+| crate types `bin`, `lib`, `rlib`, `cdylib`, `staticlib` | supported; a `dylib` is refused, and so is a `staticlib` on Windows | programs only: a `cdylib` is linked again in full after an edit, and a `staticlib` written again |
 | proc macros (attribute, derive, function-like) | supported: rustc's build of the macro is loaded and its expansion is compiled by rustd | served; the proc-macro crate itself is rustc's, and an edit to it has cargo rebuild it before the daemon reloads |
 | build scripts (`rerun-if-changed`, `rerun-if-env-changed`, `rustc-cfg`, `rustc-env`, `rustc-link-lib`, `OUT_DIR`, `links`) | supported | served; the script is rustc's, and a change to it or its inputs has cargo run it again before the daemon reloads |
 | unit tests, integration tests, examples, benches | supported | examples served; tests and benches fail the build (`--doc` aside) |

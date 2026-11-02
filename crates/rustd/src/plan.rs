@@ -472,8 +472,11 @@ impl Plan {
         command.args(["build", "--unit-graph", "-Z", "unstable-options"]);
         command.arg("--manifest-path").arg(manifest);
         command.args(selection.flags());
+        // Tests bring in the dev-dependencies as benches and examples do. A published
+        // package may list a bench or an example whose file it left out, which only a build
+        // that has it fails on, as `cargo test` does not.
         if selection.dev_deps {
-            command.arg("--all-targets");
+            command.arg("--tests");
         }
         let output = command.output().context("running `cargo build`")?;
         anyhow::ensure!(

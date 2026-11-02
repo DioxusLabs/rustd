@@ -229,7 +229,7 @@ These fail the build with an error that names them; `cargo rustd` hands nothing 
 - `lto = true` or `"thin"`;
 - more than one `--target`, a JSON `--message-format`, `-Z` flags, and a
   `RUSTC_WORKSPACE_WRAPPER` that names another wrapper;
-- workspace crates built as `cdylib`, `dylib` or `staticlib`.
+- workspace crates built as `dylib`, and a `staticlib` for Windows.
 
 Plain cargo after `rustd enable` fails at the first crate of a workspace and names the
 `cargo rustd` command that builds it; rustc never compiles the workspace.

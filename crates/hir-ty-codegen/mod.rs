@@ -2895,6 +2895,7 @@ fn compile<'db>(
         if *PROMOTE {
             promote::promote(&mut ctx.func, cg.named_slots());
         }
+        promote::empty_unused(&mut ctx.func, cg.named_slots());
         Result::Ok(ctx)
     })?;
     let code = match cg.naked.take() {
@@ -4623,8 +4624,15 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         // Not shared with equal data: a static has an address of its own. Known before its
         // value is: what the value points to may point back at the static.
         let thread_local = is_thread_local(db, id);
+        // One `#[no_mangle]` or `#[export_name]` names is looked up by that name, as by the
+        // user of a C library.
+        let extern_ = StaticSignature::of(db, id).flags.contains(StaticFlags::EXTERN);
+        let exported = static_symbol(db, id).filter(|_| !extern_ && !thread_local);
         let data = if let Some(known) = again {
-            self.module.declare_data(&known.symbol, Linkage::Hidden, compiled.writable, false)?
+            let linkage = if exported.is_some() { Linkage::Export } else { Linkage::Hidden };
+            self.module.declare_data(&known.symbol, linkage, compiled.writable, false)?
+        } else if let Some(name) = &exported {
+            self.module.declare_data(name.as_str(), Linkage::Export, compiled.writable, false)?
         } else if self.patching || thread_local {
             // Nothing else defines the statics of a program compiled to WebAssembly, and
             // under its own name a static is the same one after a build in full.

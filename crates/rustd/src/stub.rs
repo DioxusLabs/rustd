@@ -98,14 +98,18 @@ fn stand_in(args: &[OsString]) -> Option<(usize, String)> {
 }
 
 /// Whether rustc is asked for a program and nothing else, a test executable being one.
-/// `None` when it is asked for neither that nor a Rust library alone: nothing stands in
-/// for the crate then.
+/// `Some(false)` is a library of the kinds the daemon builds: a Rust library and the C
+/// libraries linked of the same crate. `None` when it is asked for neither: nothing stands
+/// in for the crate then.
 pub(crate) fn is_program<S: AsRef<str>>(args: &[S]) -> Option<bool> {
     let kinds = args.windows(2).filter(|it| it[0].as_ref() == "--crate-type");
-    match *kinds.map(|it| it[1].as_ref()).collect::<Vec<_>>() {
+    let kinds: Vec<&str> = kinds.map(|it| it[1].as_ref()).collect();
+    match *kinds {
         // Cargo names no type for a test target, which is a program to rustc.
         ["bin"] | [] => Some(true),
-        ["lib" | "rlib"] => Some(false),
+        _ if kinds.iter().all(|it| matches!(*it, "lib" | "rlib" | "cdylib" | "staticlib")) => {
+            Some(false)
+        }
         _ => None,
     }
 }
