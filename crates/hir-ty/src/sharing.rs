@@ -1218,9 +1218,12 @@ fn impl_safety(db: &dyn HirDatabase, normal: Crate, test: Crate, local: bool) ->
                 let twins = twin_index(db, normal, test);
                 twins.cfg_differing_items.contains(&item) || twins.unknown_items.contains(&item)
             };
-            if bad {
+            if bad && !local {
                 veto.insert("impl-cfg-unknown");
             }
+            continue;
+        }
+        if local && test_only_impl_is_anchored(db, normal, test, id) {
             continue;
         }
         let self_ty = db.impl_self_ty(id).skip_binder();
@@ -1276,6 +1279,47 @@ fn impl_safety(db: &dyn HirDatabase, normal: Crate, test: Crate, local: bool) ->
     let mut veto: Vec<_> = veto.into_iter().collect();
     veto.sort_unstable();
     veto
+}
+
+/// Whether the declaration graph sees a test-only impl: its trait or a type it mentions has a
+/// twin, whose impl comparison then fails and makes the users of that declaration unstable.
+fn test_only_impl_is_anchored(
+    db: &dyn HirDatabase,
+    normal: Crate,
+    test: Crate,
+    id: ImplId,
+) -> bool {
+    struct Anchored<'a, 'db> {
+        db: &'db dyn HirDatabase,
+        normal: Crate,
+        test: Crate,
+        found: &'a mut bool,
+    }
+    impl<'db> TypeVisitor<DbInterner<'db>> for Anchored<'_, 'db> {
+        type Result = ();
+        fn visit_ty(&mut self, ty: Ty<'db>) {
+            if let TyKind::Adt(def, _) = ty.kind() {
+                let item = AttrDefId::from(def.def_id());
+                *self.found |= item.module(self.db).krate(self.db) == self.test
+                    && hir_def::twins::declaration_twin(self.db, self.normal, self.test, item)
+                        .is_some();
+            }
+            ty.super_visit_with(self);
+        }
+    }
+    let Some(trait_ref) = db.impl_trait(id) else {
+        return true;
+    };
+    let trait_ref = trait_ref.skip_binder();
+    let trait_item = AttrDefId::from(trait_ref.def_id.0);
+    if trait_item.module(db).krate(db) == test
+        && hir_def::twins::declaration_twin(db, normal, test, trait_item).is_some()
+    {
+        return true;
+    }
+    let mut found = false;
+    trait_ref.visit_with(&mut Anchored { db, normal, test, found: &mut found });
+    found
 }
 
 #[salsa::tracked(returns(copy))]
@@ -1784,6 +1828,20 @@ fn local_declaration(
     LocalDeclaration { stable: true, edges }
 }
 
+fn local_item_name(db: &dyn HirDatabase, item: AttrDefId) -> String {
+    use crate::next_solver::SolverDefId;
+    match item {
+        AttrDefId::FunctionId(id) => format!("{:?}", SolverDefId::from(id)),
+        AttrDefId::AdtId(id) => format!("{:?}", SolverDefId::from(id)),
+        AttrDefId::ConstId(id) => format!("{:?}", SolverDefId::from(id)),
+        AttrDefId::StaticId(id) => format!("{:?}", SolverDefId::from(id)),
+        AttrDefId::TraitId(id) => format!("{:?}", SolverDefId::from(id)),
+        AttrDefId::TypeAliasId(id) => format!("{:?}", SolverDefId::from(id)),
+        AttrDefId::ImplId(id) => format!("impl {:?}", db.impl_self_ty(id).skip_binder()),
+        _ => format!("{item:?}"),
+    }
+}
+
 /// The declarations that fail their own comparison, for diagnostics.
 pub fn local_unstable_seeds(db: &dyn HirDatabase, normal: Crate, test: Crate) -> Vec<String> {
     let mut seen = FxHashSet::default();
@@ -1818,7 +1876,7 @@ pub fn local_unstable_seeds(db: &dyn HirDatabase, normal: Crate, test: Crate) ->
                     }
                 }
             };
-            seeds.push(format!("{reason} {item:?}"));
+            seeds.push(format!("{reason} {}", local_item_name(db, item)));
         }
         pending.extend(fact.edges.iter().copied());
     }
@@ -1894,6 +1952,9 @@ fn local_facts(
     if local_impl_mismatch(db, normal, test, item) {
         return Err(LocalRejection::ImplMismatch);
     }
+    if !local_scope_traits_stable(db, normal, test, item, twin) {
+        return Err(LocalRejection::Signature);
+    }
     let refs = references(db, item, !matches!(item, AttrDefId::StaticId(_)));
     if refs.unknown && !refs.generic_unresolved {
         return Err(LocalRejection::Unknown);
@@ -1916,6 +1977,77 @@ fn local_facts(
         }
     }
     Ok(refs)
+}
+
+/// Method probing considers every trait in scope, including ones the chosen method does not
+/// come from, so a trait that gained an impl can change a body that never names it.
+fn local_scope_traits_stable(
+    db: &dyn HirDatabase,
+    normal: Crate,
+    test: Crate,
+    item: AttrDefId,
+    twin: AttrDefId,
+) -> bool {
+    let module_scope = local_module_traits_stable(db, normal, test, item.module(db), twin.module(db));
+    let body_owner = |item| match item {
+        AttrDefId::FunctionId(id) => Some(DefWithBodyId::from(id)),
+        AttrDefId::ConstId(id) => Some(id.into()),
+        AttrDefId::StaticId(id) => Some(id.into()),
+        _ => None,
+    };
+    if !module_scope {
+        return false;
+    }
+    let (Some(own), Some(other)) = (body_owner(item), body_owner(twin)) else {
+        return true;
+    };
+    let block_traits = |owner| -> Vec<TraitId> {
+        let body = hir_def::expr_store::Body::of(db, owner);
+        body.blocks(db)
+            .flat_map(|(_, def_map)| def_map.modules(db))
+            .flat_map(|(_, module)| module.traits_in_scope(db))
+            .collect()
+    };
+    local_traits_stable(db, normal, test, &block_traits(own), &block_traits(other))
+}
+
+#[salsa::tracked(returns(copy))]
+fn local_module_traits_stable(
+    db: &dyn HirDatabase,
+    normal: Crate,
+    test: Crate,
+    own: hir_def::ModuleId,
+    other: hir_def::ModuleId,
+) -> bool {
+    let traits = |module: hir_def::ModuleId| -> Vec<TraitId> {
+        hir_def::resolver::HasResolver::resolver(module, db).traits_in_scope(db).into_iter().collect()
+    };
+    local_traits_stable(db, normal, test, &traits(own), &traits(other))
+}
+
+fn local_traits_stable(
+    db: &dyn HirDatabase,
+    normal: Crate,
+    test: Crate,
+    own: &[TraitId],
+    other: &[TraitId],
+) -> bool {
+    let unstable = local_unstable(db, normal, test);
+    let mut mapped = FxHashSet::default();
+    for &id in other {
+        let item = AttrDefId::from(id);
+        if item.module(db).krate(db) != test {
+            mapped.insert(id);
+        } else if let Some(AttrDefId::TraitId(id)) =
+            hir_def::twins::declaration_twin(db, normal, test, item)
+        {
+            mapped.insert(id);
+        } else {
+            return false;
+        }
+    }
+    let own: FxHashSet<_> = own.iter().copied().collect();
+    own == mapped && !own.iter().any(|&id| unstable.contains(&AttrDefId::from(id)))
 }
 
 #[salsa::tracked(returns(copy))]
