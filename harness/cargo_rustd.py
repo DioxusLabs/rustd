@@ -1190,6 +1190,59 @@ def incremental(work):
     checks.append(("incremental: a test that aborts is listed among the failures", held, ""))
     side.cargo("stop")
     checks.extend(memory_cache(work))
+    checks.extend(foreign_generics(work))
+    return checks
+
+
+FOREIGN_GENERICS_LIB = """use std::cmp::Ordering;
+pub struct Local(pub u32);
+impl Drop for Local { fn drop(&mut self) { assert!(self.0 < 10); } }
+#[derive(PartialEq, Eq)]
+pub struct Key(pub u32);
+impl PartialOrd for Key { fn partial_cmp(&self, other: &Key) -> Option<Ordering> { Some(self.cmp(other)) } }
+impl Ord for Key { fn cmp(&self, other: &Key) -> Ordering { self.0.cmp(&other.0) } }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test] fn closure() { assert_eq!(Some(1u32).map(|it| it + 1), Some(2)); }
+    #[test] fn dropped() { drop(vec![Local(1)]); }
+    #[test] fn sorted() { let mut keys = vec![Key(2), Key(1)]; keys.sort(); assert_eq!(keys[0].0, 1); }
+    #[test] fn plain() { let mut all = vec![2u32, 1]; all.sort(); assert_eq!(Some(1u32).map(|it| it * 1), Some(all[0])); }
+}
+"""
+
+
+def foreign_generics(work):
+    """Code of std instantiated with what the checkout wrote is edited with it, and of nothing
+    else is not."""
+    ws = os.path.realpath(os.path.join(work, "foreign-generics"))
+    lib = os.path.join(ws, "src/lib.rs")
+    os.makedirs(os.path.dirname(lib), exist_ok=True)
+    open(os.path.join(ws, "Cargo.toml"), "w").write('[package]\nname = "foreign-generics"\nversion = "0.1.0"\nedition = "2021"\n')
+    open(lib, "w").write(FOREIGN_GENERICS_LIB)
+    side = Side(ws, base_env(os.path.join(work, "home-foreign-generics")), True)
+    every, checks = {"closure", "dropped", "sorted", "plain"}, []
+
+    def step(name, find, replace, ran_again, failed=()):
+        text = open(lib).read()
+        if find:
+            assert find in text, find
+            open(lib, "w").write(text.replace(find, replace))
+        _, ran = side.cargo("test")
+        results = dict(re.findall(r"^test tests::(\w+) \.\.\. (.+)$", ran.stdout, re.M))
+        again = {it for it, result in results.items() if not result.endswith("(cached)")}
+        failing = {it for it, result in results.items() if result.startswith("FAILED")}
+        held = set(results) == every and again == set(ran_again) and failing == set(failed)
+        checks.append((f"foreign generics: {name}", held, f"ran {sorted(again)}, failed {sorted(failing)}"))
+        print(f"  {'ok ' if held else 'NOT'} foreign generics: {name}  ran {sorted(again)}, failed {sorted(failing)}", flush=True)
+
+    step("the first run runs every test", None, None, every)
+    step("a closure std calls", "it + 1", "it + 2", ["closure"], failed=["closure"])
+    step("the same closure again", "it + 2", "it + 1", ["closure"])
+    step("a drop std's drop glue calls", "self.0 < 10", "self.0 < 1", ["dropped"], failed=["dropped"])
+    step("the same drop again", "self.0 < 1)", "self.0 < 10)", ["dropped"])
+    step("a comparison std's sort calls", "self.0.cmp(&other.0)", "other.0.cmp(&self.0)", ["sorted"], failed=["sorted"])
+    side.cargo("stop")
     return checks
 
 

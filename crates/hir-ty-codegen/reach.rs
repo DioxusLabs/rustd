@@ -17,6 +17,7 @@ use crate::{db::HirDatabase, traits::StoredParamEnvAndCrate};
 use super::{
     CodegenError, Instance, InstanceDef, compiled_instance, compiled_root, compiled_static,
     fragment::{DataRequest, FuncTarget, Requests},
+    home::mentioned_crates,
     instance_serial, is_thread_local,
     patch::Mark,
     print_of, root_serial, static_serial,
@@ -169,9 +170,8 @@ impl Graph {
         funcs.chain(statics).collect()
     }
 
-    /// Whether the node is of a crate no edit reaches, and of nothing else: a function
-    /// without type arguments, or a static. What it calls is then of such crates too,
-    /// unless it was handed it when the program ran, by code that is a node of its own.
+    /// Whether the node is of crates no edit reaches, and of nothing else. What it calls is
+    /// then of such crates too, unless it was handed it when the program ran, by code that is a node of its own.
     fn settled(&self, db: &dyn HirDatabase, node: &Node) -> bool {
         let krate = match node {
             Node::Root(func) => func.krate(db),
@@ -180,7 +180,14 @@ impl Graph {
             {
                 func.krate(db)
             }
-            Node::Instance(..) => return false,
+            // Its code comes of what its name mentions, and an edit can't add an impl that
+            // only those crates can hold.
+            Node::Instance(instance, env) => {
+                return !self.edited.contains(&env.krate)
+                    && env.param_env(db).clauses.is_empty()
+                    && mentioned_crates(db, instance)
+                        .is_some_and(|it| it.is_disjoint(&self.edited));
+            }
             Node::Static(id) => id.krate(db),
         };
         !self.edited.contains(&krate)
