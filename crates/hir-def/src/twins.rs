@@ -406,6 +406,32 @@ fn collect(db: &dyn SourceDatabase, map: &DefMap, items: &mut CrateItems) {
 pub fn declaration_items(db: &dyn SourceDatabase, krate: Crate) -> CrateItems {
     let mut items = CrateItems::default();
     collect(db, crate_def_map(db, krate), &mut items);
+    // `const _: () = { .. }` is how derives scope their impls, which are visible crate-wide.
+    let mut seen = FxHashSet::default();
+    loop {
+        let pending: Vec<_> = items
+            .items
+            .iter()
+            .copied()
+            .filter(|&item| match item {
+                AttrDefId::ConstId(id) => {
+                    crate::signatures::ConstSignature::of(db, id).name.is_none()
+                }
+                _ => false,
+            })
+            .filter_map(body)
+            .filter(|&owner| seen.insert(owner))
+            .collect();
+        if pending.is_empty() {
+            break;
+        }
+        for owner in pending {
+            let inventory = body_inventory(db, owner);
+            items.items.extend(&inventory.items);
+            items.scopes.extend(&inventory.scopes);
+            items.definitions.extend(inventory.definitions.iter().map(|(&k, &v)| (k, v)));
+        }
+    }
     items
 }
 
@@ -558,6 +584,42 @@ pub fn declaration_twin(
         && item_kind(db, twin) == item_kind(db, item)
         && matcher.origins(twin, item))
     .then_some(twin)
+}
+
+/// Which step of `declaration_twin` failed, for diagnostics.
+pub fn declaration_twin_failure(
+    db: &dyn SourceDatabase,
+    normal: Crate,
+    test: Crate,
+    item: AttrDefId,
+) -> &'static str {
+    if normal == test || normal.root_file_id(db) != test.root_file_id(db) {
+        return "crate";
+    }
+    let module = item.module(db);
+    let Some(target) =
+        declaration_scope_pairs(db, normal, test).iter().find_map(|&(n, t)| (t == module).then_some(n))
+    else {
+        return if module.block(db).is_some() { "block-scope" } else { "module-scope" };
+    };
+    let Some(key) = source_key(db, item) else { return "source-key" };
+    let Some(candidates) = declarations_by_source(db, target).get(&key) else {
+        return "no-candidate";
+    };
+    let &[twin] = candidates.as_slice() else { return "ambiguous" };
+    if item_kind(db, twin).is_none() || item_kind(db, twin) != item_kind(db, item) {
+        return "kind";
+    }
+    let mut matcher = CallMatcher {
+        db,
+        normal,
+        test,
+        definitions: declaration_definitions(db, normal, test),
+        calls: FxHashMap::default(),
+        active: FxHashSet::default(),
+        pending: Vec::new(),
+    };
+    if matcher.origins(twin, item) { "matched" } else { "origins" }
 }
 
 #[salsa::tracked(returns(ref))]

@@ -596,6 +596,11 @@ impl<'db> TypeVisitor<DbInterner<'db>> for Collector<'db> {
         if !self.seen.insert(ty) {
             return;
         }
+        // Instantiating where-clauses can grow types without bound; give up rather than overflow.
+        if self.type_depth > 64 || self.seen.len() > 16_384 {
+            self.result.unknown = true;
+            return;
+        }
         self.type_depth += 1;
         match ty.kind() {
             TyKind::Adt(adt, args) => {
@@ -1404,6 +1409,24 @@ fn same_signature_mode(
         fn cx(&self) -> DbInterner<'db> {
             self.interner
         }
+        fn fold_binder<T>(
+            &mut self,
+            binder: rustc_type_ir::Binder<DbInterner<'db>, T>,
+        ) -> rustc_type_ir::Binder<DbInterner<'db>, T>
+        where
+            T: TypeFoldable<DbInterner<'db>>,
+        {
+            use crate::next_solver::{BoundRegionKind, BoundVarKinds, BoundVariableKind};
+            let vars = BoundVarKinds::new_from_iter(
+                binder.bound_vars().iter().map(|var| match var {
+                    BoundVariableKind::Region(BoundRegionKind::Named(_)) => {
+                        BoundVariableKind::Region(BoundRegionKind::Anon)
+                    }
+                    var => var,
+                }),
+            );
+            rustc_type_ir::Binder::bind_with_vars(binder.skip_binder().fold_with(self), vars)
+        }
         fn fold_region(
             &mut self,
             region: crate::next_solver::Region<'db>,
@@ -1438,6 +1461,7 @@ fn same_signature_mode(
             value.super_fold_with(self)
         }
         fn fold_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
+            use rustc_type_ir::inherent::Ty as _;
             if let TyKind::Param(p) = ty.kind()
                 && let Some(parent) = self.parent(p.id.parent())
             {
@@ -1481,6 +1505,83 @@ fn same_signature_mode(
             {
                 return Ty::new_adt(self.interner, n, args.fold_with(self));
             }
+            if let TyKind::Alias(mut alias) = ty.kind()
+                && let AliasTyKind::Projection { def_id } = alias.kind
+                && let Some(AttrDefId::TypeAliasId(mapped)) = self.item(def_id.0.into())
+            {
+                alias.kind = rustc_type_ir::AliasTyKind::new_from_def_id(self.interner, mapped.into());
+                alias.args = alias.args.fold_with(self);
+                return Ty::new(self.interner, TyKind::Alias(alias));
+            }
+            if let TyKind::FnDef(def, args) = ty.kind() {
+                let mapped = match def.0 {
+                    CallableDefId::FunctionId(id) => match self.item(id.into()) {
+                        Some(AttrDefId::FunctionId(id)) => Some(CallableDefId::FunctionId(id)),
+                        _ => None,
+                    },
+                    CallableDefId::StructId(id) => match self.item(AdtId::StructId(id).into()) {
+                        Some(AttrDefId::AdtId(AdtId::StructId(id))) => {
+                            Some(CallableDefId::StructId(id))
+                        }
+                        _ => None,
+                    },
+                    CallableDefId::EnumVariantId(id) => match self.item(id.into()) {
+                        Some(AttrDefId::EnumVariantId(id)) => {
+                            Some(CallableDefId::EnumVariantId(id))
+                        }
+                        _ => None,
+                    },
+                };
+                if let Some(mapped) = mapped {
+                    return Ty::new_fn_def(self.interner, mapped.into(), args.fold_with(self));
+                }
+            }
+            if let TyKind::Dynamic(bounds, region) = ty.kind() {
+                use crate::next_solver::{BoundExistentialPredicates, ExistentialPredicate};
+                let interner = self.interner;
+                let region = region.fold_with(self);
+                let predicates: Vec<_> = bounds
+                    .iter()
+                    .map(|bound| {
+                        bound.map_bound(|pred| {
+                            let mut pred = pred.fold_with(self);
+                            match &mut pred {
+                                ExistentialPredicate::Trait(tr) => {
+                                    if let Some(AttrDefId::TraitId(id)) =
+                                        self.item(tr.def_id.0.into())
+                                    {
+                                        tr.def_id = id.into();
+                                    }
+                                }
+                                ExistentialPredicate::AutoTrait(id) => {
+                                    if let Some(AttrDefId::TraitId(mapped)) =
+                                        self.item(id.0.into())
+                                    {
+                                        *id = mapped.into();
+                                    }
+                                }
+                                ExistentialPredicate::Projection(projection) => {
+                                    if let crate::next_solver::SolverDefId::TypeAliasId(id) =
+                                        projection.def_id.into()
+                                        && let Some(AttrDefId::TypeAliasId(mapped)) =
+                                            self.item(id.into())
+                                        && let Ok(mapped) =
+                                            crate::next_solver::SolverDefId::from(mapped).try_into()
+                                    {
+                                        projection.def_id = mapped;
+                                    }
+                                }
+                            }
+                            pred
+                        })
+                    })
+                    .collect();
+                return Ty::new_dynamic(
+                    interner,
+                    BoundExistentialPredicates::new_from_iter(predicates),
+                    region,
+                );
+            }
             ty.super_fold_with(self)
         }
     }
@@ -1497,6 +1598,9 @@ fn same_signature_mode(
                 GenericParams::of(db, n.into()).len() == GenericParams::of(db, t.into()).len();
             let n = db.callable_item_signature(n.into()).skip_binder().fold_with(&mut mapper);
             let t = db.callable_item_signature(t.into()).skip_binder().fold_with(&mut mapper);
+            if local && n != t && std::env::var("RUSTD_CFG_VERIFY").is_ok_and(|it| it == "items") {
+                eprintln!("cfg verify sig: {n:?} vs {t:?}");
+            }
             generics_match && !n.has_non_region_error() && !t.has_non_region_error() && n == t
         }
         (AttrDefId::StaticId(n), AttrDefId::StaticId(t)) => {
@@ -1845,7 +1949,7 @@ fn local_item_name(db: &dyn HirDatabase, item: AttrDefId) -> String {
 /// The declarations that fail their own comparison, for diagnostics.
 pub fn local_unstable_seeds(db: &dyn HirDatabase, normal: Crate, test: Crate) -> Vec<String> {
     let mut seen = FxHashSet::default();
-    let mut pending: Vec<_> = crate_items(db, normal).items.iter().copied().collect();
+    let mut pending: Vec<_> = hir_def::twins::declaration_items(db, normal).items.iter().copied().collect();
     let mut seeds = Vec::new();
     while let Some(item) = pending.pop() {
         if !seen.insert(item) {
@@ -1855,13 +1959,16 @@ pub fn local_unstable_seeds(db: &dyn HirDatabase, normal: Crate, test: Crate) ->
         if !fact.stable {
             let twin = hir_def::twins::declaration_twin(db, test, normal, item);
             let reason = match twin {
-                None => "no-twin",
+                None => hir_def::twins::declaration_twin_failure(db, test, normal, item),
                 Some(twin) => {
                     let (a, b) = (
                         hir_def::twins::declaration_reads(db, item),
                         hir_def::twins::declaration_reads(db, twin),
                     );
                     if a.unknown || b.unknown {
+                        if std::env::var("RUSTD_CFG_VERIFY").is_ok_and(|it| it == "items") {
+                            eprintln!("cfg verify reads: {} {a:?} {b:?}", local_item_name(db, item));
+                        }
                         "reads-unknown"
                     } else if a.differs_from(test.cfg_options(db))
                         || b.differs_from(normal.cfg_options(db))
@@ -1889,7 +1996,7 @@ pub fn local_unstable_seeds(db: &dyn HirDatabase, normal: Crate, test: Crate) ->
 fn local_unstable(db: &dyn HirDatabase, normal: Crate, test: Crate) -> FxHashSet<AttrDefId> {
     let mut users: FxHashMap<AttrDefId, Vec<AttrDefId>> = FxHashMap::default();
     let mut seen = FxHashSet::default();
-    let mut pending: Vec<_> = crate_items(db, normal).items.iter().copied().collect();
+    let mut pending: Vec<_> = hir_def::twins::declaration_items(db, normal).items.iter().copied().collect();
     let mut unstable = Vec::new();
     while let Some(item) = pending.pop() {
         if !seen.insert(item) {
