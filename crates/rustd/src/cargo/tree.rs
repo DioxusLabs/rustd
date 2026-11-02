@@ -251,10 +251,12 @@ fn cpu_of_group(group: u32) -> Option<u64> {
     let mut pids = [0 as libc::pid_t; 1024];
     let size = std::mem::size_of_val(&pids) as libc::c_int;
     // SAFETY: the buffer has room for the size given.
-    let bytes = unsafe { libc::proc_listpgrppids(group as _, pids.as_mut_ptr().cast(), size) };
-    let count = usize::try_from(bytes).ok()? / size_of::<libc::pid_t>();
+    if unsafe { libc::proc_listpgrppids(group as _, pids.as_mut_ptr().cast(), size) } <= 0 {
+        return None;
+    }
     let mut total = None;
-    for &pid in pids.iter().take(count) {
+    // The buffer starts out zeroed, so its unused end needs no count.
+    for &pid in pids.iter().filter(|it| **it != 0) {
         // SAFETY: all zeros is a valid value of this structure of integers.
         let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
         let size = size_of::<libc::proc_taskinfo>() as libc::c_int;
