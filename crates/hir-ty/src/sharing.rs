@@ -1784,6 +1784,47 @@ fn local_declaration(
     LocalDeclaration { stable: true, edges }
 }
 
+/// The declarations that fail their own comparison, for diagnostics.
+pub fn local_unstable_seeds(db: &dyn HirDatabase, normal: Crate, test: Crate) -> Vec<String> {
+    let mut seen = FxHashSet::default();
+    let mut pending: Vec<_> = crate_items(db, normal).items.iter().copied().collect();
+    let mut seeds = Vec::new();
+    while let Some(item) = pending.pop() {
+        if !seen.insert(item) {
+            continue;
+        }
+        let fact = local_declaration(db, normal, test, item);
+        if !fact.stable {
+            let twin = hir_def::twins::declaration_twin(db, test, normal, item);
+            let reason = match twin {
+                None => "no-twin",
+                Some(twin) => {
+                    let (a, b) = (
+                        hir_def::twins::declaration_reads(db, item),
+                        hir_def::twins::declaration_reads(db, twin),
+                    );
+                    if a.unknown || b.unknown {
+                        "reads-unknown"
+                    } else if a.differs_from(test.cfg_options(db))
+                        || b.differs_from(normal.cfg_options(db))
+                    {
+                        "reads-differ"
+                    } else if !same_signature_mode(db, normal, item, twin, true) {
+                        "signature"
+                    } else if local_impl_mismatch(db, normal, test, item) {
+                        "impl-mismatch"
+                    } else {
+                        "refs-unknown"
+                    }
+                }
+            };
+            seeds.push(format!("{reason} {item:?}"));
+        }
+        pending.extend(fact.edges.iter().copied());
+    }
+    seeds
+}
+
 /// The declarations of `normal` that differ in `test`, or are built from one that does. Bodies
 /// are not part of this, so an edit inside a body leaves it unchanged.
 #[salsa::tracked(returns(ref))]
