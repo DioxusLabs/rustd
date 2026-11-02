@@ -213,7 +213,7 @@ impl FileIdToSyntax for EditionedFileId {
 }
 impl FileIdToSyntax for MacroCallId {
     fn file_syntax(self, db: &dyn SourceDatabase) -> SyntaxNode {
-        self.parse_macro_expansion(db).value.0.syntax_node()
+        self.parse_macro_expansion_laundered(db).value.0.syntax_node()
     }
 }
 impl FileIdToSyntax for HirFileId {

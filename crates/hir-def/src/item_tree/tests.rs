@@ -4,6 +4,104 @@ use test_fixture::WithFixture;
 
 use crate::test_db::TestDB;
 
+#[salsa::tracked(returns(copy))]
+fn laundered_item_count(
+    db: &dyn base_db::SourceDatabase,
+    file: hir_expand::HirFileId,
+    krate: base_db::Crate,
+) -> usize {
+    super::file_item_tree(db, file, krate).top_level.len()
+}
+
+#[test]
+fn laundered_item_tree_body_and_signature_changes() {
+    use super::inputs::ItemTreeInput;
+    use base_db::SourceDatabase;
+    use salsa::{Durability, Setter};
+
+    let (mut db, file) = TestDB::with_single_file("fn f() { let _ = 1; }");
+    let krate = db.test_crate();
+    let hir_file = file.into();
+    let tree = super::file_item_tree_snapshot(&db, hir_file, krate);
+    let input = ItemTreeInput::builder(tree.clone()).durability(Durability::MEDIUM).new(&db);
+    db.item_trees.insert(hir_file, krate, input);
+    assert!(std::sync::Arc::ptr_eq(tree.as_ref().unwrap(), input.value(&db).as_ref().unwrap()));
+    assert_eq!(laundered_item_count(&db, hir_file, krate), 1);
+
+    db.set_file_text(file.file_id(&db), "fn f() { let _ = 2; }");
+    assert_eq!(*input.value(&db), super::file_item_tree_snapshot(&db, hir_file, krate));
+    let events = db.log(|| assert_eq!(laundered_item_count(&db, hir_file, krate), 1));
+    assert!(
+        events
+            .iter()
+            .filter(|event| matches!(event.kind, salsa::EventKind::DidValidateMemoizedValue { .. }))
+            .count()
+            <= 1
+    );
+    assert!(!events.iter().any(|event| matches!(event.kind, salsa::EventKind::WillExecute { .. })));
+
+    db.set_file_text(file.file_id(&db), "fn f() {} fn g() {}");
+    let tree = super::file_item_tree_snapshot(&db, hir_file, krate);
+    assert_ne!(*input.value(&db), tree);
+    input.set_value(&mut db).with_durability(Durability::MEDIUM).to(tree);
+    assert_eq!(laundered_item_count(&db, hir_file, krate), 2);
+
+    db.set_file_text(file.file_id(&db), "");
+    input.set_value(&mut db).with_durability(Durability::MEDIUM).to(None);
+    assert_eq!(laundered_item_count(&db, hir_file, krate), 0);
+    assert_eq!(*input.value(&db), super::file_item_tree_snapshot(&db, hir_file, krate));
+}
+
+#[test]
+fn item_tree_input_refresh_worklist() {
+    use salsa::Database;
+    use salsa::plumbing::ZalsaDatabase;
+    let (mut db, file) = TestDB::with_single_file("fn f() {}");
+    let medium = db.zalsa().last_changed_revision(salsa::Durability::MEDIUM);
+    let inputs = db.item_trees.clone();
+    assert!(inputs.take_writes(medium).1);
+    inputs.refreshed(medium);
+    assert_eq!(inputs.take_writes(medium), (Default::default(), false));
+    inputs.written(file.file_id(&db));
+    let (written, all) = inputs.take_writes(medium);
+    assert_eq!(written.into_iter().collect::<Vec<_>>(), vec![file.file_id(&db)]);
+    assert!(!all);
+    inputs.invalidate_all();
+    assert!(inputs.take_writes(medium).1);
+    db.synthetic_write(salsa::Durability::MEDIUM);
+    assert!(inputs.take_writes(db.zalsa().last_changed_revision(salsa::Durability::MEDIUM)).1);
+}
+
+#[test]
+fn equal_item_trees_and_call_arguments_do_not_pin_module_impls() {
+    use base_db::SourceDatabase;
+
+    let text = "trait T {} struct S; macro_rules! m { () => { impl T for S {} } } m!();";
+    let (mut db, file) = TestDB::with_single_file(text);
+    let krate = db.test_crate();
+    let tree = super::file_item_tree_snapshot(&db, file.into(), krate);
+    let map = crate::nameres::crate_def_map(&db, krate);
+    let calls: Vec<_> =
+        map.modules(&db).flat_map(|(_, module)| module.scope(&db).all_macro_calls()).collect();
+    assert_eq!(calls.len(), 1);
+    let arguments = calls[0].macro_arg_considering_derives(&db, &calls[0].loc(&db).kind).clone();
+    assert_eq!(
+        map.modules(&db).map(|(_, module)| module.scope(&db).trait_impls().count()).sum::<usize>(),
+        1
+    );
+
+    let replacement = " ".repeat("impl T for S {}".len());
+    db.set_file_text(file.file_id(&db), &text.replace("impl T for S {}", &replacement));
+
+    assert_eq!(tree, super::file_item_tree_snapshot(&db, file.into(), krate));
+    assert_eq!(arguments, *calls[0].macro_arg_considering_derives(&db, &calls[0].loc(&db).kind));
+    let map = crate::nameres::crate_def_map(&db, krate);
+    assert_eq!(
+        map.modules(&db).map(|(_, module)| module.scope(&db).trait_impls().count()).sum::<usize>(),
+        0
+    );
+}
+
 fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
     let (db, file_id) = TestDB::with_single_file(ra_fixture);
     let item_tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());

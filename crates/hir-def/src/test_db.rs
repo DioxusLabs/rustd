@@ -27,6 +27,8 @@ pub(crate) struct TestDB {
     crates_map: Arc<CratesMap>,
     events: Arc<Mutex<Option<Vec<salsa::Event>>>>,
     nonce: Nonce,
+    pub(crate) item_trees: std::sync::Arc<crate::item_tree::inputs::ItemTreeInputs>,
+    pub(crate) macro_expansions: Option<std::sync::Arc<hir_expand::inputs::MacroExpansionInputs>>,
 }
 
 impl Default for TestDB {
@@ -46,6 +48,8 @@ impl Default for TestDB {
             files: Default::default(),
             crates_map: Default::default(),
             nonce: Nonce::new(),
+            item_trees: Default::default(),
+            macro_expansions: None,
         };
         crate::set_expand_proc_attr_macros(&mut this, true);
         // This needs to be here otherwise `CrateGraphBuilder` panics.
@@ -69,6 +73,8 @@ impl Clone for TestDB {
             crates_map: self.crates_map.clone(),
             events: self.events.clone(),
             nonce: self.nonce,
+            item_trees: self.item_trees.clone(),
+            macro_expansions: self.macro_expansions.clone(),
         }
     }
 }
@@ -86,6 +92,14 @@ impl panic::RefUnwindSafe for TestDB {}
 
 #[salsa::db]
 impl SourceDatabase for TestDB {
+    fn macro_expansion_data(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        self.macro_expansions.as_deref().map(|inputs| inputs as _)
+    }
+
+    fn connector_data(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        Some(&*self.item_trees)
+    }
+
     fn file_text(&self, file_id: base_db::FileId) -> FileText {
         self.files.file_text(file_id)
     }

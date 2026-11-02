@@ -90,6 +90,16 @@ pub struct RootDatabase {
     files: Arc<Files>,
     crates_map: Arc<CratesMap>,
     nonce: Nonce,
+    item_trees: Option<std::sync::Arc<hir::db::ItemTreeInputs>>,
+    trait_impls: Option<std::sync::Arc<hir::db::TraitImplsInputs>>,
+    impl_packages: Vec<(std::path::PathBuf, bool)>,
+    tiered_durability: bool,
+    tiered_packages: Vec<(std::path::PathBuf, bool)>,
+    tiered_low_roots: FxHashSet<SourceRootId>,
+    ladder: bool,
+    ladder_initial_low: bool,
+    ladder_low_files: FxHashSet<vfs::FileId>,
+    macro_expansions: Option<std::sync::Arc<hir::db::MacroExpansionInputs>>,
 }
 
 impl std::panic::RefUnwindSafe for RootDatabase {}
@@ -110,6 +120,16 @@ impl Clone for RootDatabase {
             files: self.files.clone(),
             crates_map: self.crates_map.clone(),
             nonce: self.nonce,
+            item_trees: self.item_trees.clone(),
+            trait_impls: self.trait_impls.clone(),
+            impl_packages: self.impl_packages.clone(),
+            tiered_durability: self.tiered_durability,
+            tiered_packages: self.tiered_packages.clone(),
+            tiered_low_roots: self.tiered_low_roots.clone(),
+            ladder: self.ladder,
+            ladder_initial_low: self.ladder_initial_low,
+            ladder_low_files: self.ladder_low_files.clone(),
+            macro_expansions: self.macro_expansions.clone(),
         }
     }
 }
@@ -121,6 +141,107 @@ impl fmt::Debug for RootDatabase {
 }
 
 impl RootDatabase {
+    pub fn impl_connector_time(&self) -> std::time::Duration {
+        self.trait_impls.as_ref().map_or(std::time::Duration::ZERO, |inputs| inputs.refresh_time())
+    }
+
+    pub fn enable_impl_connector(&mut self, mut packages: Vec<(std::path::PathBuf, bool)>) {
+        packages.sort_unstable_by(|a, b| b.cmp(a));
+        packages.dedup_by(|a, b| a.0 == b.0);
+        self.impl_packages = packages;
+        self.trait_impls.get_or_insert_with(Default::default);
+    }
+
+    pub fn refresh_impl_connector(&mut self) {
+        let Some(inputs) = self.trait_impls.clone() else { return };
+        let crates: Vec<_> = base_db::all_crates(self)
+            .iter()
+            .copied()
+            .filter(|&krate| {
+                let file = krate.data(self).root_file_id;
+                let root = self
+                    .source_root(self.file_source_root(file).source_root_id(self))
+                    .source_root(self);
+                !root.is_library
+                    && root.path_for_file(&file).and_then(|path| path.as_path()).is_some_and(
+                        |path| {
+                            self.impl_packages
+                                .iter()
+                                .find(|(package, _)| {
+                                    AsRef::<std::path::Path>::as_ref(path).starts_with(package)
+                                })
+                                .is_some_and(|(_, primary)| *primary)
+                        },
+                    )
+            })
+            .collect();
+        inputs.refresh(self, &crates, std::env::var("RUSTD_VERIFY_LAUNDER").as_deref() == Ok("1"));
+    }
+
+    pub fn enable_tiered_durability(&mut self, packages: Vec<(std::path::PathBuf, bool)>) {
+        self.tiered_durability = true;
+        self.tiered_packages.extend(packages);
+        self.tiered_packages.sort_unstable_by(|a, b| b.cmp(a));
+        self.tiered_packages.dedup_by(|a, b| a.0 == b.0);
+    }
+
+    pub fn item_tree_inputs(&self) -> Option<std::sync::Arc<hir::db::ItemTreeInputs>> {
+        self.item_trees.clone()
+    }
+
+    pub fn enable_ladder(&mut self, packages: Vec<(std::path::PathBuf, bool)>, initial_low: bool) {
+        self.enable_tiered_durability(packages);
+        self.ladder = true;
+        self.ladder_initial_low = initial_low;
+        self.item_trees.get_or_insert_with(Default::default);
+        self.macro_expansions.get_or_insert_with(Default::default);
+    }
+
+    pub fn ladder_file_is_low(&self, file: vfs::FileId) -> bool {
+        self.ladder_low_files.contains(&file)
+    }
+
+    pub fn predemote_ladder_files(&mut self, files: &[vfs::FileId]) -> usize {
+        if !self.ladder {
+            return 0;
+        }
+        let selected: Vec<_> = files
+            .iter()
+            .copied()
+            .filter(|&file| {
+                !self.ladder_file_is_low(file)
+                    && self.files.has_file_text(file)
+                    && self.ladder_file_is_selected(file)
+            })
+            .collect();
+        let files = Arc::clone(&self.files);
+        for &file in &selected {
+            let text = self.file_text(file).text(self).clone();
+            files.set_file_text_with_durability(self, file, &text, Durability::LOW);
+            self.ladder_low_files.insert(file);
+        }
+        selected.len()
+    }
+
+    pub fn ladder_file_is_selected(&self, file: vfs::FileId) -> bool {
+        let root =
+            self.source_root(self.file_source_root(file).source_root_id(self)).source_root(self);
+        !root.is_library
+            && root
+                .path_for_file(&file)
+                .and_then(|path| path.as_path())
+                .and_then(|path| {
+                    self.tiered_packages.iter().find(|(package, _)| {
+                        AsRef::<std::path::Path>::as_ref(path).starts_with(package)
+                    })
+                })
+                .is_some_and(|(_, selected)| *selected)
+    }
+
+    pub fn macro_expansion_inputs(&self) -> Option<std::sync::Arc<hir::db::MacroExpansionInputs>> {
+        self.macro_expansions.clone()
+    }
+
     /// The files outside the VFS that an `include_bytes!` or `include_str!` has read.
     pub fn included_files(&self) -> Vec<vfs::AbsPathBuf> {
         self.files.included_files()
@@ -171,12 +292,25 @@ impl RootDatabase {
     /// Reads such a file again, after it changed on disk.
     pub fn reload_included_file(&mut self, path: &vfs::AbsPath) -> bool {
         let files = Arc::clone(&self.files);
-        files.reload_included_file(self, path)
+        let changed = files.reload_included_file(self, path);
+        if changed {
+            if let Some(inputs) = &self.item_trees {
+                inputs.invalidate_all();
+            }
+        }
+        changed
     }
 }
 
 #[salsa::db]
 impl SourceDatabase for RootDatabase {
+    fn macro_expansion_data(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        self.macro_expansions.as_deref().map(|inputs| inputs as _)
+    }
+    fn connector_data(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        self.item_trees.as_deref().map(|inputs| inputs as _)
+    }
+
     fn file_text(&self, file_id: vfs::FileId) -> FileText {
         self.files.file_text(file_id)
     }
@@ -186,8 +320,18 @@ impl SourceDatabase for RootDatabase {
     }
 
     fn set_file_text(&mut self, file_id: vfs::FileId, text: &str) {
+        if self.ladder {
+            self.set_file_text_with_durability(file_id, text, Durability::LOW);
+            return;
+        }
+        if let Some(inputs) = &self.trait_impls {
+            inputs.written(self, file_id, text);
+        }
         let files = Arc::clone(&self.files);
         files.set_file_text(self, file_id, text);
+        if let Some(inputs) = &self.item_trees {
+            inputs.written(file_id);
+        }
     }
 
     fn set_file_text_with_durability(
@@ -196,8 +340,45 @@ impl SourceDatabase for RootDatabase {
         text: &str,
         durability: Durability,
     ) {
+        if let Some(inputs) = &self.trait_impls {
+            inputs.written(self, file_id, text);
+        }
         let files = Arc::clone(&self.files);
+        // Unedited dependency roots start MEDIUM. Later writes demote permanently;
+        // Salsa invalidates using the field's old durability.
+        let durability = if self.ladder {
+            if files.has_file_text(file_id) || self.ladder_low_files.contains(&file_id) {
+                self.ladder_low_files.insert(file_id);
+                Durability::LOW
+            } else if durability == Durability::HIGH {
+                Durability::HIGH
+            } else {
+                let selected = self.ladder_file_is_selected(file_id);
+                if selected && self.ladder_initial_low {
+                    self.ladder_low_files.insert(file_id);
+                    Durability::LOW
+                } else if selected {
+                    Durability::MEDIUM
+                } else {
+                    Durability::HIGH
+                }
+            }
+        } else if self.tiered_durability
+            && durability == Durability::LOW
+            && !files.has_file_text(file_id)
+            && (self.tiered_packages.is_empty()
+                || !self
+                    .tiered_low_roots
+                    .contains(&self.file_source_root(file_id).source_root_id(self)))
+        {
+            Durability::MEDIUM
+        } else {
+            durability
+        };
         files.set_file_text_with_durability(self, file_id, text, durability);
+        if let Some(inputs) = &self.item_trees {
+            inputs.written(file_id);
+        }
     }
 
     /// Source root of the file.
@@ -211,8 +392,38 @@ impl SourceDatabase for RootDatabase {
         source_root: Arc<SourceRoot>,
         durability: Durability,
     ) {
+        if let Some(inputs) = &self.trait_impls {
+            inputs.invalidate_all();
+        }
         let files = Arc::clone(&self.files);
+        if self.tiered_durability
+            && !source_root.is_library
+            && source_root.iter().any(|file| {
+                source_root.path_for_file(&file).and_then(|path| path.as_path()).is_some_and(
+                    |path| {
+                        self.tiered_packages
+                            .iter()
+                            .find(|(package, _)| {
+                                AsRef::<std::path::Path>::as_ref(path).starts_with(package)
+                            })
+                            .is_some_and(|(_, primary)| *primary)
+                    },
+                )
+            })
+        {
+            self.tiered_low_roots.insert(source_root_id);
+        } else {
+            self.tiered_low_roots.remove(&source_root_id);
+        }
+        let durability = if self.tiered_durability && durability == Durability::LOW {
+            Durability::MEDIUM
+        } else {
+            durability
+        };
         files.set_source_root_with_durability(self, source_root_id, source_root, durability);
+        if let Some(inputs) = &self.item_trees {
+            inputs.invalidate_all();
+        }
     }
 
     fn included_file(&self, path: base_db::AnchoredPath<'_>) -> Option<base_db::IncludedFile> {
@@ -252,8 +463,20 @@ impl SourceDatabase for RootDatabase {
         source_root_id: SourceRootId,
         durability: Durability,
     ) {
+        if let Some(inputs) = &self.trait_impls {
+            inputs.invalidate_all();
+        }
         let files = Arc::clone(&self.files);
+        let durability = if self.tiered_durability && durability == Durability::LOW {
+            Durability::MEDIUM
+        } else {
+            durability
+        };
         files.set_file_source_root_with_durability(self, id, source_root_id, durability);
+        if let Some(inputs) = &self.item_trees {
+            inputs.written(id);
+            inputs.invalidate_all();
+        }
     }
 
     fn crates_map(&self) -> Arc<CratesMap> {
@@ -269,21 +492,68 @@ impl SourceDatabase for RootDatabase {
     }
 }
 
-hir::impl_hir_database!(RootDatabase);
+hir::impl_hir_database!(
+    RootDatabase,
+    fn trait_impls_connector(&self) -> Option<&hir::db::TraitImplsInputs> {
+        self.trait_impls.as_deref()
+    }
+);
 
 /// Counts how often each query ran, when `RUSTD_TRACE` is set.
 pub mod executions {
     use std::sync::Mutex;
 
     use rustc_hash::FxHashMap;
-    use salsa::{Database, Event, EventKind, IngredientIndex};
+    use salsa::{Database, DatabaseKeyIndex, Event, EventKind, IngredientIndex};
 
     static RAN: Mutex<Option<FxHashMap<IngredientIndex, u32>>> = Mutex::new(None);
+    static VALIDATED: Mutex<Option<FxHashMap<IngredientIndex, u32>>> = Mutex::new(None);
+    static ROOTS: Mutex<Option<FxHashMap<String, u32>>> = Mutex::new(None);
+    static MEMOS: Mutex<Option<FxHashMap<(String, DatabaseKeyIndex), u32>>> = Mutex::new(None);
+    static PHASES: Mutex<Option<FxHashMap<(&'static str, IngredientIndex), u32>>> =
+        Mutex::new(None);
+    static EXECUTED_PHASES: Mutex<Option<FxHashMap<(&'static str, IngredientIndex), u32>>> =
+        Mutex::new(None);
 
     pub(super) fn callback() -> Option<Box<dyn Fn(Event) + Send + Sync>> {
         std::env::var_os("RUSTD_TRACE")?;
-        Some(Box::new(|event| {
+        let phases = std::env::var_os("RUSTD_TRACE_PHASES").is_some();
+        let memos = std::env::var_os("RUSTD_TRACE_MEMOS").is_some();
+        Some(Box::new(move |event| {
+            if let EventKind::DidValidateMemoizedValue { database_key } = event.kind {
+                if phases {
+                    if let Some(root) = base_db::query_phase::root() {
+                        let key = format!("{}/{root}", base_db::query_phase::current());
+                        if memos {
+                            let mut counts = MEMOS.lock().unwrap_or_else(|it| it.into_inner());
+                            *counts
+                                .get_or_insert_default()
+                                .entry((key.clone(), database_key))
+                                .or_default() += 1;
+                        }
+                        let mut roots = ROOTS.lock().unwrap_or_else(|it| it.into_inner());
+                        *roots.get_or_insert_default().entry(key).or_default() += 1;
+                    }
+                    let mut counts = PHASES.lock().unwrap_or_else(|it| it.into_inner());
+                    *counts
+                        .get_or_insert_default()
+                        .entry((base_db::query_phase::current(), database_key.ingredient_index()))
+                        .or_default() += 1;
+                }
+                let mut validated = VALIDATED.lock().unwrap_or_else(|it| it.into_inner());
+                *validated
+                    .get_or_insert_default()
+                    .entry(database_key.ingredient_index())
+                    .or_default() += 1;
+            }
             if let EventKind::WillExecute { database_key } = event.kind {
+                if phases {
+                    let mut counts = EXECUTED_PHASES.lock().unwrap_or_else(|it| it.into_inner());
+                    *counts
+                        .get_or_insert_default()
+                        .entry((base_db::query_phase::current(), database_key.ingredient_index()))
+                        .or_default() += 1;
+                }
                 let mut ran = RAN.lock().unwrap_or_else(|it| it.into_inner());
                 *ran.get_or_insert_default().entry(database_key.ingredient_index()).or_default() +=
                     1;
@@ -305,7 +575,60 @@ pub mod executions {
 
     /// The queries that ran since the last call, most often first.
     pub fn take(db: &dyn Database) -> Vec<(String, u32)> {
-        let ran = RAN.lock().unwrap_or_else(|it| it.into_inner()).take().unwrap_or_default();
+        named(db, &RAN)
+    }
+
+    /// The memos found still valid since the last call, most often first.
+    pub fn take_validated(db: &dyn Database) -> Vec<(String, u32)> {
+        named(db, &VALIDATED)
+    }
+
+    pub fn take_phases(db: &dyn Database) -> Vec<(String, u32)> {
+        named_phases(db, &PHASES)
+    }
+
+    pub fn take_roots() -> Vec<(String, u32)> {
+        let counts = ROOTS.lock().unwrap_or_else(|it| it.into_inner()).take().unwrap_or_default();
+        let mut counts: Vec<_> = counts.into_iter().collect();
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        counts
+    }
+
+    pub fn take_memos() -> Vec<(String, DatabaseKeyIndex, u32)> {
+        MEMOS
+            .lock()
+            .unwrap_or_else(|it| it.into_inner())
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|((root, key), count)| (root, key, count))
+            .collect()
+    }
+
+    pub fn take_executed_phases(db: &dyn Database) -> Vec<(String, u32)> {
+        named_phases(db, &EXECUTED_PHASES)
+    }
+
+    fn named_phases(
+        db: &dyn Database,
+        counts: &Mutex<Option<FxHashMap<(&'static str, IngredientIndex), u32>>>,
+    ) -> Vec<(String, u32)> {
+        let counts = counts.lock().unwrap_or_else(|it| it.into_inner()).take().unwrap_or_default();
+        let mut counts: Vec<_> = counts
+            .into_iter()
+            .map(|((phase, key), count)| {
+                (format!("{phase}/{}", db.ingredient_debug_name(key)), count)
+            })
+            .collect();
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        counts
+    }
+
+    fn named(
+        db: &dyn Database,
+        counts: &Mutex<Option<FxHashMap<IngredientIndex, u32>>>,
+    ) -> Vec<(String, u32)> {
+        let ran = counts.lock().unwrap_or_else(|it| it.into_inner()).take().unwrap_or_default();
         let mut ran: Vec<_> = ran
             .into_iter()
             .map(|(query, count)| (db.ingredient_debug_name(query).into_owned(), count))
@@ -328,6 +651,18 @@ impl RootDatabase {
             files: Default::default(),
             crates_map: Default::default(),
             nonce: Nonce::new(),
+            trait_impls: None,
+            impl_packages: Vec::new(),
+            tiered_durability: false,
+            tiered_packages: Vec::new(),
+            tiered_low_roots: FxHashSet::default(),
+            ladder: false,
+            ladder_initial_low: false,
+            ladder_low_files: FxHashSet::default(),
+            macro_expansions: None,
+            item_trees: (std::env::var_os("RUSTD_LAUNDER").is_some()
+                || std::env::var_os("RUSTD_VERIFY_LAUNDER").is_some())
+            .then(Default::default),
         };
         // This needs to be here otherwise `CrateGraphBuilder` will panic.
         set_all_crates_with_durability(&mut db, std::iter::empty(), Durability::HIGH);
@@ -348,14 +683,11 @@ impl RootDatabase {
         hir::db::set_expand_proc_attr_macros(self, true);
     }
 
-    pub fn update_base_query_lru_capacities(&mut self, _lru_capacity: Option<u16>) {
-        // let lru_capacity = lru_capacity.unwrap_or(base_db::DEFAULT_PARSE_LRU_CAP);
-        // base_db::FileTextQuery.in_db_mut(self).set_lru_capacity(DEFAULT_FILE_TEXT_LRU_CAP);
-        // base_db::ParseQuery.in_db_mut(self).set_lru_capacity(lru_capacity);
-        // // macro expansions are usually rather small, so we can afford to keep more of them alive
-        // hir::db::ParseMacroExpansionQuery.in_db_mut(self).set_lru_capacity(4 * lru_capacity);
-        // hir::db::BorrowckQuery.in_db_mut(self).set_lru_capacity(base_db::DEFAULT_BORROWCK_LRU_CAP);
-        // hir::db::BodyWithSourceMapQuery.in_db_mut(self).set_lru_capacity(2048);
+    /// Overrides all LRU query capacities; `None` leaves attribute defaults and zero disables eviction.
+    pub fn update_base_query_lru_capacities(&mut self, lru_capacity: Option<u16>) {
+        if let Some(capacity) = lru_capacity {
+            hir::db::set_lru_capacity(self, usize::from(capacity));
+        }
     }
 
     pub fn update_lru_capacities(&mut self, _lru_capacities: &FxHashMap<Box<str>, u16>) {

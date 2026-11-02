@@ -31,6 +31,7 @@
 //! surface syntax.
 
 mod attrs;
+pub mod inputs;
 mod lower;
 mod pretty;
 #[cfg(test)]
@@ -122,7 +123,15 @@ fn lower_extra_crate_attrs<'a>(
 
 /// Computes an [`ItemTree`] for the given file or macro expansion.
 pub fn file_item_tree(db: &dyn SourceDatabase, file_id: HirFileId, krate: Crate) -> &ItemTree {
-    match file_item_tree_query(db, file_id, krate) {
+    let input = db
+        .connector_data()
+        .and_then(|data| data.downcast_ref::<inputs::ItemTreeInputs>())
+        .and_then(|inputs| inputs.get(file_id, krate));
+    let tree = match input {
+        Some(input) => input.value(db),
+        None => file_item_tree_query(db, file_id, krate),
+    };
+    match tree {
         Some(item_tree) => item_tree,
         None => {
             static EMPTY: OnceLock<ItemTree> = OnceLock::new();

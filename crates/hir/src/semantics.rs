@@ -563,7 +563,8 @@ impl<'db> SemanticsImpl<'db> {
     }
 
     pub fn expand(&self, file_id: MacroCallId) -> ExpandResult<SyntaxNode> {
-        let res = file_id.parse_macro_expansion(self.db).as_ref().map(|it| it.0.syntax_node());
+        let res =
+            file_id.parse_macro_expansion_laundered(self.db).as_ref().map(|it| it.0.syntax_node());
         self.cache(res.value.clone(), file_id.into());
         res
     }
@@ -660,7 +661,7 @@ impl<'db> SemanticsImpl<'db> {
             .into_iter()
             .map(|call| {
                 let file_id = call?.left()?;
-                let ExpandResult { value, err } = file_id.parse_macro_expansion(self.db);
+                let ExpandResult { value, err } = file_id.parse_macro_expansion_laundered(self.db);
                 let root_node = value.0.syntax_node();
                 self.cache(root_node.clone(), file_id.into());
                 Some(ExpandResult { value: root_node, err: err.clone() })

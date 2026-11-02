@@ -87,52 +87,11 @@ impl ops::Deref for BodySourceMap {
 
 #[salsa::tracked]
 impl Body {
-    #[salsa::tracked(lru = 512, returns(ref))]
     pub fn with_source_map(
         db: &dyn SourceDatabase,
         def: DefWithBodyId,
-    ) -> (Arc<Body>, BodySourceMap) {
-        let _p = tracing::info_span!("body_with_source_map_query").entered();
-        let mut params = None;
-
-        let mut is_async_fn = false;
-        let mut is_gen_fn = false;
-        let (InFile { file_id, value: body }, syntax_node) = {
-            match def {
-                DefWithBodyId::FunctionId(f) => {
-                    let f = f.lookup(db);
-                    let src = f.source(db);
-                    params = src.value.param_list();
-                    is_async_fn = src.value.async_token().is_some();
-                    is_gen_fn = src.value.gen_token().is_some();
-                    let syntax_node = SyntaxNodePtr::new(src.syntax().value);
-                    (src.map(|it| it.body().map(ast::Expr::from)), syntax_node)
-                }
-                DefWithBodyId::ConstId(c) => {
-                    let c = c.lookup(db);
-                    let src = c.source(db);
-                    let syntax_node = SyntaxNodePtr::new(src.syntax().value);
-                    (src.map(|it| it.body()), syntax_node)
-                }
-                DefWithBodyId::StaticId(s) => {
-                    let s = s.lookup(db);
-                    let src = s.source(db);
-                    let syntax_node = SyntaxNodePtr::new(src.syntax().value);
-                    (src.map(|it| it.body()), syntax_node)
-                }
-                DefWithBodyId::VariantId(v) => {
-                    let s = v.lookup(db);
-                    let src = s.source(db);
-                    let syntax_node = SyntaxNodePtr::new(src.syntax().value);
-                    (src.map(|it| it.const_arg()?.expr()), syntax_node)
-                }
-            }
-        };
-        let module = def.module(db);
-        let (body, source_map) =
-            lower_body(db, def, syntax_node, file_id, module, params, body, is_async_fn, is_gen_fn);
-
-        (Arc::new(body), source_map)
+    ) -> &(Arc<Body>, BodySourceMap) {
+        with_source_map_(db, def)
     }
 
     #[salsa::tracked(returns(deref))]
@@ -203,5 +162,59 @@ impl Body {
 impl BodySourceMap {
     pub fn self_param_syntax(&self) -> Option<InFile<SelfParamPtr>> {
         self.self_param
+    }
+}
+
+#[salsa::tracked(lru = 512, returns(ref), self_ty = Body)]
+fn with_source_map_(
+    db: &dyn SourceDatabase,
+    def: DefWithBodyId,
+) -> (Arc<Body>, BodySourceMap) {
+    let _p = tracing::info_span!("body_with_source_map_query").entered();
+    let mut params = None;
+
+    let mut is_async_fn = false;
+    let mut is_gen_fn = false;
+    let (InFile { file_id, value: body }, syntax_node) = {
+        match def {
+            DefWithBodyId::FunctionId(f) => {
+                let f = f.lookup(db);
+                let src = f.source(db);
+                params = src.value.param_list();
+                is_async_fn = src.value.async_token().is_some();
+                is_gen_fn = src.value.gen_token().is_some();
+                let syntax_node = SyntaxNodePtr::new(src.syntax().value);
+                (src.map(|it| it.body().map(ast::Expr::from)), syntax_node)
+            }
+            DefWithBodyId::ConstId(c) => {
+                let c = c.lookup(db);
+                let src = c.source(db);
+                let syntax_node = SyntaxNodePtr::new(src.syntax().value);
+                (src.map(|it| it.body()), syntax_node)
+            }
+            DefWithBodyId::StaticId(s) => {
+                let s = s.lookup(db);
+                let src = s.source(db);
+                let syntax_node = SyntaxNodePtr::new(src.syntax().value);
+                (src.map(|it| it.body()), syntax_node)
+            }
+            DefWithBodyId::VariantId(v) => {
+                let s = v.lookup(db);
+                let src = s.source(db);
+                let syntax_node = SyntaxNodePtr::new(src.syntax().value);
+                (src.map(|it| it.const_arg()?.expr()), syntax_node)
+            }
+        }
+    };
+    let module = def.module(db);
+    let (body, source_map) =
+        lower_body(db, def, syntax_node, file_id, module, params, body, is_async_fn, is_gen_fn);
+
+    (Arc::new(body), source_map)
+}
+
+impl Body {
+    pub fn set_lru_capacity(db: &mut dyn SourceDatabase, capacity: usize) {
+        with_source_map_::set_lru_capacity(db, capacity);
     }
 }

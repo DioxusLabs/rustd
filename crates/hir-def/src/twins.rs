@@ -23,6 +23,7 @@ use hir_expand::{
     attrs::expand_cfg_attr,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+use salsa::plumbing::AsId;
 use span::{ErasedFileAstId, SyntaxContext};
 use syntax::{AstNode, SyntaxNode, ast};
 
@@ -423,29 +424,30 @@ pub fn crate_items(db: &dyn SourceDatabase, krate: Crate) -> CrateItems {
             items.definitions.extend(inventory.definitions.iter().map(|(&k, &v)| (k, v)));
         }
     }
+    items.scopes.sort_unstable();
     items
 }
 
 #[salsa::tracked(returns(ref))]
 fn body_inventory(db: &dyn SourceDatabase, owner: DefWithBodyId) -> CrateItems {
     let mut items = CrateItems::default();
-    items.body_calls.insert(
-        owner,
-        Body::with_source_map(db, owner)
-            .1
-            .macro_calls()
-            .map(|(_, call)| call)
-            .filter(|call| {
-                !matches!(
-                    call.loc(db).def.kind,
-                    MacroDefKind::BuiltIn(_, hir_expand::builtin::BuiltinFnLikeExpander::Cfg)
-                )
-            })
-            .collect(),
-    );
+    let mut calls: Vec<_> = Body::with_source_map(db, owner)
+        .1
+        .macro_calls()
+        .map(|(_, call)| call)
+        .filter(|call| {
+            !matches!(
+                call.loc(db).def.kind,
+                MacroDefKind::BuiltIn(_, hir_expand::builtin::BuiltinFnLikeExpander::Cfg)
+            )
+        })
+        .collect();
+    calls.sort_unstable_by_key(|call| call.as_id());
+    items.body_calls.insert(owner, calls);
     for (_, map) in Body::of(db, owner).blocks(db) {
         collect(db, map, &mut items);
     }
+    items.scopes.sort_unstable();
     items
 }
 

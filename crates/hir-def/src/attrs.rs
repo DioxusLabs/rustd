@@ -1070,44 +1070,11 @@ impl AttrFlags {
         if !self.contains(AttrFlags::HAS_CFG) {
             return None;
         }
-        return match owner {
+        match owner {
             Either::Left(it) => cfgs(db, it).as_ref(),
             Either::Right(field) => {
                 fields_cfgs(db, field.parent).get(field.local_id).and_then(|it| it.as_ref())
             }
-        };
-
-        // We LRU this query because it is only used by IDE.
-        #[salsa::tracked(returns(ref), lru = 250)]
-        fn cfgs(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<CfgExpr> {
-            let mut result = Vec::new();
-            collect_attrs::<Infallible>(db, owner, |attr| extract_cfgs(&mut result, attr));
-            match result.len() {
-                0 => None,
-                1 => result.into_iter().next(),
-                _ => Some(CfgExpr::All(result.into_boxed_slice())),
-            }
-        }
-
-        // We LRU this query because it is only used by IDE.
-        #[salsa::tracked(returns(ref), lru = 50)]
-        fn fields_cfgs(
-            db: &dyn SourceDatabase,
-            variant: VariantId,
-        ) -> ArenaMap<LocalFieldId, Option<CfgExpr>> {
-            collect_field_attrs(db, variant, |cfg_options, field| {
-                let mut result = Vec::new();
-                expand_cfg_attr(
-                    field.value.attrs(),
-                    || cfg_options,
-                    |attr, _| extract_cfgs(&mut result, attr),
-                );
-                match result.len() {
-                    0 => None,
-                    1 => result.into_iter().next(),
-                    _ => Some(CfgExpr::All(result.into_boxed_slice())),
-                }
-            })
         }
     }
 
@@ -1139,22 +1106,8 @@ impl AttrFlags {
     }
 
     // We LRU this query because it is only used by IDE.
-    #[salsa::tracked(returns(as_deref), lru = 250)]
-    pub fn docs(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Box<Docs>> {
-        let (source, outer_mod_decl, _extra_crate_attrs, krate) = attrs_source(db, owner);
-        let inner_attrs_node = source.value.inner_attributes_node();
-        // Note: we don't have to pass down `_extra_crate_attrs` here, since `extract_docs`
-        // does not handle crate-level attributes related to docs.
-        // See: https://doc.rust-lang.org/rustdoc/write-documentation/the-doc-attribute.html#at-the-crate-level
-        self::docs::extract_docs(
-            db,
-            krate,
-            &|| resolver_for_attr_def_id(db, owner),
-            &|| krate.cfg_options(db),
-            source,
-            outer_mod_decl,
-            inner_attrs_node,
-        )
+    pub fn docs(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<&Docs> {
+        docs_(db, owner)
     }
 
     #[inline]
@@ -1163,23 +1116,11 @@ impl AttrFlags {
     }
 
     // We LRU this query because it is only used by IDE.
-    #[salsa::tracked(returns(ref), lru = 50)]
     pub fn fields_docs(
         db: &dyn SourceDatabase,
         variant: VariantId,
-    ) -> ArenaMap<LocalFieldId, Option<Box<Docs>>> {
-        let krate = variant.module(db).krate(db);
-        collect_field_attrs(db, variant, |cfg_options, field| {
-            self::docs::extract_docs(
-                db,
-                krate,
-                &|| variant.resolver(db),
-                &|| cfg_options,
-                field,
-                None,
-                None,
-            )
-        })
+    ) -> &ArenaMap<LocalFieldId, Option<Box<Docs>>> {
+        fields_docs_(db, variant)
     }
 
     #[inline]
@@ -1560,4 +1501,79 @@ mod tests {
         let attrs = AttrFlags::query(&db, AttrDefId::ModuleId(module));
         assert!(attrs.contains(AttrFlags::IS_NO_STD | AttrFlags::HAS_CFG));
     }
+}
+
+#[salsa::tracked(returns(ref), lru = 250)]
+fn cfgs(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<CfgExpr> {
+    let mut result = Vec::new();
+    collect_attrs::<Infallible>(db, owner, |attr| extract_cfgs(&mut result, attr));
+    match result.len() {
+        0 => None,
+        1 => result.into_iter().next(),
+        _ => Some(CfgExpr::All(result.into_boxed_slice())),
+    }
+}
+
+#[salsa::tracked(returns(ref), lru = 50)]
+fn fields_cfgs(
+    db: &dyn SourceDatabase,
+    variant: VariantId,
+) -> ArenaMap<LocalFieldId, Option<CfgExpr>> {
+    collect_field_attrs(db, variant, |cfg_options, field| {
+        let mut result = Vec::new();
+        expand_cfg_attr(
+            field.value.attrs(),
+            || cfg_options,
+            |attr, _| extract_cfgs(&mut result, attr),
+        );
+        match result.len() {
+            0 => None,
+            1 => result.into_iter().next(),
+            _ => Some(CfgExpr::All(result.into_boxed_slice())),
+        }
+    })
+}
+
+#[salsa::tracked(returns(as_deref), lru = 250, self_ty = AttrFlags)]
+fn docs_(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Box<Docs>> {
+    let (source, outer_mod_decl, _extra_crate_attrs, krate) = attrs_source(db, owner);
+    let inner_attrs_node = source.value.inner_attributes_node();
+    // Note: we don't have to pass down `_extra_crate_attrs` here, since `extract_docs`
+    // does not handle crate-level attributes related to docs.
+    // See: https://doc.rust-lang.org/rustdoc/write-documentation/the-doc-attribute.html#at-the-crate-level
+    self::docs::extract_docs(
+        db,
+        krate,
+        &|| resolver_for_attr_def_id(db, owner),
+        &|| krate.cfg_options(db),
+        source,
+        outer_mod_decl,
+        inner_attrs_node,
+    )
+}
+
+#[salsa::tracked(returns(ref), lru = 50, self_ty = AttrFlags)]
+fn fields_docs_(
+    db: &dyn SourceDatabase,
+    variant: VariantId,
+) -> ArenaMap<LocalFieldId, Option<Box<Docs>>> {
+    let krate = variant.module(db).krate(db);
+    collect_field_attrs(db, variant, |cfg_options, field| {
+        self::docs::extract_docs(
+            db,
+            krate,
+            &|| variant.resolver(db),
+            &|| cfg_options,
+            field,
+            None,
+            None,
+        )
+    })
+}
+
+pub(crate) fn set_lru_capacity(db: &mut dyn SourceDatabase, capacity: usize) {
+    cfgs::set_lru_capacity(db, capacity);
+    fields_cfgs::set_lru_capacity(db, capacity);
+    docs_::set_lru_capacity(db, capacity);
+    fields_docs_::set_lru_capacity(db, capacity);
 }

@@ -19,12 +19,8 @@ pub struct EditionedFileId {
 
 #[salsa::tracked]
 impl EditionedFileId {
-    #[salsa::tracked(lru = 128, returns(clone))]
     pub fn parse(self, db: &dyn SourceDatabase) -> syntax::Parse<ast::SourceFile> {
-        let _p = tracing::info_span!("parse", ?self).entered();
-        let (file_id, edition) = self.unpack(db);
-        let text = db.file_text(file_id).text(db);
-        ast::SourceFile::parse(text, edition)
+        parse_(db, self)
     }
 
     // firewall query
@@ -67,5 +63,19 @@ impl EditionedFileId {
     #[inline]
     pub fn edition(self, db: &dyn Database) -> Edition {
         self.field(db).edition()
+    }
+}
+
+#[salsa::tracked(lru = 128, returns(clone), self_ty = EditionedFileId)]
+fn parse_(db: &dyn SourceDatabase, this: EditionedFileId) -> syntax::Parse<ast::SourceFile> {
+    let _p = tracing::info_span!("parse", ?this).entered();
+    let (file_id, edition) = this.unpack(db);
+    let text = db.file_text(file_id).text(db);
+    ast::SourceFile::parse(text, edition)
+}
+
+impl EditionedFileId {
+    pub fn set_parse_lru_capacity(db: &mut dyn SourceDatabase, capacity: usize) {
+        parse_::set_lru_capacity(db, capacity);
     }
 }

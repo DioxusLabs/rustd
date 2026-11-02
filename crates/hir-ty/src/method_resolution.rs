@@ -7,6 +7,7 @@
 //! [`rustc_hir_typeck/method/probe.rs`]: https://github.com/rust-lang/rust/blob/5503df87342a73d0c29126a7e08dc9c1255c46ad/compiler/rustc_hir_typeck/src/method/probe.rs
 
 mod confirm;
+pub mod connector;
 mod probe;
 
 use either::Either;
@@ -584,7 +585,7 @@ pub(crate) fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> 
         if unnamed.is_empty() {
             break;
         }
-        let names = identifiers(call.parse_macro_expansion(db).value.0.syntax_node());
+        let names = identifiers(call.parse_macro_expansion_laundered(db).value.0.syntax_node());
         unnamed.retain(|dep| !names.contains(dep.name.symbol()));
     }
     let mut loaded = FxHashSet::default();
@@ -805,12 +806,27 @@ pub struct InherentImpls<'db> {
 #[salsa::tracked]
 impl<'db> InherentImpls<'db> {
     #[salsa::tracked(returns(ref))]
-    pub fn for_crate(db: &'db dyn HirDatabase, krate: Crate) -> InherentImpls<'db> {
+    pub fn for_crate(db: &'db dyn HirDatabase, krate: Crate) -> Arc<InherentImpls<'db>> {
+        if let Some(input) = db.trait_impls_connector().and_then(|inputs| inputs.get(krate)) {
+            if let Some(value) = input.inherent(db) {
+                return value.get().clone();
+            }
+        }
+        let _p = tracing::info_span!("inherent_impls_in_crate_query", ?krate).entered();
+        let value = Arc::new(Self::collect_def_map(db, crate_def_map(db, krate)));
+        if let Some(inputs) = db.trait_impls_connector() {
+            inputs.ready_inherent(krate);
+        }
+        value
+    }
+
+    #[salsa::tracked(returns(ref))]
+    pub fn for_crate_tracked(db: &'db dyn HirDatabase, krate: Crate) -> Arc<InherentImpls<'db>> {
         let _p = tracing::info_span!("inherent_impls_in_crate_query", ?krate).entered();
 
         let crate_def_map = crate_def_map(db, krate);
 
-        Self::collect_def_map(db, crate_def_map)
+        Arc::new(Self::collect_def_map(db, crate_def_map))
     }
 
     /// The inherent impls of `krate` for one type. An impl added for another type changes
@@ -838,20 +854,29 @@ impl<'db> InherentImpls<'db> {
 }
 
 impl<'db> InherentImpls<'db> {
-    fn collect_def_map(db: &'db dyn HirDatabase, def_map: &'db DefMap) -> Self {
+    fn collect_def_map(db: &'db dyn HirDatabase, def_map: &DefMap) -> Self {
+        Self::collect_def_map_parts(db, def_map, None)
+    }
+
+    fn collect_def_map_parts(
+        db: &'db dyn HirDatabase,
+        def_map: &DefMap,
+        mut parts: Option<&mut Vec<(Option<DefWithBodyId>, Arc<Self>)>>,
+    ) -> Self {
         let mut map = FxHashMap::default();
-        collect(db, def_map, &mut map);
-        let mut map = map
-            .into_iter()
-            .map(|(self_ty, impls)| (self_ty, impls.into_boxed_slice()))
-            .collect::<FxHashMap<_, _>>();
-        map.shrink_to_fit();
-        return Self { map };
+        collect(db, def_map, &mut map, parts.as_deref_mut());
+        if let Some(parts) = parts {
+            for (_, part) in parts {
+                Self::append(&mut map, part);
+            }
+        }
+        return Self::finish(map);
 
         fn collect<'db>(
             db: &'db dyn HirDatabase,
             def_map: &DefMap,
             map: &mut FxHashMap<SimplifiedType<'db>, Vec<ImplId>>,
+            mut parts: Option<&mut Vec<(Option<DefWithBodyId>, Arc<InherentImpls<'db>>)>>,
         ) {
             for (_module_id, module_data) in def_map.modules(db) {
                 for impl_id in module_data.scope(db).inherent_impls() {
@@ -865,13 +890,45 @@ impl<'db> InherentImpls<'db> {
                     }
                 }
 
+                if let Some(parts) = parts.as_deref_mut() {
+                    parts.push((None, Arc::new(InherentImpls::finish(std::mem::take(map)))));
+                }
                 for owner in impl_holders(db, def_map.krate(), module_data.scope(db)) {
                     for (_, block_def_map) in Body::of(db, owner).blocks(db) {
-                        collect(db, block_def_map, map);
+                        collect(db, block_def_map, map, None);
+                    }
+                    if let Some(parts) = parts.as_deref_mut() {
+                        parts.push((
+                            Some(owner),
+                            Arc::new(InherentImpls::finish(std::mem::take(map))),
+                        ));
                     }
                 }
             }
         }
+    }
+
+    fn finish(map: FxHashMap<SimplifiedType<'db>, Vec<ImplId>>) -> Self {
+        let mut map = map
+            .into_iter()
+            .map(|(self_ty, impls)| (self_ty, impls.into_boxed_slice()))
+            .collect::<FxHashMap<_, _>>();
+        map.shrink_to_fit();
+        Self { map }
+    }
+
+    fn append(map: &mut FxHashMap<SimplifiedType<'db>, Vec<ImplId>>, part: &Self) {
+        for (&ty, impls) in &part.map {
+            map.entry(ty).or_default().extend_from_slice(impls);
+        }
+    }
+
+    fn collect_holder(db: &'db dyn HirDatabase, owner: DefWithBodyId) -> Self {
+        let mut map = FxHashMap::default();
+        for (_, block) in Body::of(db, owner).blocks(db) {
+            Self::append(&mut map, &Self::collect_def_map(db, block));
+        }
+        Self::finish(map)
     }
 
     pub fn for_self_ty(&self, self_ty: &SimplifiedType<'db>) -> &[ImplId] {
@@ -930,6 +987,21 @@ pub struct TraitImpls<'db> {
 impl<'db> TraitImpls<'db> {
     #[salsa::tracked(returns(ref))]
     pub fn for_crate(db: &'db dyn HirDatabase, krate: Crate) -> Arc<TraitImpls<'db>> {
+        if let Some(input) = db.trait_impls_connector().and_then(|inputs| inputs.get(krate)) {
+            if let Some(value) = input.value(db) {
+                return value.get().clone();
+            }
+        }
+        let _p = tracing::info_span!("inherent_impls_in_crate_query", ?krate).entered();
+        let value = Arc::new(Self::collect_def_map(db, crate_def_map(db, krate)));
+        if let Some(inputs) = db.trait_impls_connector() {
+            inputs.ready(krate);
+        }
+        value
+    }
+
+    #[salsa::tracked(returns(ref))]
+    pub fn for_crate_tracked(db: &'db dyn HirDatabase, krate: Crate) -> Arc<TraitImpls<'db>> {
         let _p = tracing::info_span!("inherent_impls_in_crate_query", ?krate).entered();
 
         let crate_def_map = crate_def_map(db, krate);
@@ -989,21 +1061,30 @@ impl<'db> TraitImpls<'db> {
 
 impl<'db> TraitImpls<'db> {
     fn collect_def_map(db: &'db dyn HirDatabase, def_map: &DefMap) -> Self {
+        Self::collect_def_map_parts(db, def_map, None)
+    }
+
+    fn collect_def_map_parts(
+        db: &'db dyn HirDatabase,
+        def_map: &DefMap,
+        mut parts: Option<&mut Vec<(Option<DefWithBodyId>, Arc<Self>)>>,
+    ) -> Self {
         let lang_items = hir_def::lang_item::lang_items(db, def_map.krate());
         let mut map = FxHashMap::default();
-        collect(db, def_map, lang_items, &mut map);
-        let mut map = map
-            .into_iter()
-            .map(|(trait_id, trait_map)| (trait_id, trait_map.finish()))
-            .collect::<FxHashMap<_, _>>();
-        map.shrink_to_fit();
-        return Self { map };
+        collect(db, def_map, lang_items, &mut map, parts.as_deref_mut());
+        if let Some(parts) = parts {
+            for (_, part) in parts {
+                Self::append(&mut map, part);
+            }
+        }
+        return Self::finish(map);
 
         fn collect<'db>(
             db: &'db dyn HirDatabase,
             def_map: &DefMap,
             lang_items: &LangItems,
             map: &mut FxHashMap<TraitId, OneTraitImplsBuilder<'db>>,
+            mut parts: Option<&mut Vec<(Option<DefWithBodyId>, Arc<TraitImpls<'db>>)>>,
         ) {
             for (_module_id, module_data) in def_map.modules(db) {
                 for impl_id in module_data.scope(db).trait_impls() {
@@ -1050,13 +1131,47 @@ impl<'db> TraitImpls<'db> {
                     entry.1.push(impl_id);
                 }
 
+                if let Some(parts) = parts.as_deref_mut() {
+                    parts.push((None, Arc::new(TraitImpls::finish(std::mem::take(map)))));
+                }
                 for owner in impl_holders(db, def_map.krate(), module_data.scope(db)) {
                     for (_, block_def_map) in Body::of(db, owner).blocks(db) {
-                        collect(db, block_def_map, lang_items, map);
+                        collect(db, block_def_map, lang_items, map, None);
+                    }
+                    if let Some(parts) = parts.as_deref_mut() {
+                        parts
+                            .push((Some(owner), Arc::new(TraitImpls::finish(std::mem::take(map)))));
                     }
                 }
             }
         }
+    }
+
+    fn finish(map: FxHashMap<TraitId, OneTraitImplsBuilder<'db>>) -> Self {
+        let mut map =
+            map.into_iter().map(|(id, value)| (id, value.finish())).collect::<FxHashMap<_, _>>();
+        map.shrink_to_fit();
+        Self { map }
+    }
+
+    fn append(map: &mut FxHashMap<TraitId, OneTraitImplsBuilder<'db>>, part: &Self) {
+        for (&id, value) in &part.map {
+            let entry = map.entry(id).or_default();
+            entry.blanket_impls.extend_from_slice(&value.blanket_impls);
+            for (&ty, (impls, derives)) in &value.non_blanket_impls {
+                let entry = entry.non_blanket_impls.entry(ty).or_default();
+                entry.0.extend_from_slice(impls);
+                entry.1.extend_from_slice(derives);
+            }
+        }
+    }
+
+    fn collect_holder(db: &'db dyn HirDatabase, owner: DefWithBodyId) -> Self {
+        let mut map = FxHashMap::default();
+        for (_, block) in Body::of(db, owner).blocks(db) {
+            Self::append(&mut map, &Self::collect_def_map(db, block));
+        }
+        Self::finish(map)
     }
 
     pub fn blanket_impls(&self, for_trait: TraitId) -> &[ImplId] {

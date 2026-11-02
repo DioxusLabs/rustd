@@ -3423,7 +3423,7 @@ fn mir_body_for_coroutine_cycle_result<'db>(
 fn check_expansions<'db>(db: &'db dyn HirDatabase, owner: InferBodyId<'db>) -> Result<'db, ()> {
     let (_, source_map) = ExpressionStore::with_source_map(db, owner.expression_store_owner(db));
     for (_, call) in source_map.macro_calls() {
-        if let Some(error) = &call.parse_macro_expansion(db).err {
+        if let Some(error) = &call.parse_macro_expansion_laundered(db).err {
             let message = error.render_to_string(db).message;
             not_supported!("macro call that failed to expand: {message}");
         }

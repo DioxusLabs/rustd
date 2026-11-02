@@ -35,6 +35,14 @@ pub mod lang_item;
 pub mod unstable_features;
 
 pub mod expr_store;
+
+/// Sets all syntax, expansion, body and IDE-attribute LRU capacities. Zero disables eviction.
+pub fn set_lru_capacity(db: &mut dyn base_db::SourceDatabase, capacity: usize) {
+    base_db::EditionedFileId::set_parse_lru_capacity(db, capacity);
+    hir_expand::set_lru_capacity(db, capacity);
+    expr_store::Body::set_lru_capacity(db, capacity);
+    attrs::set_lru_capacity(db, capacity);
+}
 pub mod hir;
 pub mod resolver;
 pub mod upvars;

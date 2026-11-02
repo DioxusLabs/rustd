@@ -2603,7 +2603,8 @@ impl ModCollector<'_, '_> {
         } else {
             // Case 2: normal `macro_rules!` macro
             let id = InFile::new(self.file_id(), ast_id);
-            let decl_expander = id.upcast().decl_macro_expander(self.def_collector.db, krate);
+            let decl_expander =
+                id.upcast().decl_macro_expander_laundered(self.def_collector.db, krate);
             let styles = decl_expander.mac.rule_styles();
             MacroExpander::Declarative { styles }
         };
@@ -2684,7 +2685,8 @@ impl ModCollector<'_, '_> {
         } else {
             // Case 2: normal `macro`
             let id = InFile::new(self.file_id(), ast_id);
-            let decl_expander = id.upcast().decl_macro_expander(self.def_collector.db, krate);
+            let decl_expander =
+                id.upcast().decl_macro_expander_laundered(self.def_collector.db, krate);
             let styles = decl_expander.mac.rule_styles();
             MacroExpander::Declarative { styles }
         };

@@ -43,6 +43,10 @@ use crate::{
 
 #[salsa::db]
 pub trait HirDatabase: SourceDatabase + 'static {
+    fn trait_impls_connector(&self) -> Option<&crate::method_resolution::connector::Inputs> {
+        None
+    }
+
     /// Manual implementation of upcasting from `dyn SourceDatabase` to `dyn HirDatabase`.
     ///
     /// This function is needed because Rust can't perform this upcasting automatically

@@ -124,7 +124,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
         let ptr = InFile::new(source.file_id, AstPtr::new(&macro_call_node));
         let macro_call_id = resolve_macro_call_id(&db, def_map, ast_id, ptr)
             .unwrap_or_else(|| panic!("unable to find semantic macro call {macro_call_node}"));
-        let expansion_result = macro_call_id.parse_macro_expansion(&db);
+        let expansion_result = macro_call_id.parse_macro_expansion_laundered(&db);
         expansions.push((macro_call_node.clone(), expansion_result));
     }
 

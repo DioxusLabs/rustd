@@ -2,7 +2,7 @@
 
 #[macro_export]
 macro_rules! impl_hir_database {
-    ($ty:ty) => {
+    ($ty:ty $(, $item:item)*) => {
         const _: () = {
             use $crate::{
                 __private::{hir_def::ModuleId, salsa},
@@ -13,6 +13,7 @@ macro_rules! impl_hir_database {
 
             #[salsa::db]
             impl $crate::db::HirDatabase for $ty {
+                $($item)*
                 fn as_dyn(&self) -> &dyn HirDatabase {
                     self
                 }

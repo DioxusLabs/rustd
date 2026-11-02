@@ -16,6 +16,7 @@ mod patterns;
 mod regression;
 mod simple;
 mod trait_aliases;
+mod trait_impls_connector;
 mod traits;
 mod variance;
 

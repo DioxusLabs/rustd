@@ -23,6 +23,7 @@ pub(crate) struct TestDB {
     crates_map: Arc<CratesMap>,
     events: Arc<Mutex<Option<Vec<salsa::Event>>>>,
     nonce: Nonce,
+    pub(crate) trait_impls: std::sync::Arc<hir_ty::method_resolution::connector::Inputs>,
 }
 
 impl Default for TestDB {
@@ -42,6 +43,7 @@ impl Default for TestDB {
             files: Default::default(),
             crates_map: Default::default(),
             nonce: Nonce::new(),
+            trait_impls: Default::default(),
         };
         hir_def::set_expand_proc_attr_macros(&mut this, true);
         // This needs to be here otherwise `CrateGraphBuilder` panics.
@@ -65,6 +67,7 @@ impl Clone for TestDB {
             crates_map: self.crates_map.clone(),
             events: self.events.clone(),
             nonce: self.nonce,
+            trait_impls: self.trait_impls.clone(),
         }
     }
 }
@@ -186,7 +189,12 @@ impl TestDB {
     }
 }
 
-crate::impl_hir_database!(TestDB);
+crate::impl_hir_database!(
+    TestDB,
+    fn trait_impls_connector(&self) -> Option<&hir_ty::method_resolution::connector::Inputs> {
+        Some(&self.trait_impls)
+    }
+);
 
 impl TestDB {
     pub(crate) fn log(&self, f: impl FnOnce()) -> Vec<salsa::Event> {

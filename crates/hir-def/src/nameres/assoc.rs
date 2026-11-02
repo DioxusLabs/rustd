@@ -366,7 +366,7 @@ impl<'db> AssocItemCollector<'db> {
             return;
         }
 
-        let (syntax, span_map) = &macro_call_id.parse_macro_expansion(self.db).value;
+        let (syntax, span_map) = &macro_call_id.parse_macro_expansion_laundered(self.db).value;
         let old_file_id = mem::replace(&mut self.file_id, macro_call_id.into());
         let old_ast_id_map = mem::replace(&mut self.ast_id_map, self.file_id.ast_id_map(self.db));
         let old_span_map = mem::replace(&mut self.span_map, SpanMap::ExpansionSpanMap(span_map));

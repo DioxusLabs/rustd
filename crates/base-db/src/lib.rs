@@ -13,6 +13,7 @@ use span::TextSize;
 mod change;
 mod editioned_file_id;
 mod input;
+pub mod query_phase;
 pub mod target;
 
 use std::{
@@ -387,6 +388,15 @@ pub struct SourceRootInput {
 
 #[salsa::db]
 pub trait SourceDatabase: salsa::Database + std::fmt::Debug {
+    fn macro_expansion_data(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        None
+    }
+
+    /// Optional connector-owned state, outside the tracked dependency graph.
+    fn connector_data(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        None
+    }
+
     /// Text of the file.
     fn file_text(&self, file_id: vfs::FileId) -> FileText;
 

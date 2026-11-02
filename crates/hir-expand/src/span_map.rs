@@ -137,6 +137,6 @@ pub(crate) fn real_span_map(
 
 impl MacroCallId {
     pub fn expansion_span_map(self, db: &dyn SourceDatabase) -> &ExpansionSpanMap {
-        &self.parse_macro_expansion(db).value.1
+        &self.parse_macro_expansion_laundered(db).value.1
     }
 }

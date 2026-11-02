@@ -684,7 +684,7 @@ fn expand_doc_macro_call<'db>(
     .value?;
     macro_calls.push((ast_id, call_id));
 
-    let (parse, span_map) = &call_id.parse_macro_expansion(expander.db).value;
+    let (parse, span_map) = &call_id.parse_macro_expansion_laundered(expander.db).value;
     let expr = parse.clone().cast::<ast::Expr>().map(|parse| parse.tree())?;
 
     // Build a new source context for the expansion file so that any further

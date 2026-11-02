@@ -191,7 +191,7 @@ impl<'db> Expander<'db> {
             ));
         }
 
-        let res = call_id.parse_macro_expansion(db);
+        let res = call_id.parse_macro_expansion_laundered(db);
 
         let err = err.or_else(|| res.err.clone());
         ExpandResult {

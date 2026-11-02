@@ -66,7 +66,7 @@ pub fn expand_eager_macro_input(
     #[expect(deprecated, reason = "builtin eager macros are never derives")]
     let (_, _, span) = arg_id.macro_arg(db);
     let ExpandResult { value: (arg_exp, arg_exp_map), err: parse_err } =
-        arg_id.parse_macro_expansion(db);
+        arg_id.parse_macro_expansion_laundered(db);
 
     let mut arg_map = ExpansionSpanMap::empty();
 
@@ -143,7 +143,7 @@ fn lazy_expand<'db>(
     );
     eager_callback(ast_id.map(|ast_id| (AstPtr::new(macro_call), ast_id)), id);
 
-    id.parse_macro_expansion(db)
+    id.parse_macro_expansion_laundered(db)
         .as_ref()
         .map(|parse| (InFile::new(id.into(), parse.0.clone()), &parse.1))
 }
@@ -245,7 +245,7 @@ fn eager_macro_recur(
                             call_id,
                         );
                         let ExpandResult { value: (parse, map), err: err2 } =
-                            call_id.parse_macro_expansion(db);
+                            call_id.parse_macro_expansion_laundered(db);
 
                         map.iter().for_each(|(o, span)| expanded_map.push(o + offset, span));
 
