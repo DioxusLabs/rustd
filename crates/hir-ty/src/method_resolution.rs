@@ -10,7 +10,7 @@ mod confirm;
 mod probe;
 
 use either::Either;
-use hir_expand::name::Name;
+use hir_expand::{MacroCallId, name::Name};
 use intern::Symbol;
 use salsa::SalsaValue;
 use span::Edition;
@@ -566,14 +566,6 @@ pub(crate) fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> 
     // Few files name a dependency, and a file's text tells which may without its tree.
     let def_map = crate_def_map(db, krate);
     let mut files = def_map.modules(db).filter_map(|(_, module)| module.origin.file_id());
-    let identifiers = |syntax: syntax::SyntaxNode| {
-        syntax
-            .descendants_with_tokens()
-            .filter_map(|it| it.into_token())
-            .filter(|it| it.kind() == SyntaxKind::IDENT)
-            .map(|it| Symbol::intern(it.text()))
-            .collect::<FxHashSet<_>>()
-    };
     while !unnamed.is_empty()
         && let Some(file) = files.next()
     {
@@ -584,7 +576,7 @@ pub(crate) fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> 
         if unnamed.is_empty() {
             break;
         }
-        let names = identifiers(call.parse_macro_expansion(db).value.0.syntax_node());
+        let names = macro_dependency_names(db, call, krate);
         unnamed.retain(|dep| !names.contains(dep.name.symbol()));
     }
     let mut loaded = FxHashSet::default();
@@ -626,6 +618,25 @@ fn file_dependency_names(
         return possible;
     }
     dependency_names_in_syntax(file.parse(db).syntax_node(), &possible)
+}
+
+#[salsa::tracked(returns(ref))]
+fn macro_dependency_names(
+    db: &dyn HirDatabase,
+    call: MacroCallId,
+    krate: Crate,
+) -> FxHashSet<Symbol> {
+    let possible = krate
+        .data(db)
+        .dependencies
+        .iter()
+        .filter(|dep| {
+            let data = dep.crate_id.data(db);
+            !(dep.is_sysroot() || data.origin.is_lang() || data.is_proc_macro)
+        })
+        .map(|dep| dep.name.symbol().clone())
+        .collect();
+    dependency_names_in_syntax(call.parse_macro_expansion(db).value.0.syntax_node(), &possible)
 }
 
 fn dependency_names_in_syntax(
