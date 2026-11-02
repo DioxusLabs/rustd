@@ -2,7 +2,6 @@
 
 use hir_def::item_tree::{file_item_tree_snapshot, inputs::ItemTreeInput};
 use hir_expand::{MacroCallId, MacroDefKind};
-use ide_db::base_db::SourceDatabase;
 use ide_db::base_db::salsa::{Durability, Setter, plumbing::ZalsaDatabase};
 use ide_db::{RootDatabase, base_db::EditionedFileId};
 use rustc_hash::{FxHashMap, FxHashSet};

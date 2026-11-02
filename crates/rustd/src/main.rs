@@ -3188,6 +3188,21 @@ fn declared_in(db: &RootDatabase, krate: Crate) -> Declared {
 fn functions_of_modules(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
     let mut declared = Declared::default();
     declared.in_modules(db, krate);
+    let mut modules = vec![krate.root_module(db)];
+    while let Some(module) = modules.pop() {
+        modules.extend(module.children(db));
+        for def in module.declarations(db) {
+            if let hir::ModuleDef::Trait(trait_) = def {
+                let trait_: hir_def::TraitId = trait_.into();
+                declared.functions.extend(trait_.trait_items(db).items.iter().filter_map(
+                    |&(_, item)| match item {
+                        AssocItemId::FunctionId(func) => Some(func),
+                        _ => None,
+                    },
+                ));
+            }
+        }
+    }
     declared.functions
 }
 
@@ -3267,13 +3282,30 @@ fn lower(db: &RootDatabase, bodies: Vec<DefWithBodyId>) -> Vec<DefWithBodyId> {
     bodies
 }
 
+type SkippedReport = Arc<[(String, CodegenError)]>;
+
+#[derive(Clone, Default)]
+struct BuildText {
+    skipped: Option<SkippedReport>,
+    harness: Option<Result<String, String>>,
+}
+
+impl BuildText {
+    fn skipped(&mut self, verify: bool, fresh: impl Fn() -> SkippedReport) -> SkippedReport {
+        if verify && let Some(cached) = &self.skipped {
+            assert_eq!(cached, &fresh(), "skipped diagnostics fast path");
+        }
+        self.skipped.get_or_insert_with(fresh).clone()
+    }
+}
+
 struct Build {
     compiled: usize,
-    skipped: Skipped,
+    skipped: SkippedReport,
     instances: usize,
     codegen: Duration,
     emit: Duration,
-    emitted: [Duration; 3],
+    emitted: [Duration; 4],
     /// How long finding the roots, checking what is cached and compiling took, in that order.
     steps: [Duration; 3],
     /// Within the checking, the longest a thread took over each kind of cached thing.
@@ -3281,52 +3313,6 @@ struct Build {
     /// Why what was built is no program, when it is not: a function that nothing has code for,
     /// or an `env!` that asks for a variable nobody set.
     unfit: Option<String>,
-}
-
-struct Skipped {
-    count: usize,
-    summary: String,
-    all: Option<(std::ffi::OsString, String)>,
-}
-
-impl Skipped {
-    fn of<K: Copy + Eq + std::hash::Hash>(
-        skipped: &[(K, CodegenError)],
-        mut name: impl FnMut(K) -> String,
-        path: Option<std::ffi::OsString>,
-    ) -> Self {
-        use std::fmt::Write;
-        let mut names = FxHashMap::default();
-        let mut name = |func| names.entry(func).or_insert_with(|| name(func)).clone();
-        let all = path.map(|path| {
-            let mut out = String::new();
-            for (func, error) in skipped {
-                writeln!(out, "{}: {error}", name(*func)).unwrap();
-            }
-            (path, out)
-        });
-        let mut summary = String::new();
-        if skipped.len() <= 8 {
-            for (func, error) in skipped {
-                writeln!(summary, "  left to rustc: {}: {error}", name(*func)).unwrap();
-            }
-        } else {
-            let mut reasons: FxHashMap<String, (usize, K)> = FxHashMap::default();
-            for (func, error) in skipped {
-                let error = error.to_string();
-                let reason = error.rsplit("`: ").next().unwrap_or(&error);
-                let reason = reason.split(['(', '{']).next().unwrap_or(reason).trim();
-                let entry = reasons.entry(reason.to_owned()).or_insert((0, *func));
-                entry.0 += 1;
-            }
-            let mut reasons: Vec<_> = reasons.into_iter().collect();
-            reasons.sort_by_key(|(_, (count, _))| std::cmp::Reverse(*count));
-            for (reason, (count, example)) in reasons {
-                writeln!(summary, "  {count:>5}  {reason}  (e.g. {})", name(example)).unwrap();
-            }
-        }
-        Self { count: skipped.len(), summary, all }
-    }
 }
 
 thread_local! {
@@ -3341,8 +3327,9 @@ fn build(
     args: &Args,
     known: &mut Rejections,
     listed: &Listed,
+    text: &mut BuildText,
 ) -> anyhow::Result<Build> {
-    Ok(prepare_build(db, table, args, known, listed, false)?.unwrap())
+    Ok(prepare_build(db, table, args, known, listed, text, false)?.unwrap())
 }
 
 fn prepare_build(
@@ -3351,6 +3338,7 @@ fn prepare_build(
     args: &Args,
     known: &mut Rejections,
     listed: &Listed,
+    text: &mut BuildText,
     warm_only: bool,
 ) -> anyhow::Result<Option<Build>> {
     let roots_phase = ide_db::base_db::query_phase::enter("roots/other");
@@ -3480,10 +3468,13 @@ fn prepare_build(
     // thread: left to the questions, whichever gets there has the others wait for all of it.
     let next = std::sync::atomic::AtomicUsize::new(0);
     let impls = std::sync::atomic::AtomicU64::new(0);
+    let prewarm = known.impls_changed();
+    let impl_crates = if prewarm { local.as_slice() } else { &[] };
     let stale: Option<Vec<_>> = std::thread::scope(|scope| {
         let parts: Vec<_> = (0..threads)
             .map(|part| {
-                let (db, known, local, next, impls) = (db.clone(), &*known, &local, &next, &impls);
+                let (db, known, local, next, impls) =
+                    (db.clone(), &*known, impl_crates, &next, &impls);
                 scope.spawn(move || {
                     PROBING.set(true);
                     hir::attach_db(&db, || {
@@ -3547,6 +3538,11 @@ fn prepare_build(
     hir::attach_db(db, || known.set_stale(hir_db, stale.unwrap_or_default()));
     if std::env::var_os("RUSTD_STATS").is_some() {
         eprintln!(
+            "check impls prewarm: {}; program={}",
+            if prewarm { "enabled" } else { "skipped" },
+            args.out.display()
+        );
+        eprintln!(
             "check impls longest-thread-us: {}; program={}",
             impls.load(std::sync::atomic::Ordering::Relaxed),
             args.out.display()
@@ -3561,6 +3557,9 @@ fn prepare_build(
     let mut unit =
         hir::attach_db(db, || CodegenUnit::compile(hir_db, &resolver, roots, &denied, known))
             .map_err(anyhow::Error::msg)?;
+    if known.stats.patched.is_none() {
+        *text = BuildText::default();
+    }
     let name = |func| resolver.path(func).unwrap_or_else(|| "<assoc fn>".to_owned());
     let codegen = start.elapsed();
     if std::env::var_os("RUSTD_STATS").is_some() {
@@ -3592,36 +3591,45 @@ fn prepare_build(
     let written = start.elapsed();
     let mut reached = Duration::ZERO;
     let mut harness_unfit = None;
+    let retained_harness = text.harness.is_some();
     if let Some(harness) = harness {
         // What each test can run, for the client to run only the ones an edit can change.
         Reached::of(db, listed, args, known, sharing).write(&args.out)?;
         reached = start.elapsed() - written;
-        let text = hir::attach_db(db, || match programs_own.first() {
-            Some(&krate) if doctest => {
-                let runners: Vec<(String, Option<String>)> = listed
-                    .of(db, krate)
-                    .functions
-                    .iter()
-                    .filter(|&&it| doctest::is_runner(db, it.into()))
-                    .map(|&it| {
-                        let name = hir::Function::from(it).name(db).as_str().to_owned();
-                        (name, resolver.function_named(it))
-                    })
-                    .collect();
-                doctest::harness(db, krate.into(), &runners)
-            }
-            _ => harness_of(db, &resolver, &programs_own),
-        });
-        match text {
+        let make_harness = || {
+            hir::attach_db(db, || match programs_own.first() {
+                Some(&krate) if doctest => {
+                    let runners: Vec<(String, Option<String>)> = listed
+                        .of(db, krate)
+                        .functions
+                        .iter()
+                        .filter(|&&it| doctest::is_runner(db, it.into()))
+                        .map(|&it| {
+                            let name = hir::Function::from(it).name(db).as_str().to_owned();
+                            (name, resolver.function_named(it))
+                        })
+                        .collect();
+                    doctest::harness(db, krate.into(), &runners)
+                }
+                _ => harness_of(db, &resolver, &programs_own),
+            })
+        };
+        if std::env::var_os("RUSTD_VERIFY_FASTPATH").is_some_and(|it| it == "1")
+            && let Some(cached) = &text.harness
+        {
+            assert_eq!(cached, &make_harness(), "harness text fast path");
+        }
+        let harness_text = text.harness.get_or_insert_with(make_harness);
+        match harness_text {
             Ok(text) => {
                 // A splice adds the edit to the executable and leaves the harness as it was linked.
-                if harness.write(&text)?
+                if harness.write(text)?
                     && let Some(binary) = &args.splice
                 {
                     lock(&LINKED).remove(binary);
                 }
             }
-            Err(reason) => harness_unfit = Some(reason),
+            Err(reason) => harness_unfit = Some(reason.clone()),
         }
     }
     let harnessed = start.elapsed() - written - reached;
@@ -3637,19 +3645,32 @@ fn prepare_build(
         .report_errors
         .first()
         .map(|(func, error)| format!("the report shim for test `{}` failed: {error}", name(*func)));
-    let skipped: Vec<_> = unit
-        .skipped
-        .into_iter()
-        .map(|(func, error)| (func, with_failed_macro(db, func, error)))
-        .collect();
-    let skipped_report = Skipped::of(&skipped, name, std::env::var_os("RUSTD_SKIPPED"));
+    let make_skipped = || {
+        unit.skipped
+            .iter()
+            .map(|(func, error)| (name(*func), with_failed_macro(db, *func, error.clone())))
+            .collect::<SkippedReport>()
+    };
+    if std::env::var_os("RUSTD_STATS").is_some() {
+        eprintln!(
+            "write text: retained skipped={} harness={}; program={}",
+            text.skipped.is_some(),
+            retained_harness,
+            args.out.display()
+        );
+    }
+    let skipped = text.skipped(
+        std::env::var_os("RUSTD_VERIFY_FASTPATH").is_some_and(|it| it == "1"),
+        make_skipped,
+    );
+    let diagnosed = start.elapsed() - written - reached - harnessed;
     let build = Build {
         compiled: unit.compiled.len(),
-        skipped: skipped_report,
+        skipped,
         instances: unit.instances,
         codegen,
         emit: start.elapsed(),
-        emitted: [written, reached, harnessed],
+        emitted: [written, reached, harnessed, diagnosed],
         steps: [setup, revalidate - setup, codegen - revalidate],
         looked,
         unfit: harness_unfit.or(report_unfit).or(missing).or_else(|| {
@@ -3659,7 +3680,7 @@ fn prepare_build(
     };
     if let Some(path) = &args.report {
         let compiled: Vec<String> = unit.compiled.iter().map(|&(func, _)| name(func)).collect();
-        build.write_report(path, &compiled, &skipped, name)?;
+        build.write_report(path, &compiled)?;
     }
     if let Some(dir) = &args.isolate {
         std::fs::create_dir_all(dir)?;
@@ -3686,13 +3707,7 @@ fn prepare_build(
 }
 
 impl Build {
-    fn write_report(
-        &self,
-        path: &Path,
-        compiled: &[String],
-        skipped: &[(FunctionId, CodegenError)],
-        name: impl Fn(FunctionId) -> String,
-    ) -> anyhow::Result<()> {
+    fn write_report(&self, path: &Path, compiled: &[String]) -> anyhow::Result<()> {
         use std::fmt::Write;
         let mut out = String::new();
         writeln!(
@@ -3704,9 +3719,8 @@ impl Build {
         for name in compiled {
             writeln!(out, "compiled\t{name}\t")?;
         }
-        for (func, error) in skipped {
+        for (name, error) in self.skipped.iter() {
             let error = error.to_string().replace(['\t', '\n'], " ");
-            let name = name(*func);
             writeln!(out, "skipped\t{name}\t{error}")?;
         }
         Ok(std::fs::write(path, out)?)
@@ -3747,17 +3761,38 @@ fn report(build: &Build) {
     eprintln!(
         "compiled {} of {} fns (+{} instances) in {:.1?} (+{:.1?} emit)",
         build.compiled,
-        build.compiled + build.skipped.count,
+        build.compiled + build.skipped.len(),
         build.instances,
         build.codegen,
         build.emit,
     );
-    if let Some((path, all)) = &build.skipped.all {
+    if let Some(path) = std::env::var_os("RUSTD_SKIPPED") {
+        let all: String =
+            build.skipped.iter().map(|(name, error)| format!("{name}: {error}\n")).collect();
         if let Err(error) = std::fs::write(&path, all) {
             eprintln!("rustd: cannot write {path:?}: {error}");
         }
     }
-    eprint!("{}", build.skipped.summary);
+    if build.skipped.len() <= 8 {
+        for (name, error) in build.skipped.iter() {
+            eprintln!("  left to rustc: {name}: {error}");
+        }
+        return;
+    }
+    // Bucket by the innermost reason, without the payload.
+    let mut reasons: FxHashMap<String, (usize, &str)> = FxHashMap::default();
+    for (name, error) in build.skipped.iter() {
+        let error = error.to_string();
+        let reason = error.rsplit("`: ").next().unwrap_or(&error);
+        let reason = reason.split(['(', '{']).next().unwrap_or(reason).trim();
+        let entry = reasons.entry(reason.to_owned()).or_insert((0, name));
+        entry.0 += 1;
+    }
+    let mut reasons: Vec<_> = reasons.into_iter().collect();
+    reasons.sort_by_key(|(_, (count, _))| std::cmp::Reverse(*count));
+    for (reason, (count, example)) in reasons {
+        eprintln!("  {count:>5}  {reason}  (e.g. {example})");
+    }
 }
 
 /// The lock, also after a thread panicked with it: a build that is interrupted or that
@@ -4398,7 +4433,14 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             crate_lookup: args.crate_lookup.clone(),
         };
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            build(db, table, &args, &mut Rejections::default(), &mut Listed::default())
+            build(
+                db,
+                table,
+                &args,
+                &mut Rejections::default(),
+                &mut Listed::default(),
+                &mut BuildText::default(),
+            )
         }));
         let error = match built {
             Ok(Ok(_)) => continue,
@@ -4621,6 +4663,7 @@ struct Program {
     args: Args,
     table: Arc<SymbolTable>,
     known: Rejections,
+    text: BuildText,
     unbuilt: Unbuilt,
     /// The object the last build was asked for.
     wrote: Option<PathBuf>,
@@ -5885,11 +5928,12 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
         known.touch(&db, None);
         listed.touch(&db, None);
     }
-    let mut cold = build(&db, &table, &args, &mut known, &listed)?;
+    let mut text = BuildText::default();
+    let mut cold = build(&db, &table, &args, &mut known, &listed, &mut text)?;
     // An `include!` in a body is first seen when the body is compiled.
     if WatchedFile::include_sources(&mut files, &mut tree, &mut db) {
         known.touch(&db, None);
-        cold = build(&db, &table, &args, &mut known, &listed)?;
+        cold = build(&db, &table, &args, &mut known, &listed, &mut text)?;
     }
     if let Some(unfit) = &cold.unfit {
         report(&cold);
@@ -5984,6 +6028,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
         args,
         table: Arc::new(table),
         known,
+        text,
         unbuilt: Unbuilt::default(),
         wrote,
         whole,
@@ -6030,7 +6075,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
         if WatchedFile::watch_included(&mut files, &mut db)
             | WatchedFile::include_sources(&mut files, &mut tree, &mut db)
         {
-            programs.iter_mut().for_each(|it| it.known.touch(&db, None));
+            programs.iter_mut().for_each(|it| it.touch(&db, None));
         }
         // The program each client asks for.
         let mut clients: Vec<(usize, Asked)> = Vec::new();
@@ -6108,6 +6153,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                                                         &program.args,
                                                         &mut program.known,
                                                         listed,
+                                                        &mut program.text,
                                                         true,
                                                     ) {
                                                         eprintln!(
@@ -6212,7 +6258,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                                     && parts.unit_roots == program.args.unit_roots
                                     && parts.debug == program.args.debug;
                                 if same && (linked.is_none() || new.is_empty()) {
-                                    program.known.touch(&db, (!included).then_some(&new));
+                                    program.touch(&db, (!included).then_some(&new));
                                     program.unbuilt.stale |= !new.is_empty();
                                     continue;
                                 }
@@ -6241,7 +6287,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                         let reading = process::turn(&mut db, stream.env.clone());
                         if !reading.is_empty() {
                             for program in &mut programs {
-                                program.known.touch(&db, Some(&reading));
+                                program.touch(&db, Some(&reading));
                                 program.unbuilt.stale = true;
                             }
                             listed.touch(&db, Some(&reading));
@@ -6409,6 +6455,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                                 args,
                                 table,
                                 known,
+                                text: BuildText::default(),
                                 unbuilt,
                                 wrote: None,
                                 whole: None,
@@ -6453,7 +6500,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                         (program.args.base, program.args.members) = (base, members);
                         program.args.unit_roots = unit_roots;
                         program.unbuilt.stale = true;
-                        program.known.touch(&db, None);
+                        program.touch(&db, None);
                     }
                     listed.touch(&db, None);
                     eprintln!("split again: {:.1?}", start.elapsed());
@@ -6659,7 +6706,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
         }
         // Asked after the change: a file can have joined a crate with it.
         if !included.is_empty() {
-            programs.iter_mut().for_each(|it| it.known.touch(&db, None));
+            programs.iter_mut().for_each(|it| it.touch(&db, None));
             listed.touch(&db, None);
         }
         for path in included {
@@ -6685,22 +6732,33 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
         let paths = Arc::new(Sources { paths });
         let sources = outlines.after_edit(&db, &listed, sources);
         let outlined = start.elapsed();
-        for (file, bodies_only) in sources {
+        for (file, bodies_only, functions) in sources {
             if bodies_only {
                 if std::env::var_os("RUSTD_STATS").is_some() {
-                    eprintln!("bodies only: {file:?}");
+                    eprintln!(
+                        "bodies only: {file:?}; changed functions={:?}; relocated functions={:?}",
+                        functions.as_ref().map(|it| it.code.len()),
+                        functions.as_ref().map(|it| it.locations.len())
+                    );
                 }
-                programs.iter_mut().for_each(|it| it.known.touch_bodies(&db, file));
+                programs.iter_mut().for_each(|it| {
+                    it.known.touch_bodies(
+                        &db,
+                        file,
+                        functions.as_ref().map(|it| it.code.as_slice()),
+                        functions.as_ref().map_or(&[], |it| it.locations.as_slice()),
+                    )
+                });
                 continue;
             }
             let crates = ide_db::base_db::relevant_crates(&db, file);
             let crates = (!crates.is_empty()).then_some(crates);
-            programs.iter_mut().for_each(|it| it.known.touch(&db, crates));
+            programs.iter_mut().for_each(|it| it.touch(&db, crates));
             listed.touch(&db, crates);
         }
         if !moved.is_empty() {
             programs.iter_mut().for_each(|it| {
-                it.known.touch(&db, Some(&moved));
+                it.touch(&db, Some(&moved));
                 it.unbuilt.stale = true;
             });
             listed.touch(&db, Some(&moved));
@@ -6711,7 +6769,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
             write_examples(&mut db, emits.triple(), |db| builds.settle(db, &mut programs))?;
         if !crates.is_empty() {
             programs.iter_mut().for_each(|it| {
-                it.known.touch(&db, Some(&crates));
+                it.touch(&db, Some(&crates));
                 it.unbuilt.stale = true;
             });
             listed.touch(&db, Some(&crates));
@@ -6751,6 +6809,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                     args: program.args.clone(),
                     table: program.table.clone(),
                     known: Rejections::default(),
+                    text: BuildText::default(),
                     unbuilt: Unbuilt::default(),
                     wrote: None,
                     whole: None,
@@ -6821,7 +6880,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                 break answers;
             }
             for program in &mut programs {
-                program.known.touch(&db, Some(&late));
+                program.touch(&db, Some(&late));
                 program.unbuilt.stale = true;
             }
             listed.touch(&db, Some(&late));
@@ -7014,6 +7073,10 @@ struct Edit {
 }
 
 impl Program {
+    fn touch(&mut self, db: &RootDatabase, crates: Option<&[ide_db::base_db::Crate]>) {
+        self.text = BuildText::default();
+        self.known.touch(db, crates);
+    }
     /// Notes the crates rustc did not compile from the files this program is of, when it joins
     /// linked with what rustc built: of the first checkout, whose files as the daemon read them
     /// are `as_compiled`, or of its own checkout as it was when rustc built it.
@@ -7193,12 +7256,14 @@ impl Program {
         wanted: Option<&Outputs>,
         link_it: bool,
     ) -> anyhow::Result<Result<String, String>> {
+        let queued = edit.start.elapsed().saturating_sub(edit.apply);
+        let preparing = Instant::now();
         // The crates left to rustc are as edited when a client has named what it built since.
         let _sync_phase = ide_db::base_db::query_phase::enter("prebuild");
         let named_anew = std::mem::take(&mut self.unbuilt.named_anew);
         let unnamed = if named_anew { None } else { self.widen(db) };
         self.read_copies_again(db)?;
-        let Program { args, table, known, unbuilt, wrote, whole, tests, .. } = self;
+        let Program { args, table, known, text, unbuilt, wrote, whole, tests, .. } = self;
         let Outputs { out, patch, link_cmd, splice } =
             wanted.cloned().unwrap_or_else(|| Outputs::of(args));
         let args = &Args { out, patch, link_cmd, splice, ..args.clone() };
@@ -7219,13 +7284,20 @@ impl Program {
         // Neither is what no crate that is built reads: an example, or a test.
         edited.retain(|&file| listed.sees(db, file));
         // The check of the edited files does not wait for the build: it reads other things.
-        let (warm, broken) = std::thread::scope(|scope| {
+        let prepared = preparing.elapsed();
+        let (warm, broken, diagnostics, diagnostics_wait) = std::thread::scope(|scope| {
             let check = {
                 let (db, edited) = (db.clone(), &edited);
-                scope.spawn(move || broken_in(&db, edited, paths))
+                scope.spawn(move || {
+                    let start = Instant::now();
+                    let broken = broken_in(&db, edited, paths);
+                    (broken, start.elapsed())
+                })
             };
-            let warm = build(db, table, args, known, listed);
-            (warm, check.join().ok().flatten())
+            let warm = build(db, table, args, known, listed, text);
+            let joining = Instant::now();
+            let (broken, diagnostics) = check.join().unwrap_or_default();
+            (warm, broken, diagnostics, joining.elapsed())
         });
         let warm = warm?;
         let _post_phase = ide_db::base_db::query_phase::enter("codegen/post");
@@ -7299,7 +7371,17 @@ impl Program {
                 ("write-object", warm.emitted[0]),
                 ("write-reach", warm.emitted[1]),
                 ("write-harness", warm.emitted[2]),
-                ("build-rest", built.saturating_sub(apply + warm.codegen + warm.emit)),
+                ("write-diagnostics", warm.emitted[3]),
+                ("schedule", queued),
+                ("sync-prepare", prepared),
+                ("diagnostics", diagnostics),
+                ("diagnostics-wait", diagnostics_wait),
+                (
+                    "build-rest",
+                    built.saturating_sub(
+                        apply + queued + prepared + warm.codegen + warm.emit + diagnostics_wait,
+                    ),
+                ),
                 ("report", reported - built),
                 ("link", total - reported),
             ];
@@ -7482,7 +7564,7 @@ mod tests {
         ] {
             db.set_file_text_with_durability(file, text, Durability::LOW);
             hir::attach_db(&db, || {
-                known.touch_bodies(&db, file);
+                known.touch_bodies(&db, file, None, &[]);
                 let retained = known.sharing(&db, input.clone(), "test");
                 let full = Rejections::default().sharing(&db, input.clone(), "test-full");
                 assert_eq!(retained, full);
@@ -7717,78 +7799,37 @@ mod tests {
     }
 
     #[test]
-    fn skipped_names_are_only_resolved_when_printed() {
-        let skipped: Vec<_> = (0..20).map(|id| (id, CodegenError::NoSymbol)).collect();
-        let mut asked = Vec::new();
-        let report = Skipped::of(
-            &skipped,
-            |id| {
-                asked.push(id);
-                format!("function_{id}")
-            },
-            None,
-        );
-        assert_eq!(asked, vec![0]);
-        assert_eq!(report.count, 20);
-        assert!(report.all.is_none());
-        assert_eq!(
-            report.summary,
-            format!("     20  {}  (e.g. function_0)\n", CodegenError::NoSymbol)
-        );
+    fn skipped_text_is_retained_and_verified() {
+        for report in [
+            Vec::new(),
+            vec![("module::function".to_owned(), CodegenError::Frontend("failed".to_owned()))],
+        ] {
+            let calls = std::cell::Cell::new(0);
+            let fresh = || {
+                calls.set(calls.get() + 1);
+                SkippedReport::from(report.clone())
+            };
+            let mut text = BuildText::default();
+            let first = text.skipped(false, fresh);
+            assert_eq!(&*first, &*report);
+            assert!(Arc::ptr_eq(&first, &text.skipped(false, fresh)));
+            assert_eq!(calls.get(), 1);
+            assert!(Arc::ptr_eq(&first, &text.skipped(true, fresh)));
+            assert_eq!(calls.get(), 2);
+            text = BuildText::default();
+            assert_eq!(text.skipped(false, fresh), first);
+            assert_eq!(calls.get(), 3);
+        }
     }
 
     #[test]
-    fn skipped_reports_preserve_names_errors_and_order() {
-        for count in [0, 1, 8, 9, 32] {
-            let skipped: Vec<_> = (0..count)
-                .map(|id| {
-                    let error = if id % 3 == 0 {
-                        CodegenError::Backend(format!("failed({id})"))
-                    } else {
-                        CodegenError::NoSymbol
-                    };
-                    (id, error)
-                })
-                .collect();
-            let named: Vec<_> =
-                skipped.iter().map(|(id, error)| (format!("function_{id}"), error)).collect();
-            let mut expected = String::new();
-            if count <= 8 {
-                for (name, error) in &named {
-                    expected.push_str(&format!("  left to rustc: {name}: {error}\n"));
-                }
-            } else {
-                let mut reasons: FxHashMap<String, (usize, &str)> = FxHashMap::default();
-                for (name, error) in &named {
-                    let error = error.to_string();
-                    let reason = error.rsplit("`: ").next().unwrap_or(&error);
-                    let reason = reason.split(['(', '{']).next().unwrap_or(reason).trim();
-                    let entry = reasons.entry(reason.to_owned()).or_insert((0, name));
-                    entry.0 += 1;
-                }
-                let mut reasons: Vec<_> = reasons.into_iter().collect();
-                reasons.sort_by_key(|(_, (count, _))| std::cmp::Reverse(*count));
-                for (reason, (count, example)) in reasons {
-                    expected.push_str(&format!("  {count:>5}  {reason}  (e.g. {example})\n"));
-                }
-            }
-            for path in [None, Some(std::ffi::OsString::from("skipped.txt"))] {
-                let mut asked = FxHashSet::default();
-                let report = Skipped::of(
-                    &skipped,
-                    |id| {
-                        assert!(asked.insert(id));
-                        format!("function_{id}")
-                    },
-                    path.clone(),
-                );
-                assert_eq!(report.count, count as usize);
-                assert_eq!(report.summary, expected);
-                let all: String =
-                    named.iter().map(|(name, error)| format!("{name}: {error}\n")).collect();
-                assert_eq!(report.all, path.map(|path| (path, all)));
-            }
-        }
+    #[should_panic(expected = "skipped diagnostics fast path")]
+    fn skipped_text_verification_detects_changed_errors() {
+        let mut text = BuildText::default();
+        text.skipped(false, || Arc::from([]));
+        text.skipped(true, || {
+            Arc::from([("changed".to_owned(), CodegenError::Frontend("error".to_owned()))])
+        });
     }
 
     #[test]

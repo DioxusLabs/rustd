@@ -1191,6 +1191,10 @@ impl Rejections {
         self.base.is_some()
     }
 
+    pub fn impls_changed(&self) -> bool {
+        self.base.as_ref().is_none_or(|base| base.impls_changed())
+    }
+
     /// Makes the next build a full one. A patch looks at everything the last build compiled,
     /// and what an edit took away can only be looked at where a panic can be caught.
     pub fn forget_base(&mut self) {
@@ -1233,12 +1237,18 @@ impl Rejections {
     /// Notes that a file changed in the bodies of functions alone, none of which the rest of
     /// the program sees into: not `const` or `async`, not returning `impl Trait`, declaring no
     /// items, and not handed to a macro.
-    pub fn touch_bodies(&mut self, db: &dyn HirDatabase, file: base_db::FileId) {
+    pub fn touch_bodies(
+        &mut self,
+        db: &dyn HirDatabase,
+        file: base_db::FileId,
+        functions: Option<&[FunctionId]>,
+        relocated: &[FunctionId],
+    ) {
         self.reach.touch(file);
-        self.policy.touch(file);
+        self.policy.touch(file, functions);
         self.frozen.edit_bodies(file);
         if let Some(base) = &mut self.base {
-            Arc::make_mut(base).touch_bodies(db, file);
+            Arc::make_mut(base).touch_bodies(db, file, functions, relocated);
         }
         self.forget();
     }
@@ -1284,7 +1294,7 @@ impl Rejections {
         program: &str,
     ) -> Sharing {
         for &file in files {
-            self.policy.touch(file);
+            self.policy.touch(file, None);
         }
         self.sharing(db, sharing, program)
     }
