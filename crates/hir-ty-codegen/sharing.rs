@@ -106,6 +106,33 @@ impl FileFacts {
     }
 }
 
+#[cfg(test)]
+mod fact_scope_tests {
+    use super::*;
+    use base_db::salsa::{Id, plumbing::FromId};
+
+    #[test]
+    fn normal_reference_facts_take_precedence_over_test_structure_facts() {
+        let normal = Crate::from_id(Id::from_bits(1));
+        let test = Crate::from_id(Id::from_bits(2));
+        let other = Crate::from_id(Id::from_bits(3));
+        assert!(Sharing::default().body_fact_crates().is_empty());
+        assert_eq!(
+            Sharing::new(vec![(normal, test, false)]).body_fact_crates(),
+            FxHashMap::from_iter([(normal, true), (test, false)])
+        );
+        for pairs in [
+            vec![(normal, test, false), (test, other, true)],
+            vec![(test, other, true), (normal, test, false)],
+        ] {
+            assert_eq!(
+                Sharing::new(pairs).body_fact_crates(),
+                FxHashMap::from_iter([(normal, true), (test, true), (other, false)])
+            );
+        }
+    }
+}
+
 impl Cache {
     pub(super) fn clear(&mut self) {
         *self = Self::default();
@@ -140,9 +167,11 @@ impl Cache {
             return;
         }
         let mut facts = FileFacts::default();
+        let crates = self.shared.as_ref().unwrap().body_fact_crates();
         for &func in functions {
-            let source = func.lookup(db).id.file_id;
             let krate = func.krate(db);
+            let Some(&normal) = crates.get(&krate) else { continue };
+            let source = func.lookup(db).id.file_id;
             if func.module(db).block(db).is_none()
                 && !facts.trees.iter().any(|&(k, f, _)| k == krate && f == source)
             {
@@ -153,10 +182,12 @@ impl Cache {
                 ));
             }
             if hir_def::signatures::FunctionSignature::of(db, func).has_body() {
-                facts.push(func, true, crate::sharing::body_sharing_facts(db, func, true).clone());
+                facts.push(func, normal, crate::sharing::body_sharing_facts(db, func, normal).clone());
             }
         }
-        self.files.insert(file, facts);
+        if !facts.trees.is_empty() || !facts.bodies.is_empty() {
+            self.files.insert(file, facts);
+        }
     }
 
     pub(super) fn sharing(
@@ -188,7 +219,12 @@ impl Cache {
                     let (func, normal, facts) = &facts.bodies[index];
                     checked += 1;
                     reason = "body facts changed";
-                    let new = crate::sharing::body_sharing_facts(db, *func, *normal);
+                    let root = std::env::var_os("RUSTD_TRACE_PHASES").is_some().then(|| {
+                        format!("body_sharing_facts({func:?}, normal={normal})")
+                    });
+                    let new = base_db::query_phase::with_root(root, || {
+                        crate::sharing::body_sharing_facts(db, *func, *normal)
+                    });
                     if new == facts {
                         return true;
                     }
@@ -326,12 +362,7 @@ impl Cache {
                     ((normal, test, both), state)
                 })
                 .collect();
-            let mut crates = FxHashMap::default();
-            for &(normal, test, _) in &input.pairs {
-                crates.insert(normal, true);
-                crates.entry(test).or_insert(false);
-            }
-            for (krate, normal) in crates {
+            for (krate, normal) in input.body_fact_crates() {
                 for &item in &hir_def::twins::crate_items(db, krate).items {
                     let AttrDefId::FunctionId(func) = item else { continue };
                     if !hir_def::signatures::FunctionSignature::of(db, func).has_body() {
@@ -372,6 +403,15 @@ impl Cache {
 }
 
 impl Sharing {
+    fn body_fact_crates(&self) -> FxHashMap<Crate, bool> {
+        let mut crates = FxHashMap::default();
+        for &(normal, test, _) in &self.pairs {
+            crates.insert(normal, true);
+            crates.entry(test).or_insert(false);
+        }
+        crates
+    }
+
     fn capture(mut self, db: &dyn HirDatabase) -> Self {
         if !self.is_empty() {
             self.snapshot = Some(Arc::new(Policy(

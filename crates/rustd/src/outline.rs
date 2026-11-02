@@ -152,7 +152,7 @@ fn outlines(db: &RootDatabase, listed: &Listed, files: &[FileId]) -> Vec<Option<
         let parts: Vec<_> = (0..threads.min(files.len()))
             .map(|part| {
                 let (db, functions) = (db.clone(), &functions);
-                scope.spawn(move || {
+                scope.spawn(ide_db::base_db::query_phase::inherit(move || {
                     hir::attach_db(&db, || {
                         let files = files.iter().zip(functions).enumerate();
                         files
@@ -171,7 +171,7 @@ fn outlines(db: &RootDatabase, listed: &Listed, files: &[FileId]) -> Vec<Option<
                             })
                             .collect::<Vec<_>>()
                     })
-                })
+                }))
             })
             .collect();
         for (at, outline) in parts.into_iter().flat_map(|it| it.join().unwrap_or_default()) {

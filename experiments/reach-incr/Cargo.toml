@@ -1,0 +1,17 @@
+[package]
+name = "reach-incr"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+
+[workspace]
+
+[dependencies]
+salsa = "=0.28.5"
+rustc-hash = "2"
+rand = "0.9"
+reactive_graph = "=0.2.16"
+im = "15.1"
+
+[profile.release]
+debug = 1

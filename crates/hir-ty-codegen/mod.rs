@@ -907,7 +907,8 @@ impl CodegenUnit {
                         roots.reports,
                         &compiled,
                         &skipped,
-                    );
+                    )
+                    .map(Arc::new);
                     if base.is_none() && std::env::var_os("RUSTD_STATS").is_some() {
                         eprintln!("patch discard: could not record base");
                     }
@@ -1004,6 +1005,36 @@ fn retry_sharing<T>(
 #[cfg(test)]
 mod sharing_retry_tests {
     use super::*;
+
+    #[test]
+    fn shares_the_unchanged_base_and_restores_it_after_a_failed_attempt() {
+        for fails in [0, 1, 2] {
+            let before = Arc::new(patch::Base::default());
+            let mut known = Rejections { base: Some(before.clone()), ..Rejections::default() };
+            let mut calls = 0;
+            let result = retry_sharing(true, &mut known, |_, known| {
+                calls += 1;
+                let base = known.base.as_ref().unwrap();
+                assert!(Arc::ptr_eq(base, &before));
+                assert_eq!(base.bodies, 0);
+                if calls <= fails {
+                    Arc::make_mut(known.base.as_mut().unwrap()).bodies = 99;
+                    assert_eq!(before.bodies, 0);
+                    known.base = None;
+                    Err(CodegenError::Unsupported("refusal".to_owned()))
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(result.is_ok(), fails < 2);
+            assert_eq!(calls, if fails == 0 { 1 } else { 2 });
+            if fails < 2 {
+                assert!(Arc::ptr_eq(known.base.as_ref().unwrap(), &before));
+            } else {
+                assert!(known.base.is_none());
+            }
+        }
+    }
 
     #[test]
     fn retries_only_sharing_errors_and_restores_state() {
@@ -1132,7 +1163,7 @@ pub struct Rejections {
     /// Whether rustc compiles a crate that uses the ones built, as it does the examples of a
     /// library: it then has code of its own for every function of theirs without a symbol.
     pub used_by_rustc: bool,
-    base: Option<patch::Base>,
+    base: Option<Arc<patch::Base>>,
     frozen: patch::Frozen,
     stale: Vec<Stale>,
     reach: reach::Cache,
@@ -1189,7 +1220,7 @@ impl Rejections {
             None => self.frozen.edit(base_db::all_crates(db).iter().copied()),
         }
         if let Some(base) = &mut self.base {
-            base.touch(db, crates);
+            Arc::make_mut(base).touch(db, crates);
         }
         self.forget();
     }
@@ -1217,7 +1248,7 @@ impl Rejections {
         self.policy.touch(file, functions);
         self.frozen.edit_bodies(file);
         if let Some(base) = &mut self.base {
-            base.touch_bodies(db, file, functions, relocated);
+            Arc::make_mut(base).touch_bodies(db, file, functions, relocated);
         }
         self.forget();
     }
@@ -1232,7 +1263,9 @@ impl Rejections {
         kept: &[StaticId],
         program: &str,
     ) -> (Vec<Reached>, Option<u128>, Vec<String>) {
-        self.reach.reached(db, sharing, edited, tests, always, kept, program)
+        base_db::query_phase::run("reach", || {
+            self.reach.reached(db, sharing, edited, tests, always, kept, program)
+        })
     }
 
     pub fn sharing(&mut self, db: &dyn HirDatabase, sharing: Sharing, program: &str) -> Sharing {
@@ -1253,6 +1286,19 @@ impl Rejections {
         self.policy.before_edit(db, file, functions);
     }
 
+    pub fn sharing_after_demotion(
+        &mut self,
+        db: &dyn HirDatabase,
+        sharing: Sharing,
+        files: &[base_db::FileId],
+        program: &str,
+    ) -> Sharing {
+        for &file in files {
+            self.policy.touch(file, None);
+        }
+        self.sharing(db, sharing, program)
+    }
+
     pub fn needs_sharing_facts(&self, files: &[base_db::FileId]) -> bool {
         self.policy.needs_before_edit(files)
     }
@@ -1268,7 +1314,7 @@ impl Rejections {
     /// edit in between.
     pub fn set_stale(&mut self, db: &dyn HirDatabase, mut stale: Vec<Stale>) {
         if let Some(base) = &mut self.base {
-            base.settle(db, &mut stale);
+            Arc::make_mut(base).settle(db, &mut stale);
         }
         self.stale = stale;
     }

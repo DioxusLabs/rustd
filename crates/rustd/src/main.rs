@@ -8,10 +8,13 @@ mod content;
 mod deps;
 mod doctest;
 mod inputs;
+mod launder;
+mod lru;
 mod lint;
 mod memory;
 mod outline;
 mod plan;
+mod predemote;
 mod process;
 mod remote;
 mod socket;
@@ -31,6 +34,10 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+use ide_db::base_db::salsa::{
+    Database as _, Durability,
+    plumbing::{FromId as _, ZalsaDatabase as _},
+};
 use ide_db::base_db::{CrateOrigin, LangCrateOrigin, SourceDatabase as _};
 use std::{
     collections::BTreeSet,
@@ -133,6 +140,54 @@ struct Args {
     members: Arc<FxHashSet<ide_db::base_db::Crate>>,
     /// Root files of member libs/bins, whose tested copies a normal program leaves out.
     unit_roots: Arc<FxHashSet<PathBuf>>,
+    crate_lookup: Arc<Mutex<CrateLookup>>,
+}
+
+#[derive(Default)]
+struct CrateLookup {
+    revision: Option<ide_db::base_db::salsa::Revision>,
+    crates: Vec<(Crate, Option<String>, Option<PathBuf>)>,
+    called: FxHashMap<(String, PathBuf, Option<PathBuf>), Vec<Crate>>,
+}
+
+impl CrateLookup {
+    fn called(&mut self, db: &RootDatabase, named: &str, args: &Args) -> Vec<Crate> {
+        let revision = db.zalsa().current_revision();
+        if self.revision != Some(revision) {
+            self.crates = Crate::all(db)
+                .into_iter()
+                .map(|krate| {
+                    let name = krate.display_name(db).map(|name| name.crate_name().to_string());
+                    (krate, name, crate_root_file(db, krate))
+                })
+                .collect();
+            self.called.clear();
+            self.revision = Some(revision);
+        }
+        let key = (named.to_owned(), args.checkout.clone(), args.base.clone());
+        self.called
+            .entry(key)
+            .or_insert_with(|| {
+                let is_file = named.ends_with(".rs");
+                let plain = !named.contains("//") && !named.contains("./");
+                self.crates
+                    .iter()
+                    .filter(|(_, name, root)| {
+                        if is_file {
+                            root.as_ref().is_some_and(|root| {
+                                (!plain || root.ends_with(named))
+                                    && (root == Path::new(named)
+                                        || args.inside(root) == Some(Path::new(named)))
+                            })
+                        } else {
+                            name.as_deref() == Some(named)
+                        }
+                    })
+                    .map(|(krate, _, _)| *krate)
+                    .collect()
+            })
+            .clone()
+    }
 }
 
 impl Args {
@@ -288,6 +343,7 @@ impl Args {
             base: None,
             members: Arc::default(),
             unit_roots: Arc::default(),
+            crate_lookup: Arc::default(),
         })
     }
 }
@@ -848,7 +904,7 @@ impl SymbolResolver for Resolver<'_> {
                 let (debug, apart) = (self.debug, self.apart.clone());
                 let (listed, named) = (self.listed, self.named.clone());
                 let shared_paths = self.shared_paths.clone();
-                scope.spawn(move || {
+                scope.spawn(ide_db::base_db::query_phase::inherit(move || {
                     let resolver = Resolver {
                         db: &db,
                         table,
@@ -870,7 +926,7 @@ impl SymbolResolver for Resolver<'_> {
                             work(&db, &resolver, at);
                         }
                     })
-                });
+                }));
             }
             beside();
         });
@@ -1862,20 +1918,9 @@ fn links_core(command: &str) -> bool {
 
 /// Every crate called `krate`, of the checkout or not.
 fn crates_called(db: &RootDatabase, krate: &str, args: &Args) -> Vec<Crate> {
-    let is_file = krate.ends_with(".rs");
-    // A path that is written as its parts are ends the text of every path it is the end of,
-    // which is all that most crates have to be asked.
-    let plain = !krate.contains("//") && !krate.contains("./");
-    Crate::all(db)
+    lock(&args.crate_lookup)
+        .called(db, krate, args)
         .into_iter()
-        .filter(|it| match is_file {
-            _ if is_file && plain && !root_file_ends_with(db, *it, krate) => false,
-            // Named from the checkout, or in full.
-            true => crate_root_file(db, *it).is_some_and(|root| {
-                root == Path::new(krate) || args.inside(&root) == Some(Path::new(krate))
-            }),
-            false => it.display_name(db).is_some_and(|name| name.crate_name().as_str() == krate),
-        })
         .filter(|it| args.as_built(db, *it, krate))
         .filter(|it| !doctest::is_documented(db, (*it).into()))
         .collect()
@@ -1903,16 +1948,6 @@ fn crates_to_build(
 /// Whether the crate is built with `cfg(test)`.
 fn is_tested(db: &RootDatabase, krate: ide_db::base_db::Crate) -> bool {
     krate.cfg_options(db).check_atom(&cfg::CfgAtom::Flag(intern::sym::test))
-}
-
-/// Whether the text of the path of the crate's root file ends with `end`.
-fn root_file_ends_with(db: &RootDatabase, krate: Crate, end: &str) -> bool {
-    let file = krate.root_file(db);
-    let source_root = db.file_source_root(file).source_root_id(db);
-    let source_root = db.source_root(source_root).source_root(db);
-    let path = source_root.path_for_file(&file).and_then(|it| it.as_path());
-    // By its parts: on Windows one path may be written with `/` and the other with `\`.
-    path.is_some_and(|it| Path::new(it.as_str()).ends_with(end))
 }
 
 fn crate_root_file(db: &RootDatabase, krate: Crate) -> Option<PathBuf> {
@@ -1945,7 +1980,7 @@ fn load(
         debug: Vec::new(),
         beside,
     };
-    let mut db = RootDatabase::new(None);
+    let mut db = RootDatabase::new(lru::capacity());
     let mut vfs = vfs::Vfs::default();
     checkouts.add(projects, &mut db, &mut vfs)?;
     Ok((db, vfs, checkouts))
@@ -2119,7 +2154,9 @@ impl Checkouts {
             self.loaded.replace(at, self.split(base, &over, &own));
             self.splits[at] = Some(Split { base: self.roots[base].1.clone(), own });
         }
-        self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)
+        self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        launder::refresh(db);
+        Ok(())
     }
 
     /// How the daemon builds `project`: as itself when its checkout is loaded, and as its
@@ -2256,7 +2293,36 @@ impl Checkouts {
             roots.push((dunce::canonicalize(project)?, root));
             workspaces.push(workspace);
         }
+        if tree::tiered()
+            || tree::ladder()
+            || std::env::var("RUSTD_IMPL_CONNECTOR").as_deref() == Ok("1")
+        {
+            let mut packages = Vec::new();
+            for workspace in self.loaded.workspaces().iter().chain(&workspaces) {
+                if let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind {
+                    for package in cargo.packages().map(|id| &cargo[id]) {
+                        if package.is_local {
+                            packages.push((
+                                AsRef::<Path>::as_ref(package.manifest.parent()).to_owned(),
+                                package.primary,
+                            ));
+                        }
+                    }
+                } else {
+                    packages.push((PathBuf::from(workspace.workspace_root().to_string()), true));
+                }
+            }
+            if std::env::var("RUSTD_IMPL_CONNECTOR").as_deref() == Ok("1") {
+                db.enable_impl_connector(packages.clone());
+            }
+            if tree::ladder() {
+                db.enable_ladder(packages, std::env::var("RUSTD_LADDER").as_deref() == Ok("low"));
+            } else if tree::tiered() {
+                db.enable_tiered_durability(packages);
+            }
+        }
         self.loaded.add(workspaces, &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        launder::refresh(db);
         self.roots.extend(roots);
         self.splits.extend(splits);
         self.debug.extend(debug);
@@ -2340,6 +2406,7 @@ impl Checkouts {
             self.debug[at] = self.debug[base];
         }
         self.loaded.add(Vec::new(), &self.cargo_config.extra_env, &self.load_config, vfs, db)?;
+        launder::refresh(db);
         failed
     }
 
@@ -2653,7 +2720,9 @@ fn resolve_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<usize> {
         }
     }
     resolve_all(db, &crates);
-    hir::attach_db(db, || dump_twins(db, args));
+    ide_db::base_db::query_phase::run("roots/dump_twins", || {
+        hir::attach_db(db, || dump_twins(db, args))
+    });
     Ok(crates.len())
 }
 
@@ -2789,6 +2858,67 @@ fn dump_twins(db: &RootDatabase, args: &Args) {
                     hir::Function::from(id).name(db).as_str()
                 );
             }
+        }
+    }
+}
+
+fn dump_impl_holders(db: &RootDatabase, args: &Args) {
+    let Ok(named) = std::env::var("RUSTD_IMPL_HOLDERS") else { return };
+    for &krate in args.members.iter().filter(|&&krate| {
+        hir::Crate::from(krate)
+            .display_name(db)
+            .is_some_and(|name| name.crate_name().as_str() == named)
+    }) {
+        let mut maps = vec![hir_def::nameres::crate_def_map(db, krate)];
+        let mut counts = std::collections::BTreeMap::<&str, (usize, usize)>::new();
+        while let Some(map) = maps.pop() {
+            for (_, module) in map.modules(db) {
+                let scope = module.scope(db);
+                let mut holders: Vec<hir_def::DefWithBodyId> =
+                    scope.consts().map(Into::into).collect();
+                holders.extend(scope.declarations().filter_map(|id| match id {
+                    hir_def::ModuleDefId::FunctionId(id) => Some(hir_def::DefWithBodyId::from(id)),
+                    hir_def::ModuleDefId::StaticId(id) => Some(hir_def::DefWithBodyId::from(id)),
+                    _ => None,
+                }));
+                holders.extend(scope.impls().flat_map(|id| &id.impl_items(db).items).filter_map(
+                    |(_, id)| match *id {
+                        hir_def::AssocItemId::FunctionId(id) => {
+                            Some(hir_def::DefWithBodyId::from(id))
+                        }
+                        hir_def::AssocItemId::ConstId(id) => Some(hir_def::DefWithBodyId::from(id)),
+                        hir_def::AssocItemId::TypeAliasId(_) => None,
+                    },
+                ));
+                for owner in holders {
+                    let kind = match owner {
+                        hir_def::DefWithBodyId::FunctionId(id) => {
+                            if hir::Function::from(id).as_assoc_item(db).is_some() {
+                                "impl-functions"
+                            } else {
+                                "free-functions"
+                            }
+                        }
+                        hir_def::DefWithBodyId::ConstId(_) => "consts",
+                        hir_def::DefWithBodyId::StaticId(_) => "statics",
+                        _ => "other",
+                    };
+                    let blocks: Vec<_> =
+                        Body::of(db, owner).blocks(db).map(|(_, map)| map).collect();
+                    let count = counts.entry(kind).or_default();
+                    count.0 += 1;
+                    count.1 += usize::from(!blocks.is_empty());
+                    maps.extend(blocks);
+                }
+            }
+        }
+        use ide_db::base_db::salsa::plumbing::AsId;
+        for (kind, (holders, bearing)) in counts {
+            eprintln!(
+                "impl-holders: {named} test={} key={:?} kind={kind} holders={holders} item-bearing={bearing}",
+                is_tested(db, krate),
+                krate.as_id()
+            );
         }
     }
 }
@@ -2969,7 +3099,9 @@ fn exported(db: &RootDatabase, functions: &[FunctionId]) -> Vec<bool> {
             .chunks(each)
             .map(|part| {
                 let db = db.clone();
-                scope.spawn(move || hir::attach_db(&db, || exported(&db, part)))
+                scope.spawn(ide_db::base_db::query_phase::inherit(move || {
+                    hir::attach_db(&db, || exported(&db, part))
+                }))
             })
             .collect();
         // A query that is cancelled unwinds, and goes on unwinding here as what it is.
@@ -3137,14 +3269,14 @@ fn lower(db: &RootDatabase, bodies: Vec<DefWithBodyId>) -> Vec<DefWithBodyId> {
         let probing = PROBING.get();
         for part in 0..threads.min(bodies.len()) {
             let (db, bodies) = (db.clone(), &bodies);
-            scope.spawn(move || {
+            scope.spawn(ide_db::base_db::query_phase::inherit(move || {
                 PROBING.set(probing);
                 hir::attach_db(&db, || {
                     for &body in bodies.iter().skip(part).step_by(threads) {
                         Body::of(&db, body);
                     }
                 })
-            });
+            }));
         }
     });
     bodies
@@ -3197,6 +3329,19 @@ fn build(
     listed: &Listed,
     text: &mut BuildText,
 ) -> anyhow::Result<Build> {
+    Ok(prepare_build(db, table, args, known, listed, text, false)?.unwrap())
+}
+
+fn prepare_build(
+    db: &RootDatabase,
+    table: &SymbolTable,
+    args: &Args,
+    known: &mut Rejections,
+    listed: &Listed,
+    text: &mut BuildText,
+    warm_only: bool,
+) -> anyhow::Result<Option<Build>> {
+    let roots_phase = ide_db::base_db::query_phase::enter("roots/other");
     let start = Instant::now();
     hir::attach_db(db, || dump_twins(db, args));
     let contents = &content::Contents::default();
@@ -3228,12 +3373,15 @@ fn build(
     let mut local = Vec::new();
     let mut programs_own = Vec::new();
     for (at, krate) in args.crates().enumerate() {
-        for krate in crates_to_build(db, table, krate, args)? {
+        for krate in ide_db::base_db::query_phase::run("roots/crates_to_build", || {
+            crates_to_build(db, table, krate, args)
+        })? {
             local.push(krate);
             if at == 0 {
                 programs_own.push(krate);
             }
-            let listed = listed.of(db, krate);
+            let listed =
+                ide_db::base_db::query_phase::run("roots/listed.of", || listed.of(db, krate));
             // With `cfg(test)` the program starts in the harness rustc wrote, which calls
             // every test: the crate's own `main` is one function among the others.
             if at == 0 && !args.unit_test {
@@ -3261,20 +3409,26 @@ fn build(
         .partition(|&(func, exported)| exported || main.is_none() || main == Some(func));
     let unzip = |it: Vec<(FunctionId, bool)>| it.into_iter().map(|it| it.0).collect::<Vec<_>>();
     let (entries, on_demand) = (unzip(entries), unzip(on_demand));
+    let harness_start = Instant::now();
     let harness = cargo::plan::Harness::of(&args.out)?;
     let doctest = programs_own.first().is_some_and(|&krate| doctest::is_examples(db, krate.into()));
     let reports: Vec<_> = if harness.is_some() && !doctest {
-        harness_tests(db, &resolver, &programs_own)
-            .into_iter()
-            .filter(|&id| !hir::Function::from(id).ret_type(db).is_unit())
-            .collect()
+        ide_db::base_db::query_phase::run("roots/harness_tests", || {
+            harness_tests(db, &resolver, &programs_own)
+        })
+        .into_iter()
+        .filter(|&id| !hir::Function::from(id).ret_type(db).is_unit())
+        .collect()
     } else {
         Vec::new()
     };
     // The program's `main` is called by one rustc wrote, when rustc built the crate.
     let own = |main: &FunctionId| resolver.own_crate_id(hir_def::HasModule::krate(main, db));
-    let sharing = hir::attach_db(db, || {
-        known.sharing(db, program_sharing(db, args), &args.out.display().to_string())
+    let sharing_start = Instant::now();
+    let sharing = ide_db::base_db::query_phase::run("roots/known.sharing", || {
+        hir::attach_db(db, || {
+            known.sharing(db, program_sharing(db, args), &args.out.display().to_string())
+        })
     });
     let roots = Roots {
         sharing: sharing.clone(),
@@ -3285,6 +3439,16 @@ fn build(
         kept: &kept,
     };
     let setup = start.elapsed();
+    if std::env::var_os("RUSTD_STATS").is_some() {
+        eprintln!(
+            "roots-calls-us: list={} harness={} sharing={}",
+            list.as_micros(),
+            (sharing_start - harness_start).as_micros(),
+            sharing_start.elapsed().as_micros(),
+        );
+    }
+    drop(roots_phase);
+    let _codegen_phase = ide_db::base_db::query_phase::enter("codegen");
     if std::env::var_os("RUSTD_STATS").is_some() {
         eprintln!("entries: {:.1?}", setup - list);
     }
@@ -3318,14 +3482,53 @@ fn build(
                         while let Some(&krate) =
                             local.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
                         {
-                            hir_ty::method_resolution::TraitImpls::for_crate(&db, krate.into());
-                            hir_ty::method_resolution::InherentImpls::for_crate(&db, krate.into());
+                            let trace_root = std::env::var_os("RUSTD_TRACE_PHASES").map(|_| {
+                                use ide_db::base_db::salsa::plumbing::AsId;
+                                let id = ide_db::base_db::Crate::from(krate);
+                                format!(
+                                    "{} root={} test={} key={:?}",
+                                    krate
+                                        .display_name(&db)
+                                        .map(|name| name.to_string())
+                                        .unwrap_or_default(),
+                                    crate_root_file(&db, krate).unwrap_or_default().display(),
+                                    is_tested(&db, id),
+                                    id.as_id()
+                                )
+                            });
+                            ide_db::base_db::query_phase::run(
+                                "check/TraitImpls::for_crate",
+                                || {
+                                    ide_db::base_db::query_phase::with_root(
+                                        trace_root.clone(),
+                                        || {
+                                            hir_ty::method_resolution::TraitImpls::for_crate(
+                                                &db,
+                                                krate.into(),
+                                            )
+                                        },
+                                    )
+                                },
+                            );
+                            ide_db::base_db::query_phase::run(
+                                "check/InherentImpls::for_crate",
+                                || {
+                                    ide_db::base_db::query_phase::with_root(trace_root, || {
+                                        hir_ty::method_resolution::InherentImpls::for_crate(
+                                            &db,
+                                            krate.into(),
+                                        )
+                                    })
+                                },
+                            );
                         }
                         impls.fetch_max(
                             start.elapsed().as_micros() as u64,
                             std::sync::atomic::Ordering::Relaxed,
                         );
-                        known.stale(&db, part, threads)
+                        ide_db::base_db::query_phase::run("check/known.stale", || {
+                            known.stale(&db, part, threads)
+                        })
                     })
                 })
             })
@@ -3347,6 +3550,9 @@ fn build(
     }
     let looked = known.stale_steps();
     let revalidate = start.elapsed();
+    if warm_only {
+        return Ok(None);
+    }
     // Salsa attaches the database for the duration of the closure; the solver needs it.
     let mut unit =
         hir::attach_db(db, || CodegenUnit::compile(hir_db, &resolver, roots, &denied, known))
@@ -3497,7 +3703,7 @@ fn build(
         }
         std::fs::write(dir.join("index.tsv"), index)?;
     }
-    Ok(build)
+    Ok(Some(build))
 }
 
 impl Build {
@@ -3878,6 +4084,7 @@ fn place(
     if !moved.is_empty() {
         eprintln!("placed: {} crates in {}", moved.len(), over.display());
     }
+    launder::refresh(db);
     moved
 }
 
@@ -4031,11 +4238,16 @@ fn broken_in(db: &RootDatabase, edited: &[vfs::FileId], watched: &Sources) -> Op
                     hir::attach_db(&db, || {
                         files
                             .flat_map(|&file| {
-                                ide_diagnostics::semantic_diagnostics(
-                                    &db,
-                                    config,
-                                    &ide_db::assists::AssistResolveStrategy::None,
-                                    file,
+                                ide_db::base_db::query_phase::run(
+                                    "diagnostics/semantic_diagnostics",
+                                    || {
+                                        ide_diagnostics::semantic_diagnostics(
+                                            &db,
+                                            config,
+                                            &ide_db::assists::AssistResolveStrategy::None,
+                                            file,
+                                        )
+                                    },
                                 )
                             })
                             .filter(|it| {
@@ -4168,6 +4380,7 @@ impl WatchedFile {
                 changed |= db.reload_included_file(&path);
             }
         }
+        launder::refresh(db);
         changed
     }
 }
@@ -4217,6 +4430,7 @@ fn build_batch(db: &RootDatabase, args: Args) -> anyhow::Result<()> {
             base: args.base.clone(),
             members: args.members.clone(),
             unit_roots: args.unit_roots.clone(),
+            crate_lookup: args.crate_lookup.clone(),
         };
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             build(
@@ -5393,6 +5607,7 @@ fn follow_cargo(
             checkouts.loaded.replace(beside.at, workspace);
             let Checkouts { loaded, cargo_config, load_config, .. } = checkouts;
             loaded.add(Vec::new(), &cargo_config.extra_env, load_config, vfs, db)?;
+            launder::refresh(db);
             beside.applied = lines.len();
         }
         if all {
@@ -5491,6 +5706,7 @@ fn write_examples(
             change.change_file(file, Some(text));
         }
         db.apply_change(change);
+        launder::refresh(db);
         for file in files {
             crates.extend(ide_db::base_db::relevant_crates(db, file).iter().copied());
         }
@@ -5577,6 +5793,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
     };
     let listed = Arc::new(Listed::default());
     ide_db::base_db::set_process_env(&mut db, process::own());
+    launder::refresh(&mut db);
     // What is compiled while cargo builds is stored too, so the store is told the toolchain
     // first. A build told ahead of cargo's links the library of the toolchain that was loaded, or
     // is not the daemon's.
@@ -5627,6 +5844,8 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
         resolved = resolve_crates(&db, &args)?;
     }
     eprintln!("resolve: {resolved} crates in {:.1?}", start.elapsed());
+    db.refresh_impl_connector();
+    dump_impl_holders(&db, &args);
     memory::checkpoint("resolve");
     // What the other checkouts don't share with this one, before a request waits for it.
     for also in &args.also {
@@ -5720,6 +5939,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
         report(&cold);
         bail!("{unfit}");
     }
+    db.refresh_impl_connector();
     eprint!("cold: ");
     report(&cold);
     memory::report(&mut db, "build")?;
@@ -5842,6 +6062,12 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
     let mut viewed: FxHashMap<PathBuf, PathBuf> = FxHashMap::default();
     // The crates whose variables name another checkout than the one they were loaded in.
     let mut placed = Placed::default();
+    let candidate_predemote = std::env::var("RUSTD_PREDEMOTE").as_deref() == Ok("dirty");
+    let warm_only = std::env::var("RUSTD_PREDEMOTE").as_deref() == Ok("warm");
+    let mut predemoted = !candidate_predemote
+        && !warm_only
+        && std::env::var("RUSTD_PREDEMOTE").as_deref() != Ok("1");
+    let mut session_edited = FxHashSet::default();
     loop {
         if WatchedFile::unwatched(&files, &db) || tree.includes_more(&db) {
             builds.settle(&mut db, &mut programs)?;
@@ -5861,7 +6087,107 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
             true => {
                 let mut later = Vec::new();
                 if builds.stuck || builds.waiting.is_empty() {
-                    let event = builds.events.recv()?;
+                    let event = if !predemoted && builds.running.is_empty() {
+                        match builds.events.recv_timeout(Duration::from_millis(200)) {
+                            Ok(event) => event,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                predemoted = true;
+                                let start = Instant::now();
+                                eprintln!("predemote: start");
+                                let selected: Vec<_> = files
+                                    .iter()
+                                    .filter_map(|file| match file.file {
+                                        Watched::Source(id) if db.ladder_file_is_selected(id) => {
+                                            Some((id, db.on_disk(&file.path).to_path_buf()))
+                                        }
+                                        Watched::Source(_) => None,
+                                        Watched::Included(_) => None,
+                                    })
+                                    .collect();
+                                let selected = if candidate_predemote {
+                                    predemote::candidates(&selected, &session_edited)
+                                } else {
+                                    selected.into_iter().map(|(id, _)| id).collect()
+                                };
+                                let revision = db.zalsa().current_revision();
+                                let count = if warm_only {
+                                    0
+                                } else {
+                                    launder::predemote(&mut db, &selected)
+                                };
+                                let refreshed = start.elapsed();
+                                if count != 0 || (warm_only && !selected.is_empty()) {
+                                    std::thread::scope(|scope| -> anyhow::Result<()> {
+                                        let (db, programs, listed, selected) =
+                                            (db.clone(), &mut programs, &listed, &selected);
+                                        std::thread::Builder::new()
+                                            .name("predemote".into())
+                                            .stack_size(16 * 1024 * 1024)
+                                            .spawn_scoped(scope, move || {
+                                                for program in programs {
+                                                    hir::attach_db(&db, || {
+                                                        ide_db::base_db::query_phase::run(
+                                                            "idle/sharing",
+                                                            || {
+                                                                program
+                                                                    .known
+                                                                    .sharing_after_demotion(
+                                                                        &db,
+                                                                        program_sharing(
+                                                                            &db,
+                                                                            &program.args,
+                                                                        ),
+                                                                        selected,
+                                                                        &program
+                                                                            .args
+                                                                            .out
+                                                                            .display()
+                                                                            .to_string(),
+                                                                    )
+                                                            },
+                                                        )
+                                                    });
+                                                    if let Err(error) = prepare_build(
+                                                        &db,
+                                                        &program.table,
+                                                        &program.args,
+                                                        &mut program.known,
+                                                        listed,
+                                                        &mut program.text,
+                                                        true,
+                                                    ) {
+                                                        eprintln!(
+                                                            "predemote: warm-up failed: {error:#}"
+                                                        );
+                                                    }
+                                                }
+                                            })?
+                                            .join()
+                                            .map_err(|_| {
+                                                anyhow::anyhow!("pre-demotion warm-up panicked")
+                                            })
+                                    })?;
+                                }
+                                if warm_only {
+                                    assert_eq!(revision, db.zalsa().current_revision());
+                                    eprintln!(
+                                        "predemote: warm-only selected={} revision={revision:?} unchanged",
+                                        selected.len(),
+                                    );
+                                }
+                                eprintln!(
+                                    "predemote: done files={count} refresh_us={} warm_us={} total_us={}",
+                                    refreshed.as_micros(),
+                                    (start.elapsed() - refreshed).as_micros(),
+                                    start.elapsed().as_micros(),
+                                );
+                                continue;
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                    } else {
+                        builds.events.recv()?
+                    };
                     builds.take(event, &mut programs)?;
                 }
                 loop {
@@ -6308,14 +6634,25 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
             Watched::Included(_) => None,
         });
         let editing: Vec<_> = editing.collect();
-        outlines.before_edit(&db, &listed, &editing);
+        session_edited.extend(editing.iter().copied());
+        ide_db::base_db::query_phase::run("read/outlines", || {
+            outlines.before_edit(&db, &listed, &editing)
+        });
         if programs.iter().any(|program| program.known.needs_sharing_facts(&editing)) {
-            let functions = listed.in_files(&db, &editing);
+            let functions =
+                ide_db::base_db::query_phase::run("read/listed", || listed.in_files(&db, &editing));
             hir::attach_db(&db, || {
                 for (&file, functions) in editing.iter().zip(functions) {
                     if let Some(functions) = functions {
                         for program in &mut programs {
-                            program.known.sharing_before_edit(&db, file, &functions);
+                            let root = std::env::var_os("RUSTD_TRACE_PHASES")
+                                .is_some()
+                                .then(|| program.args.out.display().to_string());
+                            ide_db::base_db::query_phase::with_root(root, || {
+                                ide_db::base_db::query_phase::run("read/sharing", || {
+                                    program.known.sharing_before_edit(&db, file, &functions)
+                                })
+                            });
                         }
                     }
                 }
@@ -6341,10 +6678,22 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
         }
         let read = read.elapsed();
         eprintln!("change: {changed} files");
+        let connector_before = db.impl_connector_time();
         let start = Instant::now();
+        let apply_phase = ide_db::base_db::query_phase::enter("apply");
         // A write stops the builds under way, so nothing is written when nothing changed.
         if changed != 0 || !background {
-            db.apply_change(change);
+            let cancellation = db.apply_change(change);
+            let applied = start.elapsed();
+            launder::refresh(&mut db);
+            if std::env::var_os("RUSTD_STATS").is_some() {
+                eprintln!(
+                    "apply-db-us: cancellation={} write={} refresh={}",
+                    cancellation.as_micros(),
+                    (applied - cancellation).as_micros(),
+                    (start.elapsed() - applied).as_micros(),
+                );
+            }
         }
         let changed_db = start.elapsed();
         if !removed.is_empty() {
@@ -6363,6 +6712,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
         for path in included {
             db.reload_included_file(&path);
         }
+        launder::refresh(&mut db);
         // Asked of every file before any is noted: noting one forgets the functions listed.
         for program in &mut programs {
             let unbuilt = &mut program.unbuilt;
@@ -6434,7 +6784,9 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                 (start.elapsed() - invalidated).as_micros(),
             );
         }
-        let edit = Edit { start, age, settled, read, apply: start.elapsed(), changed };
+        drop(apply_phase);
+        let edit =
+            Edit { start, age, settled, read, apply: start.elapsed(), connector_before, changed };
         if background {
             let mut asked: FxHashMap<usize, Vec<Asked>> = FxHashMap::default();
             for (at, client) in clients {
@@ -6715,6 +7067,7 @@ struct Edit {
     settled: Duration,
     read: Duration,
     apply: Duration,
+    connector_before: Duration,
     /// How many files changed.
     changed: usize,
 }
@@ -6906,6 +7259,7 @@ impl Program {
         let queued = edit.start.elapsed().saturating_sub(edit.apply);
         let preparing = Instant::now();
         // The crates left to rustc are as edited when a client has named what it built since.
+        let _sync_phase = ide_db::base_db::query_phase::enter("prebuild");
         let named_anew = std::mem::take(&mut self.unbuilt.named_anew);
         let unnamed = if named_anew { None } else { self.widen(db) };
         self.read_copies_again(db)?;
@@ -6923,7 +7277,7 @@ impl Program {
                 }
             }
         }
-        let &Edit { start, age, settled, read, apply, changed } = edit;
+        let &Edit { start, age, settled, read, apply, connector_before, changed } = edit;
         // Another checkout's files are not this program's to be refused for.
         let mut edited = unbuilt.edited.clone();
         edited.retain(|file| paths.paths.get(file).is_none_or(|it| args.owns(db, *file, it)));
@@ -6946,6 +7300,7 @@ impl Program {
             (warm, broken, diagnostics, joining.elapsed())
         });
         let warm = warm?;
+        let _post_phase = ide_db::base_db::query_phase::enter("codegen/post");
         if known.stats.patched.is_none() {
             *whole = Some(args.out.clone());
         }
@@ -6993,6 +7348,7 @@ impl Program {
                 ("settle", settled),
                 ("read", read),
                 ("apply", apply),
+                ("impl-connector", db.impl_connector_time().saturating_sub(connector_before)),
                 ("roots", roots),
                 // All of the checking: threads look at the kinds one after another.
                 ("check", revalidate),
@@ -7105,6 +7461,342 @@ fn report_stats(stats: &hir_ty::mir::codegen::BuildStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sharing_retains_pair_facts_at_cold_capture_and_keeps_missing_files_conservative() {
+        use ide_db::base_db::{
+            CrateDisplayName, CrateGraphBuilder, CrateWorkspaceData, SourceRoot, SourceRootId,
+        };
+
+        let mut db = RootDatabase::new(None);
+        let paired = vfs::FileId::from_raw(0);
+        let outside = vfs::FileId::from_raw(1);
+        let empty = vfs::FileId::from_raw(2);
+        let mut files = vfs::file_set::FileSet::default();
+        for (file, name) in [(paired, "paired"), (outside, "outside"), (empty, "empty")] {
+            files.insert(file, VfsPath::new_real_path(format!("/sharing/{name}.rs")));
+        }
+        let root = SourceRootId(0);
+        db.set_source_root_with_durability(
+            root,
+            triomphe::Arc::new(SourceRoot::new_local(files)),
+            Durability::LOW,
+        );
+        let original = "fn one() {} fn two() { one(); } #[cfg(test)] fn only_test() {}";
+        for (file, text) in [(paired, original), (outside, "fn unrelated() {}"), (empty, "")] {
+            db.set_file_source_root_with_durability(file, root, Durability::LOW);
+            db.set_file_text_with_durability(file, text, Durability::LOW);
+        }
+        let mut graph = CrateGraphBuilder::default();
+        let mut ids = Vec::new();
+        for (file, name, test) in [
+            (paired, "normal", false),
+            (paired, "test", true),
+            (outside, "outside", false),
+            (empty, "empty", false),
+            (empty, "empty_test", true),
+        ] {
+            let mut cfg = cfg::CfgOptions::default();
+            if test {
+                cfg.insert_atom(intern::sym::test);
+            }
+            ids.push(graph.add_crate_root(
+                file,
+                syntax::Edition::CURRENT,
+                Some(CrateDisplayName::from_canonical_name(name)),
+                None,
+                cfg,
+                None,
+                Default::default(),
+                CrateOrigin::Local { repo: None, name: None },
+                Vec::new(),
+                false,
+                triomphe::Arc::new(AbsPathBuf::assert_utf8("/sharing".into())),
+                triomphe::Arc::new(CrateWorkspaceData { target: Err("".into()), toolchain: None }),
+            ));
+        }
+        let crates = graph.set_in_db(&mut db);
+        let input = hir_ty::mir::codegen::Sharing::new(vec![
+            (crates[&ids[0]], crates[&ids[1]], true),
+            (crates[&ids[3]], crates[&ids[4]], true),
+        ]);
+        let mut known = Rejections::default();
+        hir::attach_db(&db, || {
+            known.sharing(&db, input.clone(), "test");
+            assert!(!known.needs_sharing_facts(&[paired]));
+            let outside_functions = functions_of_modules(&db, crates[&ids[2]].into());
+            assert_eq!(outside_functions.len(), 1);
+            known.sharing_before_edit(&db, outside, &outside_functions);
+            assert!(known.needs_sharing_facts(&[outside]));
+            known.sharing_before_edit(&db, empty, &[]);
+            assert!(known.needs_sharing_facts(&[empty]));
+            let revision = db.zalsa().current_revision();
+            let warmed = known.sharing_after_demotion(
+                &db,
+                input.clone(),
+                &[paired, outside, empty],
+                "test-idle-no-write",
+            );
+            assert_eq!(revision, db.zalsa().current_revision());
+            assert_eq!(warmed, Rejections::default().sharing(&db, input.clone(), "test-full"));
+            assert!(!known.needs_sharing_facts(&[paired]));
+            assert!(known.needs_sharing_facts(&[outside, empty]));
+        });
+        db.set_file_text_with_durability(paired, original, Durability::MEDIUM);
+        db.set_file_text_with_durability(paired, original, Durability::LOW);
+        hir::attach_db(&db, || {
+            let warmed = known.sharing_after_demotion(
+                &db,
+                input.clone(),
+                &[paired, outside, empty],
+                "test-idle",
+            );
+            let full = Rejections::default().sharing(&db, input.clone(), "test-idle-full");
+            assert_eq!(warmed, full);
+            assert!(!known.needs_sharing_facts(&[paired]));
+            assert!(known.needs_sharing_facts(&[outside, empty]));
+        });
+        for (file, text) in [
+            (paired, "fn one() {} fn two() {} #[cfg(test)] fn only_test() {}"),
+            (outside, "fn unrelated() { fn nested() {} }"),
+            (empty, "fn added() {}"),
+            (outside, "fn unrelated() { missing(); }"),
+        ] {
+            db.set_file_text_with_durability(file, text, Durability::LOW);
+            hir::attach_db(&db, || {
+                known.touch_bodies(&db, file, None, &[]);
+                let retained = known.sharing(&db, input.clone(), "test");
+                let full = Rejections::default().sharing(&db, input.clone(), "test-full");
+                assert_eq!(retained, full);
+                if file == outside {
+                    assert!(known.needs_sharing_facts(&[file]));
+                } else {
+                    assert!(!known.needs_sharing_facts(&[file]));
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn crate_lookup_follows_revisions_and_checkout_context() {
+        use ide_db::base_db::{
+            CrateDisplayName, CrateGraphBuilder, CrateWorkspaceData, SourceRoot, SourceRootId,
+        };
+        let mut args = Args::parse(
+            ["/checkout", "--crate", "first", "--out", "out.o"].map(str::to_owned).into_iter(),
+        )
+        .unwrap();
+        args.checkout = "/checkout".into();
+        let mut db = RootDatabase::new(None);
+        let file = vfs::FileId::from_raw(0);
+        let root = SourceRootId(0);
+        let source = |name: &str| {
+            let mut files = vfs::file_set::FileSet::default();
+            files.insert(file, VfsPath::new_real_path(format!("/checkout/{name}.rs")));
+            triomphe::Arc::new(SourceRoot::new_local(files))
+        };
+        db.set_source_root_with_durability(root, source("lib"), Durability::LOW);
+        db.set_file_source_root_with_durability(file, root, Durability::LOW);
+        db.set_file_text_with_durability(file, "", Durability::LOW);
+        let mut graph = CrateGraphBuilder::default();
+        graph.add_crate_root(
+            file,
+            syntax::Edition::CURRENT,
+            Some(CrateDisplayName::from_canonical_name("first")),
+            None,
+            Default::default(),
+            None,
+            Default::default(),
+            CrateOrigin::Local { repo: None, name: None },
+            Vec::new(),
+            false,
+            triomphe::Arc::new(AbsPathBuf::assert_utf8("/checkout".into())),
+            triomphe::Arc::new(CrateWorkspaceData { target: Err("".into()), toolchain: None }),
+        );
+        graph.set_in_db(&mut db);
+        let found = crates_named(&db, "first", &args).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(crates_called(&db, "lib.rs", &args), found);
+        assert_eq!(crates_called(&db, "/checkout/lib.rs", &args), found);
+        assert!(crates_named(&db, "missing", &args).is_err());
+        let entries = lock(&args.crate_lookup).called.len();
+        assert_eq!(crates_called(&db, "lib.rs", &args), found);
+        assert_eq!(lock(&args.crate_lookup).called.len(), entries);
+        let elsewhere = Args { checkout: "/other".into(), ..args.clone() };
+        assert!(crates_called(&db, "lib.rs", &elsewhere).is_empty());
+        let tested = Args { unit_test: true, ..args.clone() };
+        assert!(crates_called(&db, "first", &tested).is_empty());
+        assert_eq!(crates_called(&db, "first", &args), found);
+        db.set_source_root_with_durability(root, source("renamed"), Durability::LOW);
+        assert!(crates_called(&db, "lib.rs", &args).is_empty());
+        assert_eq!(crates_called(&db, "renamed.rs", &args), found);
+        CrateGraphBuilder::default().set_in_db(&mut db);
+        assert!(crates_called(&db, "first", &args).is_empty());
+    }
+
+    #[test]
+    fn ladder_initial_tiers_and_permanent_demotion() {
+        use ide_db::base_db::{
+            SourceRoot, SourceRootId,
+            salsa::{Database, Durability, plumbing::ZalsaDatabase},
+        };
+        let mut db = RootDatabase::new(None);
+        db.enable_ladder(
+            vec![
+                (PathBuf::from("/selected"), true),
+                (PathBuf::from("/selected/dependency"), false),
+            ],
+            false,
+        );
+        for (index, (path, library, initial)) in [
+            ("/selected/lib.rs", false, Durability::MEDIUM),
+            ("/selected/dependency/lib.rs", false, Durability::HIGH),
+            ("/other/lib.rs", false, Durability::HIGH),
+            ("/library/lib.rs", true, Durability::HIGH),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let file = vfs::FileId::from_raw(index as u32);
+            let root = SourceRootId(index as u32);
+            let mut files = vfs::file_set::FileSet::default();
+            files.insert(file, vfs::VfsPath::new_real_path(path.to_owned()));
+            db.set_file_source_root_with_durability(file, root, Durability::LOW);
+            let source =
+                if library { SourceRoot::new_library(files) } else { SourceRoot::new_local(files) };
+            db.set_source_root_with_durability(root, triomphe::Arc::new(source), Durability::LOW);
+            db.set_file_text_with_durability(
+                file,
+                "",
+                if library { Durability::HIGH } else { Durability::LOW },
+            );
+            assert!(!db.ladder_file_is_low(file));
+            db.synthetic_write(Durability::LOW);
+            let before = db.zalsa().last_changed_revision(initial);
+            db.set_file_text_with_durability(file, "first", Durability::HIGH);
+            let demoted = db.zalsa().last_changed_revision(initial);
+            assert!(demoted > before, "{path} did not start at {initial:?}");
+            assert!(db.ladder_file_is_low(file));
+            db.set_file_text_with_durability(file, "", Durability::HIGH);
+            assert_eq!(demoted, db.zalsa().last_changed_revision(initial));
+            db.set_file_text(file, "later");
+            assert_eq!(demoted, db.zalsa().last_changed_revision(initial));
+        }
+    }
+
+    #[test]
+    fn ladder_low_initial_edits_preserve_medium_clock() {
+        use ide_db::base_db::{SourceRoot, SourceRootId};
+        let mut db = RootDatabase::new(None);
+        db.enable_ladder(vec![("/selected".into(), true)], true);
+        for (index, (path, library, selected)) in [
+            ("/selected/lib.rs", false, true),
+            ("/other/lib.rs", false, false),
+            ("/library/lib.rs", true, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let file = vfs::FileId::from_raw(index as u32);
+            let root = SourceRootId(index as u32);
+            let mut files = vfs::file_set::FileSet::default();
+            files.insert(file, VfsPath::new_real_path(path.to_owned()));
+            let source =
+                if library { SourceRoot::new_library(files) } else { SourceRoot::new_local(files) };
+            db.set_file_source_root_with_durability(file, root, Durability::LOW);
+            db.set_source_root_with_durability(root, triomphe::Arc::new(source), Durability::LOW);
+            db.set_file_text_with_durability(
+                file,
+                "",
+                if library { Durability::HIGH } else { Durability::LOW },
+            );
+            assert_eq!(db.ladder_file_is_low(file), selected);
+            db.synthetic_write(Durability::LOW);
+            let before = db.zalsa().last_changed_revision(Durability::MEDIUM);
+            db.set_file_text(file, "first");
+            assert_eq!(db.zalsa().last_changed_revision(Durability::MEDIUM) == before, selected);
+        }
+    }
+
+    #[test]
+    fn tiered_target_edits_do_not_advance_medium_clock() {
+        use ide_db::base_db::{
+            SourceRoot, SourceRootId,
+            salsa::{Database, Durability, plumbing::ZalsaDatabase},
+        };
+        let mut db = RootDatabase::new(None);
+        db.enable_tiered_durability(vec![
+            (PathBuf::from("/target-package"), true),
+            (PathBuf::from("/target-package/dependency"), false),
+        ]);
+        for (index, path) in [
+            "/target-package/src/lib.rs",
+            "/target-package/dependency/src/lib.rs",
+            "/dependency/src/lib.rs",
+            "/target-package/tests/test.rs",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let file = vfs::FileId::from_raw(index as u32);
+            let root = SourceRootId(index as u32);
+            let mut files = vfs::file_set::FileSet::default();
+            files.insert(file, vfs::VfsPath::new_real_path(path.to_string()));
+            db.set_file_source_root_with_durability(file, root, Durability::LOW);
+            db.set_source_root_with_durability(
+                root,
+                triomphe::Arc::new(SourceRoot::new_local(files)),
+                Durability::LOW,
+            );
+            db.set_file_text_with_durability(file, "", Durability::LOW);
+        }
+        db.synthetic_write(Durability::LOW);
+        let before = db.zalsa().last_changed_revision(Durability::MEDIUM);
+        db.set_file_text_with_durability(vfs::FileId::from_raw(0), "target edit", Durability::LOW);
+        assert_eq!(db.zalsa().last_changed_revision(Durability::MEDIUM), before);
+        db.set_file_text_with_durability(vfs::FileId::from_raw(3), "test edit", Durability::LOW);
+        assert_eq!(db.zalsa().last_changed_revision(Durability::MEDIUM), before);
+        db.set_file_text_with_durability(
+            vfs::FileId::from_raw(1),
+            "dependency edit",
+            Durability::LOW,
+        );
+        assert!(db.zalsa().last_changed_revision(Durability::MEDIUM) > before);
+        let before = db.zalsa().last_changed_revision(Durability::MEDIUM);
+        db.set_file_text_with_durability(
+            vfs::FileId::from_raw(2),
+            "dependency edit",
+            Durability::LOW,
+        );
+        assert!(db.zalsa().last_changed_revision(Durability::MEDIUM) > before);
+    }
+
+    #[test]
+    fn tiered_files_demote_once_and_libraries_stay_high() {
+        use ide_db::base_db::salsa::{Database, Durability, plumbing::ZalsaDatabase};
+        for tiered in [false, true] {
+            let mut db = RootDatabase::new(None);
+            if tiered {
+                db.enable_tiered_durability(Vec::new());
+            }
+            let file = vfs::FileId::from_raw(0);
+            db.set_file_text_with_durability(file, "", Durability::LOW);
+            db.synthetic_write(Durability::LOW);
+            let before = db.zalsa().last_changed_revision(Durability::MEDIUM);
+            db.set_file_text_with_durability(file, "", Durability::LOW);
+            let demoted = db.zalsa().last_changed_revision(Durability::MEDIUM);
+            assert_eq!(demoted > before, tiered);
+            db.set_file_text_with_durability(file, "changed", Durability::LOW);
+            assert_eq!(db.zalsa().last_changed_revision(Durability::MEDIUM), demoted);
+            assert_eq!(&**db.file_text(file).text(&db), "changed");
+
+            let library = vfs::FileId::from_raw(1);
+            db.set_file_text_with_durability(library, "library", Durability::HIGH);
+            let before = db.zalsa().last_changed_revision(Durability::HIGH);
+            db.set_file_text_with_durability(library, "updated", Durability::HIGH);
+            assert!(db.zalsa().last_changed_revision(Durability::HIGH) > before);
+        }
+    }
 
     #[test]
     fn skipped_text_is_retained_and_verified() {
@@ -7286,11 +7978,71 @@ fn lint_of(
 }
 
 fn trace_queries(db: &RootDatabase) {
+    if std::env::var_os("RUSTD_TRACE_MEMOS").is_some() {
+        let mut groups = rustc_hash::FxHashMap::<(String, String, String), u32>::default();
+        for (root, key, count) in ide_db::executions::take_memos() {
+            let name = db.ingredient_debug_name(key.ingredient_index());
+            let file = if name == "crate_local_def_map" {
+                let krate = ide_db::base_db::Crate::from_id(key.key_index());
+                Some(krate.root_file_id(db).file_id(db))
+            } else if name == "MacroCallId::parse_macro_expansion_" {
+                let call = hir_expand::MacroCallId::from_id(key.key_index());
+                let mut file = call.loc(db).kind.file_id();
+                while let Some(parent) = file.macro_file() {
+                    file = parent.loc(db).kind.file_id();
+                }
+                file.file_id().map(|file| file.file_id(db))
+            } else {
+                None
+            };
+            let detail = file.map_or_else(String::new, |file| {
+                let source =
+                    db.source_root(db.file_source_root(file).source_root_id(db)).source_root(db);
+                format!("{:?} low={}", source.path_for_file(&file), db.ladder_file_is_low(file))
+            });
+            *groups.entry((root, name.into_owned(), detail)).or_default() += count;
+        }
+        let mut groups: Vec<_> = groups.into_iter().collect();
+        groups.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (index, ((root, kind, detail), count)) in groups.into_iter().enumerate() {
+            if index >= 150
+                && !(kind == "crate_local_def_map" && root.starts_with("roots/known.sharing"))
+            {
+                continue;
+            }
+            eprintln!("validated-root-kind: {root}; kind={kind}; {detail}; count={count}");
+        }
+        for durability in [Durability::LOW, Durability::MEDIUM, Durability::HIGH] {
+            eprintln!(
+                "ladder-clock: {durability:?}={:?}",
+                db.zalsa().last_changed_revision(durability)
+            );
+        }
+    }
+    let phases = ide_db::executions::take_phases(db);
+    let executed_phases = ide_db::executions::take_executed_phases(db);
+    if std::env::var_os("RUSTD_TRACE_PHASES").is_some() {
+        for (root, count) in ide_db::executions::take_roots() {
+            eprintln!("validated-root: {root}={count}");
+        }
+        for (query, count) in phases {
+            eprintln!("validated-phase: {query}={count}");
+        }
+        for (query, count) in executed_phases {
+            eprintln!("executed-phase: {query}={count}");
+        }
+    }
     let ran = ide_db::executions::take(db);
+    let validated = ide_db::executions::take_validated(db);
     if std::env::var_os("RUSTD_TRACE").is_some() {
-        let ran: Vec<_> =
-            ran.into_iter().map(|(query, count)| format!("{query}={count}")).collect();
-        eprintln!("queries: {}", ran.join(" "));
+        let line = |counts: Vec<(String, u32)>| {
+            let total: u32 = counts.iter().map(|it| it.1).sum();
+            let counts: Vec<_> =
+                counts.into_iter().map(|(query, count)| format!("{query}={count}")).collect();
+            format!("{total} {}", counts.join(" "))
+        };
+        eprintln!("queries: {}", line(ran));
+        eprintln!("validated: {}", line(validated));
     }
 }
 
