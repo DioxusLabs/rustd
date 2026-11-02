@@ -2983,6 +2983,8 @@ struct Build {
     instances: usize,
     codegen: Duration,
     emit: Duration,
+    /// Telling what each test can run, for the client to run only the ones an edit can change.
+    reached: Duration,
     /// How long finding the roots, checking what is cached and compiling took, in that order.
     steps: [Duration; 3],
     /// Within the checking, the longest a thread took over each kind of cached thing.
@@ -3158,9 +3160,23 @@ fn build(
         replace(path, patch)?;
     }
     let mut harness_unfit = None;
+    let mut reached = Duration::ZERO;
     if let Some(harness) = harness {
         // What each test can run, for the client to run only the ones an edit can change.
+        let looking = Instant::now();
+        // The walk asks for all of the program one thing at a time: after an edit, threads
+        // find most of that still holds first.
+        std::thread::scope(|scope| {
+            for part in 0..threads {
+                let (db, known) = (db.clone(), &*known);
+                scope.spawn(move || {
+                    PROBING.set(true);
+                    hir::attach_db(&db, || known.look_at(&db, part, threads));
+                });
+            }
+        });
         Reached::of(db, listed, args).write(&args.out)?;
+        reached = looking.elapsed();
         let text = hir::attach_db(db, || match programs_own.first() {
             Some(&krate) if doctest => {
                 let runners: Vec<(String, Option<String>)> = listed
@@ -3210,7 +3226,8 @@ fn build(
             .collect(),
         instances: unit.instances,
         codegen,
-        emit: start.elapsed(),
+        emit: start.elapsed() - reached,
+        reached,
         steps: [setup, revalidate - setup, codegen - revalidate],
         looked,
         unfit: harness_unfit.or(report_unfit).or(missing).or_else(|| {
@@ -6668,7 +6685,11 @@ impl Program {
                     ),
                 ),
                 ("write", warm.emit),
-                ("build-rest", built.saturating_sub(apply + warm.codegen + warm.emit)),
+                ("reached", warm.reached),
+                (
+                    "build-rest",
+                    built.saturating_sub(apply + warm.codegen + warm.emit + warm.reached),
+                ),
                 ("report", reported - built),
                 ("link", total - reported),
             ];
