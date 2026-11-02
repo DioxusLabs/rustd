@@ -17,6 +17,14 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use triomphe::Arc;
 use vfs::{AbsPathBuf, FileId, Vfs, VfsPath, file_set::FileSet};
 
+pub(crate) fn tiered() -> bool {
+    std::env::var("RUSTD_TIERED").as_deref() == Ok("1")
+}
+
+pub(crate) fn ladder() -> bool {
+    matches!(std::env::var("RUSTD_LADDER").as_deref(), Ok("1" | "low"))
+}
+
 /// The directories of the source files that can change.
 pub(crate) struct Tree {
     vfs: Vfs,
@@ -132,6 +140,7 @@ impl Tree {
                     None => {
                         self.vfs.set_file_contents(vfs_path.clone(), Some(Vec::new()));
                         let Some((file, _)) = self.vfs.file_id(&vfs_path) else { continue };
+                        db.set_file_source_root_with_durability(file, root, Durability::LOW);
                         db.set_file_text_with_durability(file, "", Durability::LOW);
                         file
                     }
@@ -146,6 +155,7 @@ impl Tree {
             }
             self.rewrite(db, root, files, &FxHashSet::default());
         }
+        crate::launder::refresh(db);
         moved
     }
 
@@ -186,6 +196,7 @@ impl Tree {
         for (root, files) in joined {
             self.rewrite(db, root, files, &FxHashSet::default());
         }
+        crate::launder::refresh(db);
         added
     }
 
@@ -200,6 +211,7 @@ impl Tree {
         for (root, gone) in left {
             self.rewrite(db, root, Vec::new(), &gone);
         }
+        crate::launder::refresh(db);
     }
 
     fn rewrite(

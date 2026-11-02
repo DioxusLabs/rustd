@@ -301,6 +301,7 @@ impl Frozen {
 
 /// The last object built in full, as far as patching it goes.
 #[derive(Clone)]
+#[cfg_attr(test, derive(Default))]
 pub(super) struct Base {
     sharing: super::Sharing,
     decisions: Vec<u128>,
@@ -812,7 +813,8 @@ impl Base {
     pub(super) fn stale(&self, db: &dyn HirDatabase, part: usize, parts: usize) -> Stale {
         let start = stdx::time::Instant::now();
         let mut stale = Stale::default();
-        let changed = self.decisions_changed(db);
+        let changed =
+            base_db::query_phase::run("check/decisions_changed", || self.decisions_changed(db));
         stale.steps.policy = start.elapsed();
         if changed {
             return stale.declined("cfg sharing decisions changed");
@@ -843,10 +845,19 @@ impl Base {
             }
             let asked = stdx::time::Instant::now();
             let mark = probe(|| {
-                let compiled = program_root(db, root, &self.sharing).as_ref().ok()?;
+                let compiled = base_db::query_phase::run("check/program_root", || {
+                    let key = std::env::var_os("RUSTD_TRACE_PHASES")
+                        .is_some()
+                        .then(|| format!("program_root({root:?})"));
+                    base_db::query_phase::with_root(key, || program_root(db, root, &self.sharing))
+                })
+                .as_ref()
+                .ok()?;
                 Some(Mark::of_function(
                     db,
-                    program_root_serial(db, root, self.sharing.clone()),
+                    base_db::query_phase::run("check/program_root_serial", || {
+                        program_root_serial(db, root, self.sharing.clone())
+                    }),
                     compiled,
                     self.debug,
                 ))
@@ -880,15 +891,18 @@ impl Base {
             }
             let asked = stdx::time::Instant::now();
             let mark = probe(|| {
-                let compiled =
-                    program_instance(db, instance.clone(), was.env.clone(), &self.sharing);
+                let compiled = base_db::query_phase::run("check/program_instance", || {
+                    program_instance(db, instance.clone(), was.env.clone(), &self.sharing)
+                });
                 compiled.as_ref().ok().map(|it| {
-                    let serial = program_instance_serial(
-                        db,
-                        instance.clone(),
-                        was.env.clone(),
-                        self.sharing.clone(),
-                    );
+                    let serial = base_db::query_phase::run("check/program_instance_serial", || {
+                        program_instance_serial(
+                            db,
+                            instance.clone(),
+                            was.env.clone(),
+                            self.sharing.clone(),
+                        )
+                    });
                     Mark::of_function(db, serial, it, self.debug)
                 })
             });
