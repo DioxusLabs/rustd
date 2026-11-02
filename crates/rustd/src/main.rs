@@ -2781,6 +2781,11 @@ fn dump_twins(db: &RootDatabase, args: &Args) {
             }
             if verify {
                 eprintln!("cfg verify: {name}: {verified:?}");
+                let seeds = hir_ty::sharing::local_unstable_seeds(db, normal, test);
+                eprintln!("cfg verify: {name}: {} unstable seeds", seeds.len());
+                for seed in seeds.iter().take(40) {
+                    eprintln!("cfg seed: {name}: {seed}");
+                }
             }
             let safety = hir_ty::sharing::local_pair_safety(db, normal, test);
             let veto = if safety.is_empty() { "none".to_owned() } else { safety.join(",") };

@@ -14,7 +14,7 @@ use std::{
 use crate::{
     InferBodyId,
     db::{HirDatabase, InternedClosureId, InternedCoroutineClosureId, InternedCoroutineId},
-    next_solver::{DbInterner, Ty, TyKind},
+    next_solver::{DbInterner, SolverDefId, Ty, TyKind},
     traits::{ParamEnvAndCrate, StoredParamEnvAndCrate},
 };
 
@@ -914,6 +914,26 @@ impl<'db> Canonical<'_, 'db> {
         }
     }
 
+    fn region_owner(&self, def: SolverDefId<'db>) -> SolverDefId<'db> {
+        match def {
+            SolverDefId::FunctionId(id) => {
+                match self.generic_parent(id.into()) {
+                    hir_def::GenericDefId::FunctionId(id) => id.into(),
+                    _ => def,
+                }
+            }
+            SolverDefId::ImplId(id) => match self.generic_parent(id.into()) {
+                hir_def::GenericDefId::ImplId(id) => id.into(),
+                _ => def,
+            },
+            SolverDefId::TraitId(id) => match self.generic_parent(id.into()) {
+                hir_def::GenericDefId::TraitId(id) => id.into(),
+                _ => def,
+            },
+            _ => def,
+        }
+    }
+
     fn item(&self, item: AttrDefId) -> AttrDefId {
         if self.opaque_only {
             return item;
@@ -989,6 +1009,25 @@ impl<'db> Canonical<'_, 'db> {
 impl<'db> TypeFolder<DbInterner<'db>> for Canonical<'_, 'db> {
     fn cx(&self) -> DbInterner<'db> {
         self.interner
+    }
+
+    fn fold_region(
+        &mut self,
+        region: crate::next_solver::Region<'db>,
+    ) -> crate::next_solver::Region<'db> {
+        use crate::next_solver::{Region, RegionKind};
+        if let RegionKind::ReEarlyParam(mut param) = region.kind() {
+            param.id.parent = self.generic_parent(param.id.parent);
+            return Region::new_early_param(self.interner, param);
+        }
+        if let RegionKind::ReLateParam(param) = region.kind() {
+            let mut bound = param.bound_region;
+            if let rustc_type_ir::BoundRegionKind::Named(def) = bound.kind {
+                bound.kind = rustc_type_ir::BoundRegionKind::Named(self.region_owner(def));
+            }
+            return Region::new_late_param(self.interner, self.region_owner(param.scope), bound);
+        }
+        region
     }
 
     fn fold_const(
