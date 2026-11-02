@@ -843,6 +843,7 @@ fn references(db: &dyn HirDatabase, item: AttrDefId, initializer: bool) -> Refer
         for (expr, value) in lowered.exprs() {
             let guard = resolver.update_to_inner_scope(db, owner, expr);
             for path in baked_type_paths(&lowered, expr) {
+                c.result.items.extend(named_type(db, &resolver, &path));
                 if let Some(ValueNs::ConstId(id)) =
                     resolver.resolve_path_in_value_ns_fully(db, &path, HygieneId::ROOT)
                 {
@@ -862,6 +863,9 @@ fn references(db: &dyn HirDatabase, item: AttrDefId, initializer: bool) -> Refer
                     c.result.baked_items.insert(id.into());
                 }
                 args.visit_with(&mut c);
+            }
+            if let Expr::Path(path) | Expr::RecordLit { path, .. } = value {
+                c.result.items.extend(named_type(db, &resolver, path));
             }
             if let Expr::Path(path) = value {
                 match resolver.resolve_path_in_value_ns_fully(
@@ -1472,6 +1476,29 @@ fn same_signature_mode(
             let t = db.ty(TyDefId::TypeAliasId(t)).skip_binder().fold_with(&mut mapper);
             !n.has_non_region_error() && !t.has_non_region_error() && n == t
         }
+        (AttrDefId::AdtId(n), AttrDefId::AdtId(t)) => {
+            let variants = |id: AdtId| -> Vec<VariantId> {
+                match id {
+                    AdtId::StructId(id) => vec![id.into()],
+                    AdtId::UnionId(id) => vec![id.into()],
+                    AdtId::EnumId(id) => {
+                        id.enum_variants(db).variants.values().map(|(id, _)| (*id).into()).collect()
+                    }
+                }
+            };
+            let (n_variants, t_variants) = (variants(n), variants(t));
+            GenericParams::of(db, n.into()).len() == GenericParams::of(db, t.into()).len()
+                && n_variants.len() == t_variants.len()
+                && n_variants.iter().zip(&t_variants).all(|(&n, &t)| {
+                    let (n, t) = (db.field_types(n), db.field_types(t));
+                    n.iter().count() == t.iter().count()
+                        && n.iter().zip(t.iter()).all(|((_, n), (_, t))| {
+                            let n = n.ty().skip_binder().fold_with(&mut mapper);
+                            let t = t.ty().skip_binder().fold_with(&mut mapper);
+                            !n.has_non_region_error() && !t.has_non_region_error() && n == t
+                        })
+                })
+        }
         (AttrDefId::ImplId(n), AttrDefId::ImplId(t)) => {
             let n_self = db.impl_self_ty(n).skip_binder().fold_with(&mut mapper);
             let t_self = db.impl_self_ty(t).skip_binder().fold_with(&mut mapper);
@@ -1498,6 +1525,24 @@ fn same_signature_mode(
         }
         _ => true,
     }
+}
+
+/// The declaration a path in a body goes through. Inference expands aliases and normalizes
+/// projections, so its results no longer mention what the source named.
+fn named_type(
+    db: &dyn HirDatabase,
+    resolver: &hir_def::resolver::Resolver<'_>,
+    path: &hir_def::expr_store::path::Path,
+) -> Option<AttrDefId> {
+    use hir_def::resolver::TypeNs;
+    Some(match resolver.resolve_path_in_type_ns(db, path)?.0 {
+        TypeNs::AdtId(id) | TypeNs::AdtSelfType(id) => id.into(),
+        TypeNs::SelfType(id) => id.into(),
+        TypeNs::EnumVariantId(id) => id.into(),
+        TypeNs::TypeAliasId(id) => id.into(),
+        TypeNs::TraitId(id) => id.into(),
+        TypeNs::GenericParam(_) | TypeNs::BuiltinType(_) | TypeNs::ModuleId(_) => return None,
+    })
 }
 
 fn baked_type_paths(store: &ExpressionStore, expr: ExprId) -> Vec<hir_def::expr_store::path::Path> {
@@ -1672,6 +1717,105 @@ fn local_references(db: &dyn HirDatabase, refs: ReferenceFacts) -> impl Iterator
     refs.items(db).iter().chain(refs.type_items(db)).chain(refs.signature_types(db)).copied()
 }
 
+/// What one declaration of the normal copy needs to mean the same in the test copy: its own
+/// comparison, and the declarations its meaning is built from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalDeclaration {
+    stable: bool,
+    edges: Vec<AttrDefId>,
+}
+
+#[salsa::tracked(returns(ref))]
+fn local_declaration(
+    db: &dyn HirDatabase,
+    normal: Crate,
+    test: Crate,
+    item: AttrDefId,
+) -> LocalDeclaration {
+    let unstable = LocalDeclaration { stable: false, edges: Vec::new() };
+    if matches!(item, AttrDefId::ModuleId(_)) {
+        return LocalDeclaration { stable: true, edges: Vec::new() };
+    }
+    let Some(twin) = hir_def::twins::declaration_twin(db, test, normal, item) else {
+        return unstable;
+    };
+    let (own, other) = (
+        hir_def::twins::declaration_reads(db, item),
+        hir_def::twins::declaration_reads(db, twin),
+    );
+    if own.unknown
+        || other.unknown
+        || own.differs_from(test.cfg_options(db))
+        || other.differs_from(normal.cfg_options(db))
+        || !same_signature_mode(db, normal, item, twin, true)
+        || local_impl_mismatch(db, normal, test, item)
+    {
+        return unstable;
+    }
+    let refs = references(db, item, false);
+    if refs.unknown && !refs.generic_unresolved {
+        return unstable;
+    }
+    let mut edges: FxHashSet<_> =
+        refs.items.iter().chain(&refs.type_items).chain(&refs.signature_types).copied().collect();
+    match item {
+        AttrDefId::AdtId(adt) => {
+            edges.extend(applicable_adt_impls(db, adt).iter().map(|&id| AttrDefId::ImplId(id)));
+        }
+        AttrDefId::TraitId(id) => {
+            let impls = |krate, id| local_trait_impls(db, krate).get(&id).map_or(0, Vec::len);
+            let AttrDefId::TraitId(test_id) = twin else { return unstable };
+            if impls(normal, id) != impls(test, test_id) {
+                return unstable;
+            }
+            edges.extend(
+                local_trait_impls(db, normal)
+                    .get(&id)
+                    .into_iter()
+                    .flatten()
+                    .map(|&id| AttrDefId::ImplId(id)),
+            );
+        }
+        _ => {}
+    }
+    let mut edges: Vec<_> =
+        edges.into_iter().filter(|edge| edge.module(db).krate(db) == normal).collect();
+    edges.sort_unstable_by_key(salsa::plumbing::AsId::as_id);
+    LocalDeclaration { stable: true, edges }
+}
+
+/// The declarations of `normal` that differ in `test`, or are built from one that does. Bodies
+/// are not part of this, so an edit inside a body leaves it unchanged.
+#[salsa::tracked(returns(ref))]
+fn local_unstable(db: &dyn HirDatabase, normal: Crate, test: Crate) -> FxHashSet<AttrDefId> {
+    let mut users: FxHashMap<AttrDefId, Vec<AttrDefId>> = FxHashMap::default();
+    let mut seen = FxHashSet::default();
+    let mut pending: Vec<_> = crate_items(db, normal).items.iter().copied().collect();
+    let mut unstable = Vec::new();
+    while let Some(item) = pending.pop() {
+        if !seen.insert(item) {
+            continue;
+        }
+        let fact = local_declaration(db, normal, test, item);
+        if !fact.stable {
+            unstable.push(item);
+        }
+        for &edge in &fact.edges {
+            users.entry(edge).or_default().push(item);
+            pending.push(edge);
+        }
+    }
+    let mut result: FxHashSet<_> = unstable.iter().copied().collect();
+    while let Some(item) = unstable.pop() {
+        for &user in users.get(&item).into_iter().flatten() {
+            if result.insert(user) {
+                unstable.push(user);
+            }
+        }
+    }
+    result
+}
+
 fn local_own_reason(reason: Option<Rejection>) -> Option<LocalRejection> {
     match reason {
         Some(Rejection::CfgDiffering) => Some(LocalRejection::CfgDiffering),
@@ -1724,13 +1868,10 @@ fn local_facts(
         if referenced.module(db).krate(db) != normal {
             continue;
         }
-        let twin = local_time(2, || hir_def::twins::declaration_twin(db, test, normal, referenced))
+        local_time(2, || hir_def::twins::declaration_twin(db, test, normal, referenced))
             .ok_or(LocalRejection::MissingTwin)?;
-        if !same_signature_mode(db, normal, referenced, twin, true) {
+        if local_unstable(db, normal, test).contains(&referenced) {
             return Err(LocalRejection::Signature);
-        }
-        if local_impl_mismatch(db, normal, test, referenced) {
-            return Err(LocalRejection::ImplMismatch);
         }
     }
     Ok(refs)
