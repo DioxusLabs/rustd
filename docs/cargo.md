@@ -139,9 +139,14 @@ while loading is remembered until the source changes. Status shows lost workers,
 build requests and spare workers. On Linux, signal 9 reports the kernel's OOM-kill count
 since the worker started and its sampled peak RSS when available.
 
-On Linux, `RUSTD_HUNG_SECS` sets how long a worker and its descendants may use no CPU time
-while loading or answering a request before they are killed (default 300 seconds; 0 disables
-the check). It does not apply to an idle worker. Other platforms do not detect hangs yet.
+`RUSTD_HUNG_SECS` sets how long a worker and what it started may use no CPU time while loading
+or answering a request before they are killed (default 300 seconds; 0 disables the check). It
+does not apply to an idle worker.
+
+A worker runs in a process group (a job object on Windows), so what it started, such as a
+linker, ends with it. Its log goes through a pipe of the daemon's, so a full disk under the log
+does not fail the build. A worker that exits on an I/O error is not held to the source: the next
+build starts a new one without an edit.
 
 A new worktree still has cargo build the dependencies, because it has a target directory
 of its own. What it saves is the daemon's side: the worktree joins the worker that is

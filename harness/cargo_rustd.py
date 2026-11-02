@@ -1356,6 +1356,29 @@ def recovery(work, check):
         env["RUSTD_CACHE"] = os.path.join(work, "recovery-cache-" + name)
         if name == "hung":
             env["RUSTD_HUNG_SECS"] = "3"
+        logs = None
+        if name == "logs":
+            # The logs of the workers are on the full disk, nothing else is.
+            ws = os.path.join(work, "r-logs-ws")
+            shutil.copytree(os.path.join(root, "ws"), ws, dirs_exist_ok=True)
+            home = os.path.join(work, "r-logs-home")
+            env = base_env(home)
+            env["RUSTD_CACHE"] = os.path.join(work, "recovery-cache-" + name)
+            logs = os.path.join(home, "spares")
+            os.makedirs(logs, mode=0o700)
+            os.chmod(home, 0o700)
+            subprocess.run(["sudo", "-n", "mount", "--bind", root, logs], check=True)
+        slow = os.path.join(root, "slow")
+        if name == "orphan":
+            # Edits link rather than splice, with a linker that takes its time when asked.
+            env["RUSTD_SPLICE"] = "0"
+            linker = os.path.join(root, "linker")
+            with open(linker, "w") as out:
+                out.write(f'#!/bin/sh\nif [ -e {slow} ]; then\n  echo $$ > {slow}.pid\n  sleep 60 &\n  echo $! >> {slow}.pid\n  wait\nfi\nexec cc "$@"\n')
+            os.chmod(linker, 0o755)
+            os.makedirs(os.path.join(ws, ".cargo"), exist_ok=True)
+            with open(os.path.join(ws, ".cargo/config.toml"), "w") as out:
+                out.write(f'[build]\nrustflags = ["-C", "linker={linker}"]\n')
         side = Side(ws, env, True)
         clients, stopped = [], []
         daemon = None
@@ -1450,7 +1473,7 @@ def recovery(work, check):
                 record("stopped spare becomes loading worker", bool(loading), extra=f", worker {worker}")
                 os.kill(worker, signal.SIGKILL)
                 ran = finish(process)
-                record("client names signal 9", ran.returncode != 0 and bool(re.search(r"signal:? 9", ran.stderr)), ran)
+                record("client names signal 9", ran.returncode != 0 and bool(re.search(r"signal:? 9", ran.stderr)) and "peak RSS" in ran.stderr, ran)
                 next_build()
             else:
                 first = finish(spawn(), 120)
@@ -1477,6 +1500,52 @@ def recovery(work, check):
                            extra=f", status={text!r}")
                     sockets = glob.glob(os.path.join(home, "workers", "*", "sock"))
                     record("dead worker socket removed", not sockets, extra=f", sockets={sockets}")
+                elif name == "orphan":
+                    with open(slow, "w"):
+                        pass
+                    edit()
+                    process = spawn()
+                    pids = wait_for(lambda: (it if os.path.exists(slow + ".pid") and len(it := pathlib.Path(slow + ".pid").read_text().split()) == 2 else None), 30)
+                    if not pids:
+                        raise RuntimeError("the link never started")
+                    # A write the worker was in the middle of when it died.
+                    objects = glob.glob(os.path.join(ws, "target", "rustd", "*", "programs", "*", "rustd.o"))
+                    partial = objects[0] + f".{worker}.new"
+                    with open(partial, "wb") as out:
+                        out.write(bytes(4096))
+                    os.kill(worker, signal.SIGKILL)
+                    ran = finish(process, 30)
+                    record("client names signal 9", ran.returncode != 0 and "signal 9" in ran.stderr, ran)
+                    gone = wait_for(lambda: not any(alive(int(it)) for it in pids), 3)
+                    record("the linker it left behind is killed", bool(gone), extra=f", pids {pids}")
+                    for pid_ in pids:
+                        try:
+                            os.kill(int(pid_), signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    record("a write it left behind is removed", not os.path.exists(partial), extra=f", {partial}")
+                    os.remove(slow)
+                elif name == "unwritable":
+                    objects = glob.glob(os.path.join(ws, "target", "rustd", "*", "programs", "*"))
+                    side.cargo("stop", timeout=15)
+                    edit()
+                    for it in objects:
+                        os.chmod(it, 0o500)
+                    ran = finish(spawn())
+                    record("cold failure names the path", ran.returncode != 0 and not by_cargo(how_built(ran.stderr)) and "ermission denied" in ran.stderr, ran)
+                    daemon = pid()
+                    for it in objects:
+                        os.chmod(it, 0o700)
+                    # Nothing in the source changed: what failed was not the source's.
+                elif name == "logs":
+                    fill()
+                    edit()
+                    ran = finish(spawn())
+                    held = re.findall(r"worker: pid (\d+)", status())
+                    record("a full disk under the log does not fail the build", ran.returncode == 0 and held == [str(worker)], ran, f", workers {held}")
+                    last = status()
+                    record("status stays ready", f"{ws}: ready" in last, extra=f", status={last!r}")
+                    os.remove(os.path.join(root, "filler"))
                 elif name in ("build", "hung"):
                     edit()
                     os.kill(worker, signal.SIGSTOP)
@@ -1499,17 +1568,29 @@ def recovery(work, check):
                     next_build()
                     wait_warm(side, ws)
                     worker = int(re.search(r"worker: pid (\d+)", status())[1])
-                    log = os.readlink(f"/proc/{worker}/fd/2")
+                    log = re.search(r"worker: pid \d+, .*, log (\S+)", status())[1]
                     with open(log, "w"):
                         pass
                     fill()
                     edit()
                     ran = finish(spawn())
                     record("full worker log error names path", full_error(ran) and
-                           os.stat(log).st_size == 0 and
-                           ran.stderr.count("the disk is full:") == 1, ran)
+                           ran.stderr.count("the disk is full") == 1, ran)
                     os.remove(os.path.join(root, "filler"))
                     next_build("full worker log recovers")
+                    wait_warm(side, ws)
+                    leftovers = glob.glob(os.path.join(ws, "target", "**", "*.new"), recursive=True)
+                    record("no partial writes left behind", not leftovers, extra=f", {leftovers}")
+                    worker = int(re.search(r"worker: pid (\d+)", status())[1])
+                    path = os.path.join(ws, "app/src/main.rs")
+                    good = pathlib.Path(path).read_text()
+                    pathlib.Path(path).write_text(good.replace("std::hint::spin_loop();", "let _: u8 = \"text\"; std::hint::spin_loop();"))
+                    ran = finish(spawn())
+                    held = re.findall(r"worker: pid (\d+)", status())
+                    record("a source error keeps the worker", ran.returncode != 0 and "the disk is full" not in ran.stderr and
+                           bool(re.search(r"E0308|mismatched", ran.stderr)) and held == [str(worker)], ran, f", worker {worker} -> {held}")
+                    pathlib.Path(path).write_text(good)
+                    next_build("a source error recovers")
                     wait_warm(side, ws)
                     worker = int(re.search(r"worker: pid (\d+)", status())[1])
                     os.kill(worker, signal.SIGSTOP)
@@ -1529,7 +1610,7 @@ def recovery(work, check):
                         ran = finish(process)
                     record("unanswered request on full disk names path", full_error(ran) and
                            "did not answer" in ran.stderr and
-                           ran.stderr.count("the disk is full:") == 1, ran)
+                           ran.stderr.count("the disk is full") == 1, ran)
                     os.remove(os.path.join(root, "filler"))
                     next_build("unanswered request recovers")
                     wait_warm(side, ws)
@@ -1560,8 +1641,10 @@ def recovery(work, check):
             except subprocess.TimeoutExpired:
                 if daemon and alive(daemon):
                     kill(daemon)
+            if logs:
+                subprocess.run(["sudo", "-n", "umount", "-l", logs], check=True)
 
-    for name in ("load", "build", "idle", "spare", "hung"):
+    for name in ("load", "build", "idle", "spare", "hung", "orphan", "unwritable"):
         case(name)
     if shutil.which("sudo") is None or subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode:
         print("  skip recovery disk: passwordless sudo unavailable (not checked)", flush=True)
@@ -1574,6 +1657,7 @@ def recovery(work, check):
         return
     try:
         case("disk", disk)
+        case("logs", disk)
     finally:
         unmounted = subprocess.run(["sudo", "-n", "umount", disk], capture_output=True, text=True)
         check("recovery disk: unmount tmpfs", unmounted.returncode == 0, unmounted.stderr)

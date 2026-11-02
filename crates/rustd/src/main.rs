@@ -3415,7 +3415,14 @@ fn link(
     let said = String::from_utf8_lossy(&linked.stderr);
     eprint!("{}{said}", String::from_utf8_lossy(&linked.stdout));
     eprintln!("link: {:.1?} ({status}{declined})", start.elapsed());
-    anyhow::ensure!(status.success(), "the link failed ({status}): {}", last_lines(&said, 6));
+    if !status.success() {
+        let why = anyhow::anyhow!("the link failed ({status}): {}", last_lines(&said, 6));
+        // The linker's message is the only word there is of this one.
+        return Err(match said.contains("No space left on device") {
+            true => why.context(std::io::Error::from(std::io::ErrorKind::StorageFull)),
+            false => why,
+        });
+    }
     // A link line not of a plan writes the executable itself.
     if let (Some(binary), Some(linking)) = (binary, &linking)
         && linking.exists()
@@ -3653,9 +3660,16 @@ fn selected(args: &Args) -> Vec<String> {
 fn replace(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let mut new = path.as_os_str().to_owned();
     new.push(format!(".{}.new", std::process::id()));
-    std::fs::write(&new, bytes)
-        .with_context(|| format!("writing {}", Path::new(&new).display()))?;
-    std::fs::rename(&new, path).with_context(|| format!("replacing {}", path.display()))
+    let written = std::fs::write(&new, bytes)
+        .with_context(|| format!("writing {}", Path::new(&new).display()))
+        .and_then(|()| {
+            std::fs::rename(&new, path).with_context(|| format!("replacing {}", path.display()))
+        });
+    if written.is_err() {
+        // What did fit would stay in the way of the next build.
+        let _ = std::fs::remove_file(&new);
+    }
+    written
 }
 
 /// What cargo said of every crate when the checkouts were last loaded.
@@ -4430,7 +4444,7 @@ impl Builds {
             let _ = match &answer {
                 Ok(Ok(built)) => writeln!(&client, "ok {built}"),
                 Ok(Err(why)) => writeln!(&client, "error: {}", why.replace('\n', " ")),
-                Err(why) => writeln!(&client, "error: {}", format!("{why:#}").replace('\n', " ")),
+                Err(why) => writeln!(&client, "{FATAL}{}", said_of(why).replace('\n', " ")),
             };
         }
         let _ = answer?;
@@ -4606,7 +4620,36 @@ pub(crate) fn end_with_reader() {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+/// How a worker's answer says it failed and is ending, rather than turned the build down.
+const FATAL: &str = "fatal: ";
+
+/// The status of a process that failed on what is around the source rather than on the
+/// source: the same source can do better next time.
+const OUTSIDE_THE_SOURCE: i32 = 3;
+
+fn io_error(error: &anyhow::Error) -> Option<&std::io::Error> {
+    error.chain().find_map(|it| it.downcast_ref())
+}
+
+/// An error, with a full disk named.
+fn said_of(error: &anyhow::Error) -> String {
+    match io_error(error).map(std::io::Error::kind) {
+        Some(std::io::ErrorKind::StorageFull) => format!("{}: {error:#}", cargo::daemon::FULL),
+        _ => format!("{error:#}"),
+    }
+}
+
+fn main() -> std::process::ExitCode {
+    let Err(error) = rustd() else { return std::process::ExitCode::SUCCESS };
+    // A log that can't be written has nothing to add to this.
+    let _ = writeln!(std::io::stderr(), "Error: {}", said_of(&error));
+    std::process::ExitCode::from(match io_error(&error) {
+        Some(_) => OUTSIDE_THE_SOURCE as u8,
+        None => 1,
+    })
+}
+
+fn rustd() -> anyhow::Result<()> {
     let stands_in_for_rustc = std::env::var_os("RUSTD_WRAPS_RUSTC").is_some();
     match std::env::args().nth(1).as_deref() {
         _ if stands_in_for_rustc => {}

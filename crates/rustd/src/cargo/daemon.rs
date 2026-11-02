@@ -6,10 +6,9 @@
 use std::{
     collections::BTreeMap,
     ffi::OsString,
-    fs::OpenOptions,
     io::{self, BufRead as _, BufReader, Write as _},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Command, Stdio},
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicUsize, Ordering::Relaxed},
@@ -27,8 +26,9 @@ use std::os::unix::net::UnixStream;
 #[cfg(windows)]
 use uds_windows::UnixStream;
 
+use super::tree::{Ended, Log, Tree};
 use super::{plan::Plan, units::stamp_of};
-use crate::socket::{self, NotServed, Served, private_dir, private_file, read_request};
+use crate::socket::{self, NotServed, Served, private_dir, read_request};
 
 /// How long the daemon and each worker live without being asked, unless
 /// `RUSTD_IDLE_SECS` says otherwise.
@@ -41,6 +41,9 @@ const TICK: Duration = Duration::from_secs(1);
 const POLL: Duration = Duration::from_millis(20);
 /// How long a worker that hung up on a request is given to end.
 const ENDING: Duration = Duration::from_secs(2);
+
+/// How a loss is said to be of a full disk, by the daemon and the worker.
+pub(crate) const FULL: &str = "the disk is full";
 
 macro_rules! log {
     ($($arg:tt)*) => { let _ = writeln!(io::stderr().lock(), $($arg)*); };
@@ -271,17 +274,20 @@ struct Loaded {
 struct Worker {
     project: PathBuf,
     socket: PathBuf,
-    log: PathBuf,
+    log: Log,
     /// The variables the process runs with. A request says them with the ones of its
     /// checkout over them.
     env: ide_db::base_db::Env,
-    child: Mutex<Child>,
+    pid: u32,
+    tree: Mutex<Tree>,
     checkouts: Mutex<FxHashMap<String, Loaded>>,
     asked: Mutex<Instant>,
     lost: Mutex<Option<String>>,
     requests: Mutex<Vec<Instant>>,
-    peak_rss: Mutex<Option<u64>>,
-    oom_kills: Option<u64>,
+    /// The kernel's count of what it killed for memory, when last seen with the process alive.
+    oom_kills: Mutex<Option<u64>>,
+    /// The CPU time of a process that was asked something, and when it last changed.
+    progress: Mutex<Option<(u64, Instant)>>,
     paths: Vec<PathBuf>,
 }
 
@@ -313,7 +319,7 @@ impl Worker {
                 spare.stop();
             }
         })?;
-        let (socket, mut log) = (dir.join("sock"), dir.join("log"));
+        let socket = dir.join("sock");
         // The worker of a daemon that was killed may still be there, on its way out: it
         // is not the one to connect to.
         let _ = std::fs::remove_file(&socket);
@@ -344,11 +350,8 @@ impl Worker {
         }
         env.set(ENDS_WITH_INPUT, "1");
         let told = spare.and_then(|it| it.told(&args, &told_env, &checkout.root, false));
-        let child = match told {
-            Some(spare) => {
-                log = spare.log;
-                spare.child
-            }
+        let (tree, log) = match told {
+            Some(spare) => (spare.tree, spare.log),
             None => {
                 let mut command = Command::new(std::env::current_exe()?);
                 command.args(&args);
@@ -356,13 +359,11 @@ impl Worker {
                     Some(store) => command.env("RUSTD_CACHE", store),
                     None => command.env_remove("RUSTD_CACHE"),
                 };
-                let output =
-                    private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)
-                        .with_context(|| format!("opening {}", log.display()))?;
+                let log = Log::of(&mut command, &dir.join("log"))?;
                 command.envs(&told_env).env(ENDS_WITH_INPUT, "1");
                 command.current_dir(&checkout.root);
-                command.stdin(Stdio::piped()).stdout(output.try_clone()?).stderr(output);
-                command.spawn().context("starting a worker")?
+                command.stdin(Stdio::piped());
+                (Tree::spawn(&mut command).context("starting a worker")?, log)
             }
         };
         let loading = Loaded {
@@ -375,13 +376,14 @@ impl Worker {
             socket,
             log,
             env,
-            child: Mutex::new(child),
+            pid: tree.id(),
+            tree: Mutex::new(tree),
             checkouts: Mutex::new(FxHashMap::from_iter([(checkout.key.clone(), loading)])),
             asked: Mutex::new(Instant::now()),
             lost: Mutex::new(None),
             requests: Mutex::new(Vec::new()),
-            peak_rss: Mutex::new(None),
-            oom_kills: probe::oom_kills(),
+            oom_kills: Mutex::new(oom_kills()),
+            progress: Mutex::new(None),
             paths: std::iter::once(dir)
                 .chain(checkout.programs.iter().flat_map(|it| {
                     [&it.object, &it.binary]
@@ -398,28 +400,44 @@ impl Worker {
         if let Some(reason) = &*lost {
             return reason.clone();
         }
-        let reason = self.disk_error(reason);
         self.stop();
+        let reason = self.with_full_disk(reason);
+        self.sweep();
+        let _ = std::fs::remove_file(&self.socket);
         log!("{reason}");
         *lost = Some(reason.clone());
         reason
     }
 
-    fn disk_error(&self, mut reason: String) -> String {
-        let full = self.paths.iter().find(|path| no_space(path));
-        if disk_full(&reason) || full.is_some() {
-            reason = format!("the disk is full: {reason}");
+    /// Says so of a full disk under the worker. It may be why, and the next build needs room.
+    fn with_full_disk(&self, reason: String) -> String {
+        match self.paths.iter().find(|path| no_space(path)) {
+            Some(path) if !reason.contains(FULL) => {
+                format!("{reason} ({FULL} at {})", path.display())
+            }
+            _ => reason,
         }
-        if let Some(path) = full
-            && !reason.contains(path.to_string_lossy().as_ref())
-        {
-            reason.push_str(&format!(" (no space left at {})", path.display()));
-        }
-        reason
     }
 
-    fn death(&self, status: ExitStatus) -> String {
-        let pid = lock(&self.child).id();
+    /// Removes what the process was writing when it ended. A partial object can be most of a
+    /// disk.
+    fn sweep(&self) {
+        let partial = format!(".{}.new", self.pid);
+        for entry in self.paths.iter().filter_map(|it| std::fs::read_dir(it).ok()).flatten() {
+            if let Ok(entry) = entry
+                && entry.file_name().to_string_lossy().ends_with(&partial)
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    fn death(&self, ended: &Ended) -> String {
+        let pid = self.pid;
+        let log = self.log.path.display();
+        let Some(status) = ended.status else {
+            return format!("the daemon's worker (pid {pid}) ended unseen; its log is {log}");
+        };
         #[cfg(unix)]
         {
             use std::os::unix::process::ExitStatusExt as _;
@@ -427,28 +445,22 @@ impl Worker {
                 let mut reason =
                     format!("the daemon's worker (pid {pid}) was killed by signal {signal}");
                 if signal == 9 {
+                    let seen = *lock(&self.oom_kills);
                     reason.push_str(&sigkill(
-                        self.oom_kills.zip(probe::oom_kills()).map(|(a, b)| b.saturating_sub(a)),
+                        seen.zip(oom_kills()).map(|(a, b)| b.saturating_sub(a)),
                     ));
                 } else {
                     reason.push_str(&format!(" ({status})"));
                 }
-                reason.push_str(&peak_rss(*lock(&self.peak_rss)));
-                return format!("{reason}; its log is {}", self.log.display());
+                reason.push_str(&peak_rss(ended.peak_rss));
+                return format!("{reason}; its log is {log}");
             }
         }
+        let words = self.log.last_words();
         format!(
-            "the daemon's worker (pid {pid}) ended ({status}: {}); its log is {}",
-            self.last_words(),
-            self.log.display()
+            "the daemon's worker (pid {pid}) ended ({status}: {words}){}; its log is {log}",
+            peak_rss(ended.peak_rss)
         )
-    }
-
-    fn sample(&self) {
-        if let Some(rss) = probe::peak_rss(lock(&self.child).id()) {
-            let mut peak = lock(&self.peak_rss);
-            *peak = Some(peak.unwrap_or(0).max(rss));
-        }
     }
 
     /// Whether the process has ended, and how.
@@ -456,42 +468,47 @@ impl Worker {
         if let Some(reason) = lock(&self.lost).clone() {
             return Some(End { reason, refused: false });
         }
-        let status = lock(&self.child).try_wait();
-        match status {
-            Ok(None) => None,
-            Ok(Some(status)) => {
-                let reason = self.death(status);
-                let refused = status.code().is_some_and(|code| code != 0)
-                    && !disk_full(&reason)
-                    && !self.paths.iter().any(|path| no_space(path));
-                Some(End { reason, refused })
-            }
-            Err(error) => Some(End { reason: error.to_string(), refused: false }),
-        }
+        let ended = lock(&self.tree).ended().cloned()?;
+        let refused = ended
+            .status
+            .and_then(|it| it.code())
+            .is_some_and(|code| code != 0 && code != crate::OUTSIDE_THE_SOURCE);
+        Some(End { reason: self.death(&ended), refused })
     }
 
-    /// The last line the worker logged that says what went wrong.
-    fn last_words(&self) -> String {
-        let log = std::fs::read_to_string(&self.log).unwrap_or_default();
-        let lines: Vec<_> = log.lines().collect();
-        match lines.iter().rposition(|it| it.starts_with("Error") || it.contains("panicked")) {
-            Some(at) => lines[at..]
-                .iter()
-                .filter(|it| !it.trim().is_empty() && it.trim() != "Caused by:")
-                .map(|it| it.trim())
-                .collect::<Vec<_>>()
-                .join(": "),
-            None => lines.last().unwrap_or(&"no output").to_string(),
+    /// What the daemon looks at once in a while: whether a process that was asked something
+    /// does anything, and how many the kernel has killed while it is alive.
+    fn watch(&self, hung_after: Option<Duration>) {
+        if self.end().is_some() {
+            return;
+        }
+        *lock(&self.oom_kills) = oom_kills();
+        let asked = !lock(&self.requests).is_empty() || self.loads();
+        let mut progress = lock(&self.progress);
+        let (Some(limit), true, Some(cpu)) = (hung_after, asked, lock(&self.tree).cpu()) else {
+            *progress = None;
+            return;
+        };
+        match *progress {
+            Some((seen, since)) if seen == cpu => {
+                if since.elapsed() >= limit {
+                    *progress = None;
+                    drop(progress);
+                    let phase = if self.loads() { "loading" } else { "building" };
+                    self.lose(format!(
+                        "the daemon's worker (pid {}) hung: no CPU time for {}s while {phase}; its log is {}",
+                        self.pid,
+                        limit.as_secs(),
+                        self.log.path.display()
+                    ));
+                }
+            }
+            _ => *progress = Some((cpu, Instant::now())),
         }
     }
 
     fn stop(&self) {
-        let mut child = lock(&self.child);
-        probe::kill_descendants(child.id());
-        // One that has exited already has nothing to kill.
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = std::fs::remove_file(&self.socket);
+        lock(&self.tree).kill();
     }
 
     fn set(&self, key: &str, warmth: Warmth) {
@@ -538,7 +555,6 @@ impl Worker {
 
     /// A connection to the process, once it has loaded the workspace and listens.
     fn connected(&self) -> anyhow::Result<UnixStream> {
-        let mut progress = Progress::new(lock(&self.child).id());
         loop {
             if let Some(reason) = lock(&self.lost).clone() {
                 anyhow::bail!(reason);
@@ -552,22 +568,10 @@ impl Worker {
                         }
                         anyhow::bail!("the daemon could not load the workspace ({})", end.reason);
                     }
-                    self.check_hung(&mut progress, "loading")?;
                     std::thread::sleep(POLL);
                 }
             }
         }
-    }
-
-    fn check_hung(&self, progress: &mut Progress, phase: &str) -> anyhow::Result<()> {
-        if let Some(secs) = progress.hung() {
-            let pid = lock(&self.child).id();
-            anyhow::bail!(self.lose(format!(
-                "the daemon's worker (pid {pid}) hung: no CPU time for {secs}s while {phase}; its log is {}",
-                self.log.display()
-            )));
-        }
-        Ok(())
     }
 
     /// Asks the process for `plan` of `checkout`. The outer error is the worker's failing,
@@ -581,7 +585,6 @@ impl Worker {
         let began = Instant::now();
         lock(&self.requests).push(began);
         let _request = Outstanding { worker: self, began };
-        let mut progress = Progress::new(lock(&self.child).id());
         // A worker that hangs up is ending, and why is what the client is told.
         let failed = || {
             let asked = Instant::now();
@@ -589,10 +592,10 @@ impl Worker {
                 match self.end() {
                     Some(end) => return self.lose(end.reason),
                     None if asked.elapsed() > ENDING => {
-                        let pid = lock(&self.child).id();
                         return self.lose(format!(
-                            "the daemon's worker (pid {pid}) did not answer; its log is {}",
-                            self.log.display()
+                            "the daemon's worker (pid {}) did not answer; its log is {}",
+                            self.pid,
+                            self.log.path.display()
                         ));
                     }
                     None => std::thread::sleep(POLL),
@@ -600,18 +603,19 @@ impl Worker {
             }
         };
         let mut stream = self.connected()?;
-        stream.set_read_timeout(Some(POLL))?;
-        stream.set_write_timeout(Some(ENDING))?;
         let mut env = self.env.clone();
         for (name, value) in &checkout.env {
             env.set(name, value);
         }
+        stream.set_write_timeout(Some(ENDING))?;
         stream
             .write_all(checkout.sync_line(plan, verb).as_bytes())
             .map_err(|_| anyhow::anyhow!(failed()))?;
         stream
             .write_all(format!("{}\n", crate::process::encode(&env)).as_bytes())
             .map_err(|_| anyhow::anyhow!(failed()))?;
+        // The socket alone can't be trusted to say a worker is gone: its end may be open elsewhere.
+        stream.set_read_timeout(Some(POLL))?;
         let mut reply = Vec::new();
         let mut reader = BufReader::new(stream);
         loop {
@@ -631,14 +635,15 @@ impl Worker {
             if let Some(end) = self.end() {
                 anyhow::bail!(self.lose(end.reason));
             }
-            self.check_hung(&mut progress, "building")?;
         }
         let reply = String::from_utf8(reply)?;
         let reply = reply.trim_end();
-        if disk_full(reply)
-            || (!reply.starts_with("ok") && self.paths.iter().any(|path| no_space(path)))
-        {
-            anyhow::bail!(self.lose(reply.to_owned()));
+        if let Some(why) = reply.strip_prefix(crate::FATAL) {
+            anyhow::bail!(self.lose(format!(
+                "the daemon's worker (pid {}) failed: {why}; its log is {}",
+                self.pid,
+                self.log.path.display()
+            )));
         }
         match reply.strip_prefix("error: ") {
             _ if reply.is_empty() => Err(anyhow::anyhow!(failed())),
@@ -677,7 +682,6 @@ impl Worker {
     }
 
     fn status(&self) -> WorkerStatus {
-        self.sample();
         let state = self
             .end()
             .map(|end| {
@@ -696,9 +700,9 @@ impl Worker {
             });
         let checkouts = lock(&self.checkouts);
         WorkerStatus {
-            pid: lock(&self.child).id(),
+            pid: self.pid,
             project: self.project.clone(),
-            log: self.log.clone(),
+            log: self.log.path.clone(),
             state,
             checkouts: checkouts
                 .values()
@@ -712,26 +716,24 @@ impl Worker {
 /// loaded and its names resolved, which the first build of a workspace then does not wait
 /// for, and reads the build it is the worker of from its standard input.
 struct Spare {
-    child: Child,
-    log: PathBuf,
+    tree: Tree,
+    log: Log,
 }
 
 impl Spare {
     /// Starts one with its files in `dir`.
     fn start(dir: &Path) -> anyhow::Result<Spare> {
         private_dir(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let log = dir.join("log");
         let mut command = Command::new(std::env::current_exe()?);
         command.arg("--spare").arg(dir.join("package"));
         match store() {
             Some(store) => command.env("RUSTD_CACHE", store),
             None => command.env_remove("RUSTD_CACHE"),
         };
-        let output = private_file(OpenOptions::new().write(true).create(true).truncate(true), &log)
-            .with_context(|| format!("opening {}", log.display()))?;
-        command.stdin(Stdio::piped()).stdout(output.try_clone()?).stderr(output);
-        let child = command.spawn().context("starting a spare worker")?;
-        Ok(Spare { child, log })
+        let log = Log::of(&mut command, &dir.join("log"))?;
+        command.stdin(Stdio::piped());
+        let tree = Tree::spawn(&mut command).context("starting a spare worker")?;
+        Ok(Spare { tree, log })
     }
 
     /// Tells it to be the worker `args` start for `checkout`. `None` when it can't be
@@ -753,9 +755,9 @@ impl Spare {
             line.push('\n');
             Some(line)
         };
-        let sent = match (self.child.try_wait(), told()) {
-            (Ok(None), Some(line)) => {
-                self.child.stdin.as_mut().is_some_and(|it| it.write_all(line.as_bytes()).is_ok())
+        let sent = match (self.tree.ended().is_none(), told()) {
+            (true, Some(line)) => {
+                self.tree.input().is_some_and(|it| it.write_all(line.as_bytes()).is_ok())
             }
             _ => false,
         };
@@ -771,16 +773,14 @@ impl Spare {
     fn said(&mut self, line: String) {
         let Ok(mut line) = serde_json::to_string(&crate::Line::Said { said: line }) else { return };
         line.push('\n');
-        if let Some(input) = self.child.stdin.as_mut() {
+        if let Some(input) = self.tree.input() {
             let _ = input.write_all(line.as_bytes());
         }
     }
 
     fn stop(&mut self) {
-        // One that has exited already has nothing to kill.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if let Some(dir) = self.log.parent() {
+        self.tree.kill();
+        if let Some(dir) = self.log.path.parent() {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
@@ -799,6 +799,8 @@ struct Daemon {
     ahead: Mutex<FxHashMap<String, Spare>>,
     /// How many spare workers were started: each has a directory of its own.
     spares: AtomicUsize,
+    /// How long a worker asked something may use no CPU time.
+    hung_after: Option<Duration>,
     asked: Mutex<Instant>,
     /// The results of the tests of each program run, by its object: for which ones need
     /// not run again. They go with the daemon.
@@ -877,6 +879,10 @@ pub(crate) fn serve() -> anyhow::Result<()> {
         spare_error: Mutex::default(),
         ahead: Mutex::default(),
         spares: AtomicUsize::new(0),
+        hung_after: std::env::var("RUSTD_HUNG_SECS")
+            .map_or(Some(300), |it| it.parse().ok())
+            .filter(|it| *it != 0)
+            .map(Duration::from_secs),
         asked: Mutex::new(Instant::now()),
         results: Mutex::default(),
     });
@@ -967,10 +973,10 @@ impl Daemon {
                                 lock(&self.spare_error).as_deref().unwrap_or("not started")
                             )
                         },
-                        |it| format!("pid {}, log {}", it.child.id(), it.log.display()),
+                        |it| format!("pid {}, log {}", it.tree.id(), it.log.path.display()),
                     )];
                     lines.extend(lock(&self.ahead).iter().map(|(id, it)| {
-                        format!("ahead {id}: pid {}, log {}", it.child.id(), it.log.display())
+                        format!("ahead {id}: pid {}, log {}", it.tree.id(), it.log.path.display())
                     }));
                     lines
                 },
@@ -1094,7 +1100,7 @@ impl Daemon {
                 },
             )?,
         );
-        log!("worker {id} of pid {} for {}", lock(&worker.child).id(), worker.project.display());
+        log!("worker {id} of pid {} for {}", worker.pid, worker.project.display());
         workers.insert(id, worker.clone());
         std::thread::spawn(move || worker.warm(&checkout, true));
         Ok(())
@@ -1106,7 +1112,7 @@ impl Daemon {
         loop {
             std::thread::sleep(self.idle.map_or(TICK, |idle| idle.min(TICK)));
             for worker in lock(&self.workers).values() {
-                worker.sample();
+                worker.watch(self.hung_after);
                 if let Some(end) = worker.end() {
                     let refused = lock(&worker.checkouts)
                         .values()
@@ -1118,6 +1124,13 @@ impl Daemon {
                     let _ = std::fs::remove_file(&worker.socket);
                 }
             }
+            lock(&self.ahead).retain(|_, spare| {
+                let alive = spare.tree.ended().is_none();
+                if !alive {
+                    spare.stop();
+                }
+                alive
+            });
             // The next spare starts when the worker that was one has loaded its workspace.
             let loading = lock(&self.workers).values().any(|it| it.loading());
             if !loading && lock(&self.ahead).is_empty() {
@@ -1167,7 +1180,7 @@ impl Daemon {
             return;
         }
         let mut spare = lock(&self.spare);
-        if spare.as_mut().is_some_and(|it| matches!(it.child.try_wait(), Ok(None))) {
+        if spare.as_mut().is_some_and(|it| it.tree.ended().is_none()) {
             return;
         }
         if let Some(mut old) = spare.take() {
@@ -1226,132 +1239,22 @@ impl Drop for Outstanding<'_> {
     }
 }
 
-struct Progress {
-    pid: u32,
-    cpu: Option<u64>,
-    changed: Instant,
-    sampled: Instant,
-    limit: u64,
+/// The kernel's system-wide count, which goes up for any process.
+fn oom_kills() -> Option<u64> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    std::fs::read_to_string("/proc/vmstat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("oom_kill ")?.parse().ok())
 }
 
-impl Progress {
-    fn new(pid: u32) -> Self {
-        Self {
-            pid,
-            cpu: probe::cpu_tree(pid).map(|tree| tree.iter().map(|(_, ticks)| ticks).sum()),
-            changed: Instant::now(),
-            sampled: Instant::now(),
-            limit: std::env::var("RUSTD_HUNG_SECS")
-                .ok()
-                .and_then(|it| it.parse().ok())
-                .unwrap_or(300),
-        }
-    }
-
-    fn hung(&mut self) -> Option<u64> {
-        if self.limit == 0 || self.sampled.elapsed() < Duration::from_millis(200) {
-            return None;
-        }
-        self.sampled = Instant::now();
-        let cpu = probe::cpu_tree(self.pid).map(|tree| tree.iter().map(|(_, ticks)| ticks).sum());
-        if cpu.is_none() || cpu != self.cpu {
-            self.cpu = cpu;
-            self.changed = Instant::now();
-        }
-        (cpu.is_some() && self.changed.elapsed().as_secs() >= self.limit).then_some(self.limit)
-    }
-}
-
-#[cfg(target_os = "linux")]
-mod probe {
-    /// CPU ticks of the process and its descendants, including time of reaped children.
-    pub(super) fn cpu_tree(pid: u32) -> Option<Vec<(u32, u64)>> {
-        let mut all = Vec::new();
-        for entry in std::fs::read_dir("/proc").ok()?.flatten() {
-            let Some(pid) = entry.file_name().to_str().and_then(|it| it.parse::<u32>().ok()) else {
-                continue;
-            };
-            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else { continue };
-            let Some((_, fields)) = stat.rsplit_once(')') else { continue };
-            let fields: Vec<_> = fields.split_whitespace().collect();
-            let parse = |at: usize| fields.get(at)?.parse::<u64>().ok();
-            if let Some((parent, cpu)) = parse(1).zip(
-                parse(11)
-                    .zip(parse(12))
-                    .zip(parse(13).zip(parse(14)))
-                    .map(|((a, b), (c, d))| a + b + c + d),
-            ) {
-                all.push((pid, parent as u32, cpu));
-            }
-        }
-        let root = all.iter().find(|(id, _, _)| *id == pid)?;
-        let mut tree = vec![(pid, root.2)];
-        let mut at = 0;
-        while at < tree.len() {
-            let parent = tree[at].0;
-            tree.extend(
-                all.iter().filter(|(_, ppid, _)| *ppid == parent).map(|(pid, _, cpu)| (*pid, *cpu)),
-            );
-            at += 1;
-        }
-        Some(tree)
-    }
-
-    /// Peak resident bytes reported for a live process.
-    pub(super) fn peak_rss(pid: u32) -> Option<u64> {
-        std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?.lines().find_map(|line| {
-            let kb = line.strip_prefix("VmHWM:")?.split_whitespace().next()?.parse::<u64>().ok()?;
-            Some(kb * 1024)
-        })
-    }
-
-    /// The kernel's system-wide count, not a count specific to this worker.
-    pub(super) fn oom_kills() -> Option<u64> {
-        std::fs::read_to_string("/proc/vmstat")
-            .ok()?
-            .lines()
-            .find_map(|line| line.strip_prefix("oom_kill ")?.parse().ok())
-    }
-
-    /// Stops linkers and other descendants before their worker is reaped.
-    pub(super) fn kill_descendants(pid: u32) {
-        for (child, _) in cpu_tree(pid).unwrap_or_default().into_iter().rev() {
-            if child != pid {
-                // SAFETY: killing a descendant does not access memory in this process.
-                unsafe {
-                    libc::kill(child as i32, libc::SIGKILL);
-                }
-            }
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-mod probe {
-    pub(super) fn cpu_tree(_pid: u32) -> Option<Vec<(u32, u64)>> {
-        None
-    }
-
-    pub(super) fn peak_rss(_pid: u32) -> Option<u64> {
-        None
-    }
-
-    pub(super) fn oom_kills() -> Option<u64> {
-        None
-    }
-
-    pub(super) fn kill_descendants(_pid: u32) {}
-}
-
+/// What is known of a SIGKILL from how many the kernel killed since the process was last alive.
 fn sigkill(kills: Option<u64>) -> String {
     match kills {
-        Some(0) => {
-            " (SIGKILL), not by the kernel's OOM killer (it counted none since the worker started)"
-                .to_owned()
-        }
-        Some(kills) => format!(
-            " (SIGKILL): out of memory, the kernel's OOM killer killed {kills} process(es) since the worker started"
-        ),
+        Some(0) => " (SIGKILL), not by the kernel's OOM killer".to_owned(),
+        Some(_) => " (SIGKILL): out of memory, the kernel's OOM killer acted as it died".to_owned(),
         None => " (SIGKILL), likely out of memory".to_owned(),
     }
 }
@@ -1364,10 +1267,6 @@ fn peak_rss(rss: Option<u64>) -> String {
         }
         Some(rss) => format!("; peak RSS {:.1} GB", rss as f64 / 1_000_000_000.0),
     }
-}
-
-fn disk_full(reason: &str) -> bool {
-    reason.contains("No space left on device") || reason.contains("os error 28")
 }
 
 fn no_space(path: &Path) -> bool {
@@ -1388,7 +1287,7 @@ fn no_space(path: &Path) -> bool {
 
 /// The lock, also after a thread panicked with it: what it guards is whole between any two
 /// statements here.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -1397,70 +1296,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn disk_failure_is_not_a_source_error() {
-        assert!(disk_full("writing /target/app.o: No space left on device (os error 28)"));
-        assert!(!disk_full("the disk is full at /target"));
-        assert!(!disk_full("unresolved name"));
-        assert!(!disk_full(""));
-        assert!(!no_space(Path::new("/does-not-exist/rustd")));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn cpu_tree_includes_children_and_missing_processes_are_unknown() {
-        let mut child =
-            toolchain::command("sleep", "/", &FxHashMap::default()).arg("10").spawn().unwrap();
-        let tree = probe::cpu_tree(std::process::id()).unwrap();
-        assert!(tree.iter().any(|(pid, _)| *pid == child.id()));
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert!(probe::cpu_tree(child.id()).is_none());
-        assert!(probe::cpu_tree(u32::MAX).is_none());
-        assert!(probe::oom_kills().is_some());
-    }
-
-    #[test]
-    fn hang_detection_can_be_disabled_or_have_no_sample() {
-        let mut progress = Progress {
-            pid: u32::MAX,
-            cpu: None,
-            changed: Instant::now() - Duration::from_secs(10),
-            sampled: Instant::now() - Duration::from_secs(10),
-            limit: 0,
-        };
-        assert_eq!(progress.hung(), None);
-        progress.limit = 1;
-        assert_eq!(progress.hung(), None);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn sleeping_process_without_cpu_is_hung() {
-        let mut child =
-            toolchain::command("sleep", "/", &FxHashMap::default()).arg("10").spawn().unwrap();
-        let mut progress = Progress::new(child.id());
-        progress.limit = 1;
-        std::thread::sleep(Duration::from_millis(50));
-        progress.cpu =
-            probe::cpu_tree(child.id()).map(|tree| tree.iter().map(|(_, ticks)| ticks).sum());
-        progress.changed = Instant::now() - Duration::from_secs(2);
-        progress.sampled = Instant::now() - Duration::from_secs(2);
-        let hung = progress.hung();
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert_eq!(hung, Some(1));
-    }
-
-    #[test]
-    fn sigkill_reports_what_the_kernel_counted() {
+    fn a_kill_is_out_of_memory_only_when_the_kernel_counted_one() {
         assert_eq!(sigkill(None), " (SIGKILL), likely out of memory");
-        assert_eq!(
-            sigkill(Some(0)),
-            " (SIGKILL), not by the kernel's OOM killer (it counted none since the worker started)"
-        );
+        assert_eq!(sigkill(Some(0)), " (SIGKILL), not by the kernel's OOM killer");
         assert_eq!(
             sigkill(Some(2)),
-            " (SIGKILL): out of memory, the kernel's OOM killer killed 2 process(es) since the worker started"
+            " (SIGKILL): out of memory, the kernel's OOM killer acted as it died"
         );
     }
 

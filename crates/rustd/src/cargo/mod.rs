@@ -18,6 +18,7 @@ mod state;
 
 pub(crate) use state::running;
 mod switch;
+mod tree;
 mod units;
 
 use std::{collections::BTreeMap, path::Path, process::Command, time::Instant};

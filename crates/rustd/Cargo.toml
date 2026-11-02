@@ -75,7 +75,7 @@ libc.workspace = true
 [target.'cfg(windows)'.dependencies]
 find-msvc-tools = "0.1"
 uds_windows = "1"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_System_SystemServices", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_System_JobObjects", "Win32_System_SystemServices", "Win32_System_Threading"] }
 
 [features]
 # Allocate with jemalloc, which can profile the heap: see `memory.rs`.
