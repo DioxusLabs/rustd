@@ -206,13 +206,35 @@ enum Left {
 /// them. Rustc sees none of it: the daemon builds what rust-analyzer passes, which has no
 /// borrow checker and few of rustc's lints.
 fn by_daemon(mut state: State) -> Result<State, Left> {
+    let start = std::time::Instant::now();
     let changed = state.refusal.clone().or_else(|| state.broken_guard());
-    if let Some(reason) = changed.or_else(|| state.stale_cargos()) {
+    let changed = changed.or_else(|| state.stale_cargos());
+    if std::env::var_os("RUSTD_STATS").is_some() {
+        eprintln!("client fingerprints: {:.1?}", start.elapsed());
+    }
+    if let Some(reason) = changed {
         return Err(Left::Again(Box::new(state), reason));
     }
-    let answers =
-        state.checkouts.iter().map(built).collect::<Result<Vec<_>, _>>().map_err(Left::Failed)?;
+    let start = std::time::Instant::now();
+    let answers = std::thread::scope(|scope| {
+        let requests: Vec<_> =
+            state.checkouts.iter().map(|checkout| scope.spawn(|| built(checkout))).collect();
+        requests
+            .into_iter()
+            .map(|request| {
+                request.join().unwrap_or_else(|_| Err("a daemon request panicked".to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .map_err(Left::Failed)?;
+    if std::env::var_os("RUSTD_STATS").is_some() {
+        eprintln!("client daemon: {:.1?} ({} checkouts)", start.elapsed(), state.checkouts.len());
+    }
+    let start = std::time::Instant::now();
     let cargos = state.settle(&answers).map_err(Left::Failed)?;
+    if std::env::var_os("RUSTD_STATS").is_some() {
+        eprintln!("client settle: {:.1?}", start.elapsed());
+    }
     if let Some((_, why)) = cargos.first() {
         return Err(Left::Failed(why.clone()));
     }

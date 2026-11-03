@@ -387,14 +387,14 @@ impl Compiler {
         // those are shows in what a build leaves undefined.
         known.patching = true;
         let unit = loop {
-            let roots =
-                Roots {
-                    entries: &entries,
-                    on_demand: &on_demand,
-                    start: None,
-                    reports: &[],
-                    kept: &[],
-                };
+            let roots = Roots {
+                sharing: Default::default(),
+                entries: &entries,
+                on_demand: &on_demand,
+                start: None,
+                reports: &[],
+                kept: &[],
+            };
             let unit = hir::attach_db(db, || {
                 CodegenUnit::compile(db, resolver, roots, &Default::default(), known)
             })

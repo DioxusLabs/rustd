@@ -20,6 +20,8 @@ use rustc_type_ir::{
     UintTy,
     inherent::{BoundExistentialPredicates as _, GenericArgs as _, IntoKind},
 };
+use sha2::{Digest, Sha256};
+use std::sync::{Arc, Mutex, Weak};
 
 use super::super::vtable::{HEADER, VtableLayout};
 use super::{Aggregate, DebugType, Field, Tag, TypeIndex, TypeList, TypeSet, Variant};
@@ -33,7 +35,6 @@ use crate::{
     layout::CoroutineFrame,
     layout::struct_tail_erasing_lifetimes,
     layout::{Layout, RustcFieldIdx},
-    mir::is_by_move_coroutine,
     mir::type_name::rustc_debug_name,
     next_solver::{
         DbInterner, GenericArgs, Ty, TyKind, TypingMode,
@@ -55,10 +56,31 @@ mod encoding {
 /// unless it is told of anyway: a list is as long as it likes.
 const POINTERS: u32 = 2;
 
+#[derive(Default)]
+pub(in super::super) struct Descriptions(Mutex<FxHashMap<[u8; 32], Weak<[DebugType]>>>);
+
+impl Descriptions {
+    fn intern(&self, types: Vec<DebugType>) -> Arc<[DebugType]> {
+        let Ok(bytes) = postcard::to_allocvec(&types) else { return types.into() };
+        let key = Sha256::digest(bytes).into();
+        let mut known = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(shared) = known.get(&key).and_then(Weak::upgrade)
+            && shared.as_ref() == types.as_slice()
+        {
+            return shared;
+        }
+        let shared: Arc<[DebugType]> = types.into();
+        known.insert(key, Arc::downgrade(&shared));
+        shared
+    }
+}
+
 /// The types of the variables of the functions of one environment. What a variable's type
 /// is told as depends on nothing but the type, so it is found once for every function with
 /// a variable of it: the layouts and the names are most of what telling of variables costs.
 pub(in super::super) struct Types<'db> {
+    sharing: super::super::Sharing,
+    descriptions: Arc<Descriptions>,
     db: &'db dyn HirDatabase,
     env: ParamEnvAndCrate<'db>,
     interner: DbInterner<'db>,
@@ -75,11 +97,61 @@ pub(in super::super) struct Types<'db> {
     normalized: FxHashMap<Ty<'db>, Ty<'db>>,
 }
 
+/// For each place an `async` body yields, what it keeps there that a debugger is told of: the
+/// name, the field of the state it is in and the type. Every thread of every program asks this
+/// of each future it describes, and finding what is held takes a pass over the whole body.
+#[salsa::tracked(returns(ref))]
+fn kept_names<'db>(
+    db: &'db dyn HirDatabase,
+    instance: super::super::Instance,
+    env: crate::traits::StoredParamEnvAndCrate,
+    sharing: super::super::Sharing,
+) -> Option<Vec<Vec<(String, usize, crate::next_solver::StoredTy)>>> {
+    let def = instance.def;
+    let body = super::super::program_instance_body(db, &instance, env.clone(), &sharing).ok()?;
+    let env = env.as_ref(db);
+    let infcx = DbInterner::new_with(db, env.krate).infer_ctxt().build(TypingMode::PostAnalysis);
+    let held = body.locals_held_across_yields(&infcx, env.param_env);
+    let (super::super::InstanceDef::Coroutine(id) | super::super::InstanceDef::CoroutineByMove(id)) =
+        def
+    else {
+        return None;
+    };
+    let closure = salsa::plumbing::FromId::from_id(id);
+    let closure: crate::db::InternedCoroutineId<'db> = closure;
+    let closure = closure.loc(db);
+    let store = ExpressionStore::of(db, closure.owner.expression_store_owner(db));
+    let bindings = body.local_to_binding_map();
+    let point = |point: &crate::mir::YieldPoint| {
+        let awaited = body.awaited(point);
+        let kept = point.kept.iter().enumerate().filter_map(|(field, &local)| {
+            let local = held.locals[local];
+            // A value the body keeps without a name for it is not told of, but for the
+            // future it waits for there, which rustc has a name for.
+            let name = match bindings.get(local) {
+                Some(&binding) => store[binding].name.as_str().to_owned(),
+                None if awaited == Some(local) => "__awaitee".to_owned(),
+                None => return None,
+            };
+            Some((name, field, body.locals[local].ty.clone()))
+        });
+        kept.collect()
+    };
+    Some(held.yields.iter().map(point).collect())
+}
+
 impl<'db> Types<'db> {
-    pub(in super::super) fn new(db: &'db dyn HirDatabase, env: ParamEnvAndCrate<'db>) -> Self {
+    pub(in super::super) fn new(
+        db: &'db dyn HirDatabase,
+        env: ParamEnvAndCrate<'db>,
+        descriptions: Arc<Descriptions>,
+        sharing: super::super::Sharing,
+    ) -> Self {
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
         Types {
+            sharing,
+            descriptions,
             db,
             env,
             interner,
@@ -115,7 +187,7 @@ impl<'db> Types<'db> {
         self.roots.push(root);
         let described = self.ty(root.0, pointers).map(|_| {
             TypeSet::new(TypeList {
-                types: std::mem::take(&mut self.told),
+                types: self.descriptions.intern(std::mem::take(&mut self.told)),
                 links: std::mem::take(&mut self.links),
             })
         });
@@ -138,7 +210,13 @@ impl<'db> Types<'db> {
         let mut layout = None;
         let link = match ty.kind() {
             TyKind::Adt(..) => {
-                let found = self.db.layout_of_ty(ty.store(), self.env.store()).ok()?;
+                let found = super::super::remap::layout(
+                    self.db,
+                    ty.store(),
+                    self.env.store(),
+                    self.sharing.clone(),
+                )
+                .ok()?;
                 let link = !self.is_pointer(ty, found.size.bytes());
                 layout = Some(found);
                 link
@@ -165,7 +243,13 @@ impl<'db> Types<'db> {
         }
         let layout = match layout {
             Some(layout) => layout,
-            None => self.db.layout_of_ty(ty.store(), self.env.store()).ok()?,
+            None => super::super::remap::layout(
+                self.db,
+                ty.store(),
+                self.env.store(),
+                self.sharing.clone(),
+            )
+            .ok()?,
         };
         let name = self.name(ty)?;
         // A type that is made of itself finds its place here. What stands there until the
@@ -494,7 +578,13 @@ impl<'db> Types<'db> {
         fields
     }
 
-    fn capture_names(&self, closure: InternedClosure<'db>) -> Option<Vec<String>> {
+    fn capture_names(&self, mut closure: InternedClosure<'db>) -> Option<Vec<String>> {
+        if let crate::InferBodyId::DefWithBodyId(hir_def::DefWithBodyId::FunctionId(func)) =
+            closure.owner
+            && let Some(source) = self.sharing.analysis_source(self.db, func)
+        {
+            closure.owner = source.into();
+        }
         let store = ExpressionStore::of(self.db, closure.owner.expression_store_owner(self.db));
         let infer = InferenceResult::of(self.db, closure.owner);
         let captured = infer.closures_data.get(&closure.expr)?.min_captures.values().flatten();
@@ -555,44 +645,27 @@ impl<'db> Types<'db> {
         let captured =
             self.captures(id.0.loc(self.db), args.tupled_upvars_ty(), offset_of, pointers);
         let parent_args = GenericArgs::new_from_slice(args.parent_args());
-        let body = match is_by_move_coroutine(self.db, id.0, args) {
-            true => self.db.monomorphized_mir_body_for_coroutine_by_move(
-                id.0,
-                parent_args.store(),
-                self.env.store(),
-            ),
-            false => self.db.monomorphized_mir_body_for_coroutine(
-                id.0,
-                parent_args.store(),
-                self.env.store(),
-            ),
-        }
-        .ok()?;
-        let held = body.locals_held_across_yields(&self.infcx, self.env.param_env);
-        let closure = id.0.loc(self.db);
-        let store = ExpressionStore::of(self.db, closure.owner.expression_store_owner(self.db));
-        let bindings = body.local_to_binding_map();
+        use salsa::plumbing::AsId;
+        let def = if self.sharing.coroutine_is_by_move(self.db, id.0, args) {
+            super::super::InstanceDef::CoroutineByMove(id.0.as_id())
+        } else {
+            super::super::InstanceDef::Coroutine(id.0.as_id())
+        };
+        let instance = super::super::Instance { def, args: parent_args.store(), checked: false };
+        let frame =
+            kept_names(self.db, instance, self.env.store(), self.sharing.clone()).as_ref()?;
         let mut told = Vec::new();
         for (state, name) in ["Unresumed", "Returned", "Panicked"].into_iter().enumerate() {
             let fields = captured.clone();
             told.push(Variant { name: name.to_owned(), tag: Some(state as u64), fields });
         }
         let waiting = variants.iter().skip(CoroutineFrame::SUSPENDED);
-        for (nth, (point, kept)) in held.yields.iter().zip(waiting).enumerate() {
+        for (nth, (point, kept)) in frame.iter().zip(waiting).enumerate() {
             let mut fields = Vec::new();
-            let awaited = body.awaited(point);
-            for (field, &local) in point.kept.iter().enumerate() {
-                let local = held.locals[local];
-                // A value the body keeps without a name for it is not told of, but for the
-                // future it waits for there, which rustc has a name for.
-                let name = match bindings.get(local) {
-                    Some(&binding) => store[binding].name.as_str(),
-                    None if awaited == Some(local) => "__awaitee",
-                    None => continue,
-                };
-                let offset = kept.field_offsets[RustcFieldIdx::new(field)].bytes();
-                if let Some(ty) = self.ty(body.locals[local].ty.as_ref(), pointers) {
-                    fields.push(Field { name: name.to_owned(), offset, ty });
+            for (name, field, ty) in point {
+                let offset = kept.field_offsets[RustcFieldIdx::new(*field)].bytes();
+                if let Some(ty) = self.ty(ty.as_ref(), pointers) {
+                    fields.push(Field { name: name.clone(), offset, ty });
                 }
             }
             fields.extend(captured.iter().cloned());
@@ -638,5 +711,75 @@ impl Aggregate {
     /// A type nothing is told of but its name and its size.
     fn opaque(name: String, size: u64) -> Aggregate {
         Aggregate { name, size, fields: Vec::new(), parameters: Vec::new() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn description(name: &str) -> Vec<DebugType> {
+        vec![DebugType::Base { name: name.to_owned(), size: 4, encoding: 7 }]
+    }
+
+    #[test]
+    fn equal_descriptions_share_without_merging_sets() {
+        let descriptions = Descriptions::default();
+        let first = TypeSet::new(TypeList {
+            types: descriptions.intern(description("Shared")),
+            links: Vec::new(),
+        });
+        let mut types = description("Shared");
+        types.reserve(100);
+        let second = TypeSet::new(TypeList {
+            types: descriptions.intern(types),
+            links: vec![first.clone()],
+        });
+        assert!(Arc::ptr_eq(&first.types, &second.types));
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(&second.links[0], &first));
+    }
+
+    #[test]
+    fn empty_descriptions_share() {
+        let descriptions = Descriptions::default();
+        let first = descriptions.intern(Vec::new());
+        let second = descriptions.intern(Vec::new());
+        assert!(first.is_empty());
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn descriptions_do_not_keep_payloads_alive() {
+        let descriptions = Descriptions::default();
+        let first = descriptions.intern(description("Shared"));
+        let weak = Arc::downgrade(&first);
+        assert_eq!(Arc::strong_count(&first), 1);
+        drop(first);
+        assert!(weak.upgrade().is_none());
+        let second = descriptions.intern(description("Shared"));
+        assert_eq!(second.as_ref(), description("Shared"));
+        assert_eq!(descriptions.0.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn matching_hash_still_checks_content() {
+        let descriptions = Descriptions::default();
+        let first = descriptions.intern(description("First"));
+        let other = description("Other");
+        let key = Sha256::digest(postcard::to_allocvec(&other).unwrap()).into();
+        descriptions.0.lock().unwrap().insert(key, Arc::downgrade(&first));
+        let second = descriptions.intern(other.clone());
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(second.as_ref(), other);
+    }
+
+    #[test]
+    fn descriptions_share_across_threads() {
+        let descriptions = Arc::new(Descriptions::default());
+        let first = descriptions.intern(description("Shared"));
+        let second =
+            std::thread::spawn(move || descriptions.intern(description("Shared"))).join().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
     }
 }

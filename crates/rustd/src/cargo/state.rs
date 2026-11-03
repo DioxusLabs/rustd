@@ -332,7 +332,6 @@ impl Staged {
             let config = WorkerConfig {
                 repository: repository(&root),
                 project: project.strip_prefix(&root).unwrap_or(Path::new("")).to_owned(),
-                cfg_test: false,
                 selection: asked.selection(),
                 env: worker_env(),
             };
@@ -639,10 +638,9 @@ impl State {
                 BTreeMap::new()
             }
         };
-        let config = |unit_test: bool| WorkerConfig {
+        let config = WorkerConfig {
             repository: repository(&root),
             project: project.strip_prefix(&root).unwrap_or(Path::new("")).to_owned(),
-            cfg_test: unit_test,
             selection: asked.selection(),
             env: worker_env(),
         };
@@ -651,7 +649,8 @@ impl State {
             key: format!("{key}{}", if unit_test { "-unit" } else { "" }),
             generation: 0,
             built_at: built.started,
-            config: config(unit_test),
+            config: config.clone(),
+            unit_test,
             root: root.clone(),
             programs: Vec::new(),
             sources: Vec::new(),

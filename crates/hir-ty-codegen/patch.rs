@@ -13,7 +13,7 @@ use std::{
 use base_db::{Crate, FileId};
 use cranelift_module::{Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
-use hir_def::{FunctionId, HasModule, StaticId};
+use hir_def::{DefWithBodyId, FunctionId, HasModule, StaticId};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 type FxIndexMap<K, V> = indexmap::IndexMap<K, V, FxBuildHasher>;
@@ -26,8 +26,9 @@ use super::{
     compiled_static, declaration_location,
     fragment::{CompiledFunction, DataRequest, FuncTarget, Requests},
     home::{body_file, body_files},
-    instance_serial, is_thread_local, left_to_rustc, root_serial, row_location, source_location,
-    static_serial, target,
+    instance_serial, is_thread_local, left_to_rustc, program_instance, program_instance_serial,
+    program_root, program_root_serial, root_serial, row_location, source_location, static_serial,
+    target,
 };
 
 /// What a compiled function or static was when the base took it in.
@@ -232,7 +233,7 @@ impl Left {
         let code = compiled_root(db, root).as_ref().ok();
         Left {
             code: code.map(|it| Mark::new(db, root_serial(db, root), &it.requests)),
-            async_blocks: async_blocks(db, root).clone(),
+            async_blocks: async_blocks(db, root, super::Sharing::default()).clone(),
         }
     }
 }
@@ -301,14 +302,16 @@ impl Frozen {
 /// The last object built in full, as far as patching it goes.
 #[derive(Clone)]
 pub(super) struct Base {
+    sharing: super::Sharing,
+    decisions: Vec<u128>,
     /// Whether the object says which lines its code is of, as a patch of it then does.
     debug: bool,
     entries: Vec<FunctionId>,
     pub(super) compiled: Vec<(FunctionId, String)>,
     marks: Vec<Mark>,
+    reports: FxHashMap<FunctionId, Mark>,
     /// The crate of each of `compiled`, and the file it is written in.
     crates: Vec<Crate>,
-    files: Vec<FileId>,
     touched: Touched,
     pub(super) skipped: Vec<(FunctionId, CodegenError)>,
     /// For each of `skipped` that rustc has a copy of.
@@ -340,15 +343,21 @@ struct Homes {
     root: FxHashMap<FunctionId, u32>,
     roots_of_crate: FxHashMap<Crate, Vec<u32>>,
     roots_of_file: FxHashMap<FileId, Vec<u32>>,
+    roots_of_function: FxHashMap<FunctionId, Vec<u32>>,
+    roots_of_other_body: FxHashMap<FileId, Vec<u32>>,
     instances_of_crate: FxHashMap<Crate, Vec<u32>>,
     instances_of_file: FxHashMap<FileId, Vec<u32>>,
+    instances_of_function: FxHashMap<FunctionId, Vec<u32>>,
+    instances_of_other_body: FxHashMap<FileId, Vec<u32>>,
     /// The instances that the bodies of any file may be part of.
     instances_of_any_file: Vec<u32>,
 }
 
 impl Homes {
     fn new(
+        db: &dyn HirDatabase,
         compiled: &[(FunctionId, String)],
+        bodies: &[Vec<DefWithBodyId>],
         crates: &[Crate],
         files: &[FileId],
         instances: &FxIndexMap<Instance, BaseInstance>,
@@ -358,13 +367,42 @@ impl Homes {
             homes.root.insert(root, i as u32);
             homes.roots_of_crate.entry(crates[i]).or_default().push(i as u32);
             homes.roots_of_file.entry(files[i]).or_default().push(i as u32);
+            for &body in &bodies[i] {
+                match body {
+                    DefWithBodyId::FunctionId(func) => {
+                        homes.roots_of_function.entry(func).or_default().push(i as u32)
+                    }
+                    _ => homes
+                        .roots_of_other_body
+                        .entry(body_file(db, body))
+                        .or_default()
+                        .push(i as u32),
+                }
+            }
         }
-        for (i, was) in instances.values().enumerate() {
+        for (i, (instance, was)) in instances.iter().enumerate() {
             homes.instances_of_crate.entry(was.env.krate).or_default().push(i as u32);
             match &was.files {
                 Some(files) => {
                     for &file in files {
                         homes.instances_of_file.entry(file).or_default().push(i as u32);
+                    }
+                }
+                None => homes.instances_of_any_file.push(i as u32),
+            }
+            match super::home::body_owners(db, instance) {
+                Some(bodies) => {
+                    for body in bodies {
+                        match body {
+                            DefWithBodyId::FunctionId(func) => {
+                                homes.instances_of_function.entry(func).or_default().push(i as u32)
+                            }
+                            _ => homes
+                                .instances_of_other_body
+                                .entry(body_file(db, body))
+                                .or_default()
+                                .push(i as u32),
+                        }
                     }
                 }
                 None => homes.instances_of_any_file.push(i as u32),
@@ -392,6 +430,8 @@ struct Touched {
     crates: FxHashSet<Crate>,
     /// The files that changed in the bodies of functions alone.
     bodies: FxHashSet<FileId>,
+    wide_bodies: FxHashSet<FileId>,
+    functions: FxHashSet<FunctionId>,
     /// A file changed that we can't tell the crates of.
     any: bool,
     /// What the last look found changed.
@@ -441,6 +481,7 @@ impl Touched {
 pub struct Stale {
     roots: Vec<FunctionId>,
     instances: Vec<Instance>,
+    reach_changed: FxHashSet<Node>,
     /// The statics with another value, which a patch defines again under their name.
     statics: Vec<StaticId>,
     /// What a patch can't replace, and why. That only matters for what the program still
@@ -456,6 +497,8 @@ pub struct Stale {
 /// How long looking at each kind of thing in the base took, in the order they are looked at.
 #[derive(Default, Clone, Copy)]
 pub struct StaleSteps {
+    pub policy: std::time::Duration,
+    pub rejected: std::time::Duration,
     pub roots: std::time::Duration,
     pub instances: std::time::Duration,
     pub statics: std::time::Duration,
@@ -463,6 +506,7 @@ pub struct StaleSteps {
     pub left: std::time::Duration,
     /// How many roots and instances an edit could have changed, and so were asked about.
     pub roots_asked: usize,
+    pub rejected_asked: usize,
     pub instances_asked: usize,
     /// The longest any one of them took to answer.
     pub slowest: std::time::Duration,
@@ -487,6 +531,8 @@ pub(super) struct Patch {
     pub(super) object: Vec<u8>,
     pub(super) bodies: usize,
     pub(super) phases: Phases,
+    pub(super) sharing: super::SharingStats,
+    pub(super) reach_changed: Option<FxHashSet<Node>>,
 }
 
 /// An object that defines nothing.
@@ -510,20 +556,43 @@ impl Base {
         db: &dyn HirDatabase,
         cg: &ObjectCodegen<'_, '_>,
         entries: &[FunctionId],
+        reports: &[FunctionId],
         compiled: &[(FunctionId, String)],
         skipped: &[(FunctionId, CodegenError)],
     ) -> Option<Base> {
+        let sharing = &cg.sharing;
         let decls = cg.module.declarations();
         let debug = cg.debug.is_some();
         let root_mark = |db: &dyn HirDatabase, root| {
-            let compiled = compiled_root(db, root).as_ref().ok()?;
-            Some(Mark::of_function(db, root_serial(db, root), compiled, debug))
+            let compiled = program_root(db, root, sharing).as_ref().ok()?;
+            let mut bodies = vec![root.into()];
+            if let Some((owner, _)) = &compiled.source {
+                bodies.push(*owner);
+            }
+            for data in &compiled.requests.datas {
+                match data {
+                    DataRequest::Location(Some((owner, _))) => bodies.push(*owner),
+                    DataRequest::Declaration(func) => bodies.push((*func).into()),
+                    _ => {}
+                }
+            }
+            Some((
+                Mark::of_function(
+                    db,
+                    program_root_serial(db, root, sharing.clone()),
+                    compiled,
+                    debug,
+                ),
+                bodies,
+            ))
         };
         let instance_mark =
             |db: &dyn HirDatabase, (instance, env): &(Instance, StoredParamEnvAndCrate)| {
-                let compiled = compiled_instance(db, instance.clone(), env.clone()).as_ref().ok();
+                let compiled =
+                    program_instance(db, instance.clone(), env.clone(), sharing).as_ref().ok();
                 let mark = compiled.map(|it| {
-                    let serial = instance_serial(db, instance.clone(), env.clone());
+                    let serial =
+                        program_instance_serial(db, instance.clone(), env.clone(), sharing.clone());
                     Mark::of_function(db, serial, it, debug)
                 });
                 (mark, body_files(db, instance))
@@ -542,6 +611,7 @@ impl Base {
             .zip(root_marks)
             .map(|(&(root, _), mark)| mark.into_inner().unwrap_or_else(|| root_mark(db, root)))
             .collect::<Option<Vec<_>>>()?;
+        let (marks, root_bodies): (Vec<_>, Vec<_>) = marks.into_iter().unzip();
         let mut instances = envs
             .iter()
             .zip(instance_marks)
@@ -593,10 +663,11 @@ impl Base {
             }
         };
         for &(root, _) in compiled {
-            note(Node::Root(root), &compiled_root(db, root).as_ref().ok()?.requests);
+            note(Node::Root(root), &program_root(db, root, sharing).as_ref().ok()?.requests);
         }
         for (instance, known) in &instances {
-            if let Ok(compiled) = compiled_instance(db, instance.clone(), known.env.clone()) {
+            if let Ok(compiled) = program_instance(db, instance.clone(), known.env.clone(), sharing)
+            {
                 note(Node::Instance(instance.clone()), &compiled.requests);
             }
         }
@@ -622,7 +693,7 @@ impl Base {
             .rejected
             .iter()
             .filter(|(instance, it)| {
-                compiled_instance(db, (*instance).clone(), it.env.clone()).is_err()
+                program_instance(db, (*instance).clone(), it.env.clone(), sharing).is_err()
             })
             .map(|(instance, it)| (instance.clone(), it.env.clone()))
             .collect();
@@ -630,14 +701,22 @@ impl Base {
         let files: Vec<FileId> =
             compiled.iter().map(|&(root, _)| body_file(db, root.into())).collect();
         Some(Base {
+            sharing: sharing.clone(),
+            decisions: sharing.decisions(db),
             debug,
             rejected,
             entries: entries.to_vec(),
             compiled: compiled.to_vec(),
             marks,
-            homes: Homes::new(compiled, &crates, &files, &instances),
+            reports: reports
+                .iter()
+                .map(|&test| {
+                    let compiled = super::compiled_report(db, test).as_ref().ok()?;
+                    Some((test, Mark::new(db, super::report_serial(db, test), &compiled.requests)))
+                })
+                .collect::<Option<_>>()?,
+            homes: Homes::new(db, compiled, &root_bodies, &crates, &files, &instances),
             crates,
-            files,
             touched: Touched::default(),
             skipped: skipped.to_vec(),
             left,
@@ -668,6 +747,18 @@ impl Base {
         self.outdated
     }
 
+    pub(super) fn impls_changed(&self) -> bool {
+        self.touched.any || !self.touched.crates.is_empty()
+    }
+
+    fn decisions_changed(&self, db: &dyn HirDatabase) -> bool {
+        self.decisions != self.sharing.decisions(db)
+    }
+
+    pub(super) fn shares_with(&self, sharing: &super::Sharing) -> bool {
+        (self.sharing.is_empty() && sharing.is_empty()) || &self.sharing == sharing
+    }
+
     /// Notes that a file changed: one of `crates`, or with `None` one we can't place.
     pub(super) fn touch(&mut self, db: &dyn HirDatabase, crates: Option<&[Crate]>) {
         let Some(crates) = crates else {
@@ -686,8 +777,21 @@ impl Base {
 
     /// Notes that a file changed in the bodies of functions alone, none of which the rest of
     /// the program sees into.
-    pub(super) fn touch_bodies(&mut self, db: &dyn HirDatabase, file: FileId) {
+    pub(super) fn touch_bodies(
+        &mut self,
+        db: &dyn HirDatabase,
+        file: FileId,
+        functions: Option<&[FunctionId]>,
+        relocated: &[FunctionId],
+    ) {
         self.touched.bodies.insert(file);
+        match functions {
+            Some(functions) => self.touched.functions.extend(functions),
+            None => {
+                self.touched.wide_bodies.insert(file);
+            }
+        }
+        self.touched.functions.extend(relocated);
         self.outdated |= self.hydrated
             && base_db::relevant_crates(db, file).iter().any(|it| self.crates.contains(it));
     }
@@ -736,8 +840,14 @@ impl Base {
         }
         let homes = &self.homes;
         let of_crates = touched.crates.iter().filter_map(|it| homes.roots_of_crate.get(it));
-        let of_files = touched.bodies.iter().filter_map(|it| homes.roots_of_file.get(it));
+        let of_files = touched.wide_bodies.iter().filter_map(|it| homes.roots_of_file.get(it));
         let mut asked: Vec<u32> = of_crates.chain(of_files).flatten().copied().collect();
+        asked.extend(
+            touched.functions.iter().filter_map(|it| homes.roots_of_function.get(it)).flatten(),
+        );
+        asked.extend(
+            touched.bodies.iter().filter_map(|it| homes.roots_of_other_body.get(it)).flatten(),
+        );
         asked.extend(touched.roots.iter().filter_map(|it| homes.root.get(it)));
         Box::new(part_of(asked, part, parts))
     }
@@ -755,8 +865,14 @@ impl Base {
         }
         let homes = &self.homes;
         let of_crates = touched.crates.iter().filter_map(|it| homes.instances_of_crate.get(it));
-        let of_files = touched.bodies.iter().filter_map(|it| homes.instances_of_file.get(it));
+        let of_files = touched.wide_bodies.iter().filter_map(|it| homes.instances_of_file.get(it));
         let mut asked: Vec<u32> = of_crates.chain(of_files).flatten().copied().collect();
+        asked.extend(
+            touched.functions.iter().filter_map(|it| homes.instances_of_function.get(it)).flatten(),
+        );
+        asked.extend(
+            touched.bodies.iter().filter_map(|it| homes.instances_of_other_body.get(it)).flatten(),
+        );
         if !touched.bodies.is_empty() {
             asked.extend(&homes.instances_of_any_file);
         }
@@ -775,57 +891,105 @@ impl Base {
     pub(super) fn stale(&self, db: &dyn HirDatabase, part: usize, parts: usize) -> Stale {
         let start = stdx::time::Instant::now();
         let mut stale = Stale::default();
+        let changed = self.decisions_changed(db);
+        stale.steps.policy = start.elapsed();
+        if changed {
+            return stale.declined("cfg sharing decisions changed");
+        }
         let every = |len: usize| (part..len).step_by(parts);
         // A check of the skipping below: looks at what no edit can have changed too, and says
         // so if one did.
-        let check_all = std::env::var_os("RUSTD_CHECK_ALL").is_some();
+        let verify = std::env::var_os("RUSTD_VERIFY_FASTPATH").is_some_and(|it| it == "1");
+        let check_all = std::env::var_os("RUSTD_CHECK_ALL").is_some() || verify;
         for i in every(self.rejected.len()) {
+            stale.steps.rejected_asked += 1;
             let (instance, env) = &self.rejected[i];
-            let compiles = probe(|| compiled_instance(db, instance.clone(), env.clone()).is_ok());
+            let compiles = probe(|| {
+                program_instance(db, instance.clone(), env.clone(), &self.sharing).is_ok()
+            });
             if compiles != Some(false) {
                 return stale.declined("an instance that did not compile is another now");
             }
         }
+        stale.steps.rejected = start.elapsed() - stale.steps.policy;
+        let start = stdx::time::Instant::now();
+        let selected: Vec<_> =
+            if check_all { self.roots_to_ask(false, 0, 1).collect() } else { Vec::new() };
+        if part == 0 && std::env::var_os("RUSTD_STATS").is_some() {
+            eprintln!(
+                "patch root candidates: {} of {}",
+                self.roots_to_ask(false, 0, 1).count(),
+                self.compiled.len()
+            );
+            eprintln!(
+                "patch instance candidates: {} of {}; opaque={}",
+                self.instances_to_ask(false, 0, 1).count(),
+                self.instances.len(),
+                self.homes.instances_of_any_file.iter().collect::<FxHashSet<_>>().len()
+            );
+        }
         for i in self.roots_to_ask(check_all, part, parts) {
             let root = self.compiled[i].0;
-            let touched = self.touched.reaches(self.crates[i])
-                || self.touched.reaches_bodies(Some(&[self.files[i]]))
-                || self.touched.roots.contains(&root);
+            let touched = !check_all || selected.binary_search(&i).is_ok();
             if !touched && !check_all {
                 continue;
             }
             let asked = stdx::time::Instant::now();
             let mark = probe(|| {
-                let compiled = compiled_root(db, root).as_ref().ok()?;
-                Some(Mark::of_function(db, root_serial(db, root), compiled, self.debug))
+                let compiled = program_root(db, root, &self.sharing).as_ref().ok()?;
+                Some(Mark::of_function(
+                    db,
+                    program_root_serial(db, root, self.sharing.clone()),
+                    compiled,
+                    self.debug,
+                ))
             });
             stale.steps.roots_asked += 1;
             stale.steps.slowest = stale.steps.slowest.max(asked.elapsed());
             match mark {
                 Some(Some(mark)) if mark == self.marks[i] => {}
                 _ if !touched => {
-                    eprintln!("check-all: MISSED root {root:?} of {:?}", self.crates[i]);
+                    eprintln!(
+                        "check-all: MISSED root {root:?} of {:?}: symbol={} file={:?} before={:?} after={:?}",
+                        self.crates[i],
+                        self.compiled[i].1,
+                        body_file(db, root.into()),
+                        (self.marks[i].serial, self.marks[i].locations, self.marks[i].lines),
+                        mark.map(|it| it.map(|mark| (mark.serial, mark.locations, mark.lines)))
+                    );
+                    assert!(!verify, "root invalidation fast path missed {root:?}");
                     continue;
                 }
-                Some(Some(_)) => stale.roots.push(root),
+                Some(Some(mark)) => {
+                    stale.roots.push(root);
+                    if mark.seen() != self.marks[i].seen() {
+                        stale.reach_changed.insert(Node::Root(root));
+                    }
+                }
                 Some(None) => return stale.declined("a root of the base no longer compiles"),
                 None => return stale.declined("a root of the base is gone"),
             }
         }
         stale.steps.roots = start.elapsed();
+        let selected: Vec<_> =
+            if check_all { self.instances_to_ask(false, 0, 1).collect() } else { Vec::new() };
         for i in self.instances_to_ask(check_all, part, parts) {
             let Some((instance, was)) = self.instances.get_index(i) else { continue };
-            let touched = self.touched.reaches(was.env.krate)
-                || self.touched.reaches_bodies(was.files.as_deref())
-                || self.touched.instances.contains(instance);
+            let touched = !check_all || selected.binary_search(&i).is_ok();
             if !touched && !check_all {
                 continue;
             }
             let asked = stdx::time::Instant::now();
             let mark = probe(|| {
-                let compiled = compiled_instance(db, instance.clone(), was.env.clone());
+                let compiled =
+                    program_instance(db, instance.clone(), was.env.clone(), &self.sharing);
                 compiled.as_ref().ok().map(|it| {
-                    let serial = instance_serial(db, instance.clone(), was.env.clone());
+                    let serial = program_instance_serial(
+                        db,
+                        instance.clone(),
+                        was.env.clone(),
+                        self.sharing.clone(),
+                    );
                     Mark::of_function(db, serial, it, self.debug)
                 })
             });
@@ -838,9 +1002,15 @@ impl Base {
                 Some(mark) if mark == was.mark => {}
                 _ if !touched => {
                     eprintln!("check-all: MISSED instance {instance:?} of {:?}", was.env.krate);
+                    assert!(!verify, "instance invalidation fast path missed {instance:?}");
                     continue;
                 }
-                Some(Some(_)) if !was.forwarded => stale.instances.push(instance.clone()),
+                Some(Some(mark)) if !was.forwarded => {
+                    stale.instances.push(instance.clone());
+                    if Some(mark.seen()) != was.mark.map(|it| it.seen()) {
+                        stale.reach_changed.insert(Node::Instance(instance.clone()));
+                    }
+                }
                 // One that had no code of its own might have now.
                 _ => stale.broken.push((
                     Node::Instance(instance.clone()),
@@ -865,6 +1035,7 @@ impl Base {
             }
             if !touched {
                 eprintln!("check-all: MISSED static {id:?} of {:?}", was.krate);
+                assert!(!verify, "static invalidation fast path missed {id:?}");
                 continue;
             }
             stale.their_walk_changed |= was.theirs;
@@ -872,6 +1043,7 @@ impl Base {
             let writable = probe(|| compiled_static(db, id).as_ref().ok().map(|it| it.writable));
             if writable == Some(Some(was.writable)) && !was.theirs && !is_thread_local(db, id) {
                 stale.statics.push(id);
+                stale.reach_changed.insert(Node::Static(id));
             } else {
                 stale.broken.push((Node::Static(id), "a static of the base changed"));
             }
@@ -960,9 +1132,12 @@ impl Base {
             return true;
         }
         let requests = match parent {
-            Node::Root(root) => compiled_root(db, *root).as_ref().ok().map(|it| &it.requests),
+            Node::Root(root) => {
+                program_root(db, *root, &self.sharing).as_ref().ok().map(|it| &it.requests)
+            }
             Node::Instance(instance) => self.instances.get(instance).and_then(|known| {
-                let compiled = compiled_instance(db, instance.clone(), known.env.clone());
+                let compiled =
+                    program_instance(db, instance.clone(), known.env.clone(), &self.sharing);
                 compiled.as_ref().ok().map(|it| &it.requests)
             }),
             Node::Static(id) => compiled_static(db, *id).as_ref().ok().map(|it| &it.requests),
@@ -999,6 +1174,9 @@ impl Base {
         stale: Vec<Stale>,
     ) -> Result<std::result::Result<Patch, &'static str>> {
         let start = stdx::time::Instant::now();
+        if roots.sharing != self.sharing || self.decisions_changed(db) {
+            return Ok(Err("cfg sharing decisions changed"));
+        }
         if roots.entries != self.entries {
             return Ok(Err("the roots compiled whether called or not changed"));
         }
@@ -1014,6 +1192,7 @@ impl Base {
         let mut changed_instances = Vec::new();
         let mut changed_statics = Vec::new();
         let mut broken = Vec::new();
+        let mut reach_changed = Some(FxHashSet::default());
         for part in stale {
             if let Some(why) = part.declined {
                 return Ok(Err(why));
@@ -1022,6 +1201,15 @@ impl Base {
             changed_instances.extend(part.instances);
             changed_statics.extend(part.statics);
             broken.extend(part.broken);
+            if part.their_walk_changed {
+                reach_changed = None;
+            }
+            if let Some(changed) = &mut reach_changed {
+                changed.extend(part.reach_changed);
+            }
+        }
+        if !broken.is_empty() {
+            reach_changed = None;
         }
         // What the edit took away is still in the base, where nothing refers to it any more.
         let unchanged = Unchanged {
@@ -1049,16 +1237,33 @@ impl Base {
             Some(self),
             false,
         )?;
+        cg.sharing = self.sharing.clone();
+        cg.counting_sharing = roots.sharing.clone();
+        if cg.sharing.tentative() {
+            if let Some(entries) = cg.entries.as_mut() {
+                std::sync::Arc::get_mut(entries).expect("a new cache reader").type_ids = false;
+            }
+        }
         cg.phases.compile = verify;
         // What nothing reached any more can be reached again by the code compiled now.
         cg.replaced = unchanged;
+        let mut reports = 0;
         for &test in roots.reports {
-            cg.define_report(test)?;
+            let compiled = super::compiled_report(db, test).as_ref().map_err(Clone::clone)?;
+            let mark = Mark::new(db, super::report_serial(db, test), &compiled.requests);
+            if self.reports.get(&test) != Some(&mark) {
+                cg.define_report(test)?;
+                reports += 1;
+            }
+        }
+        if std::env::var_os("RUSTD_STATS").is_some() {
+            eprintln!("patch reports: {reports} of {}", roots.reports.len());
         }
         // rustc's copies are the ones the base was built against: what they call is in it.
         for instance in &changed_instances {
             let was = &self.instances[instance];
-            let Ok(compiled) = compiled_instance(db, instance.clone(), was.env.clone()).as_ref()
+            let Ok(compiled) =
+                program_instance(db, instance.clone(), was.env.clone(), &self.sharing).as_ref()
             else {
                 return Ok(Err("an instance of the base no longer compiles"));
             };
@@ -1075,7 +1280,8 @@ impl Base {
                 return Ok(Err("a static of the base no longer has a value"));
             }
         }
-        let mut queued: FxHashSet<FunctionId> = known_roots().collect();
+        let base_roots: FxHashSet<FunctionId> = known_roots().collect();
+        let mut queued = base_roots.clone();
         let mut queue = changed_roots;
         queue.extend(cg.wanted.drain(..).filter(|&func| queued.insert(func)));
         let mut next = 0;
@@ -1101,7 +1307,8 @@ impl Base {
         // A future is laid out by one compiler: a function that now handles one of rustc's
         // has to be left to rustc as well.
         if let Some(theirs) = self.their_async_blocks() {
-            let shares = |root| match (async_blocks(db, root).clone(), &theirs) {
+            let shares = |root| match (async_blocks(db, root, cg.sharing.clone()).clone(), &theirs)
+            {
                 (Some(ours), Some(theirs)) => !ours.is_disjoint(theirs),
                 (Some(ours), None) => !ours.is_empty(),
                 (None, _) => true,
@@ -1110,11 +1317,32 @@ impl Base {
                 return Ok(Err("a function now shares an `async` block with one left to rustc"));
             }
         }
-        let (bodies, mut phases) = (cg.bodies, cg.phases);
+        if let Some(changed) = &mut reach_changed {
+            changed.extend(
+                queue.iter().filter(|root| !base_roots.contains(root)).copied().map(Node::Root),
+            );
+            changed.extend(
+                cg.envs
+                    .iter()
+                    .filter(|(instance, _)| !self.instances.contains_key(instance))
+                    .map(|(instance, _)| Node::Instance(instance.clone())),
+            );
+            changed.extend(
+                cg.own_static_order
+                    .iter()
+                    .filter(|id| !self.statics.contains_key(id))
+                    .copied()
+                    .map(Node::Static),
+            );
+        }
+        let (bodies, mut phases, sharing) = (cg.bodies, cg.phases, cg.sharing_stats);
+        if cg.sharing_restart {
+            return Ok(Err("a shared type reaches TypeId"));
+        }
         let start = stdx::time::Instant::now();
         let (object, _) = cg.finish()?;
         phases.object = start.elapsed();
-        Ok(Ok(Patch { object, bodies, phases }))
+        Ok(Ok(Patch { object, bodies, phases, sharing, reach_changed }))
     }
 }
 

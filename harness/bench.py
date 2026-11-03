@@ -172,7 +172,7 @@ def daemon_steps(text):
     """The steps the daemon timed in `text`, in milliseconds, summed over its builds."""
     steps = {}
     for line in re.findall(r"^timeline-us: (.*)$", text, re.M):
-        for name, micros in (pair.split("=") for pair in line.split()):
+        for name, micros in (pair.split("=") for pair in line.split(";", 1)[0].split()):
             # How long ago the file was saved is not the daemon's time.
             if name != "notice":
                 steps[name] = round(steps.get(name, 0) + int(micros) / 1000, 2)

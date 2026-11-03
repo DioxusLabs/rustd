@@ -135,7 +135,6 @@ pub(crate) struct WorkerConfig {
     pub(crate) repository: PathBuf,
     /// The directory of the package being built, from the root of the checkout.
     pub(crate) project: PathBuf,
-    pub(crate) cfg_test: bool,
     /// Which build the worker stands in for, as the daemon's own plan of it has it.
     pub(crate) selection: crate::plan::Selection,
     /// The variables the worker runs with that decide what it compiles and with what.
@@ -155,9 +154,6 @@ impl WorkerConfig {
     fn args(&self, root: &Path, crates: &[PathBuf]) -> Vec<OsString> {
         let mut args: Vec<OsString> = vec![root.join(&self.project).into(), "--own-target".into()];
         args.extend(self.selection.flags().into_iter().map(Into::into));
-        if self.cfg_test {
-            args.push("--cfg-test".into());
-        }
         if self.selection.dev_deps {
             args.push("--dev-deps".into());
         }
@@ -190,6 +186,7 @@ pub(crate) struct Checkout {
     /// When cargo started, as a stamp: source newer than this is not what rustc compiled.
     pub(crate) built_at: u128,
     pub(crate) config: WorkerConfig,
+    pub(crate) unit_test: bool,
     /// The root of the checkout.
     pub(crate) root: PathBuf,
     pub(crate) programs: Vec<Plan>,
@@ -219,13 +216,14 @@ impl Checkout {
         // Each with a comma after it: the program is of these crates and no others.
         let crates: String = plan.crates.iter().map(|it| named(it) + ",").collect();
         let mut line = format!(
-            "{verb}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{verb}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.project().display(),
             crates,
             plan.object.display(),
             plan.patch.display(),
             plan.link_cmd,
-            plan.binary.display()
+            plan.binary.display(),
+            self.unit_test
         );
         for file in &plan.symbol_files {
             line.push('\t');
@@ -286,6 +284,9 @@ impl Worker {
         let _ = std::fs::remove_file(&socket);
         let config = &checkout.config;
         let mut args = config.args(&checkout.root, &first.crates);
+        if checkout.unit_test {
+            args.push("--cfg-test".into());
+        }
         let named: [(&str, &Path); 5] = [
             ("--out", &first.object),
             ("--patch", &first.patch),

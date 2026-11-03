@@ -137,7 +137,7 @@ def measure(name, spec, repeat):
                     done = len(found)
                     b = found[-1]
                     patched = "\npatch: " in log_tail(log)
-                    steps = {k: int(v) / 1000 for k, v in (kv.split("=") for kv in b[7].split())}
+                    steps = {k: int(v) / 1000 for k, v in (kv.split("=") for kv in b[7].split(";", 1)[0].split())}
                     samples.append({"edit": kind, "file": os.path.relpath(where, fx.ws) if where != "all" else where, "revert": revert, "turn": turn, "steps_ms": steps,
                                     "recompiled": int(b[5]), "cached": int(b[6]), "patched": patched})
                     if kind == "body: println" and where == fx.touch:

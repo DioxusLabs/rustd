@@ -107,6 +107,7 @@ fn hash_str(hasher: &mut StableSipHasher128, text: &str) {
 }
 
 pub(super) struct TypeIdHasher<'a, 'db> {
+    sharing: super::Sharing,
     db: &'db dyn HirDatabase,
     symbols: &'a dyn SymbolResolver,
     /// The binders around what is being hashed, outermost first: for each, its bound
@@ -133,8 +134,10 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
         db: &'db dyn HirDatabase,
         symbols: &'a dyn SymbolResolver,
         owned: &'a FxHashSet<Crate>,
+        sharing: super::Sharing,
     ) -> Self {
         Self {
+            sharing,
             db,
             symbols,
             binders: Vec::new(),
@@ -573,7 +576,7 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
                 self.closure(hasher, id.0.loc(self.db))?;
                 // The future of an `async` closure is another type when it owns what the
                 // closure captured.
-                let by_move = crate::mir::is_by_move_coroutine(self.db, id.0, args.as_coroutine());
+                let by_move = self.sharing.coroutine_is_by_move(self.db, id.0, args.as_coroutine());
                 hasher.write_u8(by_move.into());
                 let parent = GenericArgs::new_from_slice(args.as_coroutine().parent_args());
                 self.args(parent)?.hash(hasher);
