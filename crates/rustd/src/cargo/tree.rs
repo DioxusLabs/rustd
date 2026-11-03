@@ -399,6 +399,22 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_stopped_process_has_not_ended() {
+        let mut tree = Tree::spawn(&mut shell("sleep 60")).unwrap();
+        let pid = tree.id() as libc::pid_t;
+        // SAFETY: the process is a child that was not waited for, so `pid` is still its id.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(tree.ended().is_none());
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(tree.ended().is_none());
+        tree.kill();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn what_it_started_ends_with_it_also_when_it_was_killed() {
         let dir = tempfile_dir();
         let pids = dir.join("pids");
