@@ -323,10 +323,6 @@ pub(super) struct Base {
     /// The symbols of the functions built from entries of the store, by their stable names.
     /// No edit reaches what those are compiled from.
     pub(super) found: FxHashMap<Arc<str>, String>,
-    /// Some of `found` is code of the checkout, which an edit does reach, and nothing here
-    /// tells what of it: the first edit takes a full build without any.
-    hydrated: bool,
-    outdated: bool,
     /// The instances that did not compile when the base was built. What called them was left
     /// to rustc, and stays there for as long as the base does.
     rejected: Vec<(Instance, StoredParamEnvAndCrate)>,
@@ -653,26 +649,14 @@ impl Base {
                     (name.clone(), decls.get_function_decl(*id).linkage_name(*id).into_owned())
                 })
                 .collect(),
-            hydrated: cg
-                .found
-                .iter()
-                .any(|(name, _)| super::stable::StableNames::of_checkout(name)),
-            outdated: false,
             bodies: cg.bodies,
         })
-    }
-
-    /// Whether an edit changed code that the base has from the store, which no patch can
-    /// replace.
-    pub(super) fn outdated(&self) -> bool {
-        self.outdated
     }
 
     /// Notes that a file changed: one of `crates`, or with `None` one we can't place.
     pub(super) fn touch(&mut self, db: &dyn HirDatabase, crates: Option<&[Crate]>) {
         let Some(crates) = crates else {
             self.touched.any = true;
-            self.outdated |= self.hydrated;
             return;
         };
         for &krate in crates {
@@ -680,16 +664,12 @@ impl Base {
                 self.touched.crates.extend(krate.transitive_rev_deps(db));
             }
         }
-        self.outdated |=
-            self.hydrated && self.crates.iter().any(|it| self.touched.crates.contains(it));
     }
 
     /// Notes that a file changed in the bodies of functions alone, none of which the rest of
     /// the program sees into.
-    pub(super) fn touch_bodies(&mut self, db: &dyn HirDatabase, file: FileId) {
+    pub(super) fn touch_bodies(&mut self, file: FileId) {
         self.touched.bodies.insert(file);
-        self.outdated |= self.hydrated
-            && base_db::relevant_crates(db, file).iter().any(|it| self.crates.contains(it));
     }
 
     /// Takes what every part of [`Base::stale`] found as where the next edit starts from.

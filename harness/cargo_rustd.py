@@ -1028,6 +1028,57 @@ def incremental(work):
     return checks
 
 
+# A test build of a library that uses another of the workspace, generic code of it too.
+TEST_EDIT_WORKSPACE = {
+    "Cargo.toml": '[workspace]\nmembers = ["app", "dep"]\nresolver = "2"\n',
+    "dep/Cargo.toml": '[package]\nname = "dep"\nversion = "0.1.0"\nedition = "2021"\n',
+    "dep/src/lib.rs": "pub fn scale<T: Copy + Into<u64>>(x: T) -> u64 { x.into() * 2 }\n#[inline]\npub fn base() -> u64 { 100 }\n",
+    "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\ndep = { path = "../dep" }\n',
+    "app/src/lib.rs": "#[derive(Clone, Copy)]\npub struct M(pub u32);\nimpl From<M> for u64 { fn from(m: M) -> u64 { m.0 as u64 + 1 } }\npub fn twice<T: Copy + Into<u64>>(x: T) -> u64 { dep::scale(x) + dep::base() }\npub fn total() -> u64 { twice(M(1)) }\n#[cfg(test)]\nmod tests {\n    #[test] fn unit() { println!(\"VALUE {}\", super::total()); }\n}\n",
+    "app/tests/it.rs": '#[test] fn it() { println!("VALUE {}", app::total()); }\n',
+}
+
+
+def test_edit(work):
+    """What body edits recompile in a test build whose workers restarted with the code of the
+    workspace in the store, and that the programs run the edit. The result is each check with
+    whether it held."""
+    ws = os.path.realpath(os.path.join(work, "test-edit"))
+    for file, text in TEST_EDIT_WORKSPACE.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
+        open(os.path.join(ws, file), "w").write(text)
+    home = os.path.join(work, "home-test-edit")
+    side = Side(ws, base_env(home), True)
+    logs = lambda: {path: open(path, errors="replace").read() for path in glob.glob(os.path.join(home, "*", "*", "log"))}
+    run = lambda: side.cargo("test", "-p", "app", "--tests", "--", "--nocapture")[1]
+    run()
+    side.cargo("stop")
+    run()
+    checks = []
+    for name, file, old, new, value in (
+        ("a generic body of a dependency", "dep/src/lib.rs", "x.into() * 2", "x.into() * 3", 106),
+        ("an #[inline] body of a dependency", "dep/src/lib.rs", "u64 { 100 }", "u64 { 200 }", 206),
+        ("a body of the crate under test", "app/src/lib.rs", "m.0 as u64 + 1", "m.0 as u64 + 2", 209),
+    ):
+        path = os.path.join(ws, file)
+        before = logs()
+        text = open(path).read()
+        open(path, "w").write(text.replace(old, new))
+        ran = run()
+        builds = [log[len(before.get(path, "")):] for path, log in logs().items()]
+        patched = [int(it) for log in builds for it in re.findall(r"^patch: (\d+) functions$", log, re.M)]
+        whole = sum(len(re.findall(r"^stats: ", log, re.M)) for log in builds) - len(patched)
+        values = {int(it) for it in re.findall(r"^VALUE (\d+)$", ran.stdout, re.M)}
+        how = how_built(ran.stderr)
+        held = ran.returncode == 0 and how == "daemon" and whole == 0 and patched != [] and max(patched) <= 3 and values == {value}
+        detail = f"{how}, patched {patched}, {whole} built whole, ran {sorted(values)}"
+        check = f"test edit: {name} patches and runs"
+        print(f"  {'ok ' if held else 'NOT'} {check}  {detail}", flush=True)
+        checks.append((check, held, detail))
+    side.cargo("stop")
+    return checks
+
+
 def daemon(work):
     """The life of the daemon. The result is each check with whether it held."""
     ws = os.path.realpath(os.path.join(work, "life"))
@@ -1608,7 +1659,7 @@ def main():
         result["flags"], result["flags_status"] = rows, counted
         result["wrong"] += wrong
         print("daemon:", flush=True)
-        result["daemon"] = daemon(work) + incremental(work)
+        result["daemon"] = daemon(work) + incremental(work) + test_edit(work)
         result["wrong"] += [f"daemon: {name} {detail}" for name, held, detail in result["daemon"] if not held]
         print("plain cargo:", flush=True)
         result["plain"] = plain(work)

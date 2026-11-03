@@ -489,10 +489,10 @@ impl CodegenUnit {
         let on_demand: FxHashSet<FunctionId> = roots.on_demand.iter().copied().collect();
         let all = || roots.entries.iter().chain(roots.on_demand).copied();
         let mut declined = None;
-        // Code of the checkout comes from the store in the first build alone: what a patch is
-        // of has to be compiled here, to tell what an edit changes.
-        let hydrate = known.base.is_none();
-        if let Some(base) = known.base.take().filter(|it| !it.outdated()) {
+        // A patchable base must compile checkout code itself to track its instances.
+        // Code of dependencies can still come from the store.
+        let hydrate = !known.patching && known.base.is_none();
+        if let Some(base) = known.base.take() {
             let own_statics = OwnStatics::new(
                 db,
                 all().map(|root| root.krate(db)).collect(),
@@ -956,10 +956,10 @@ impl Rejections {
     /// Notes that a file changed in the bodies of functions alone, none of which the rest of
     /// the program sees into: not `const` or `async`, not returning `impl Trait`, declaring no
     /// items, and not handed to a macro.
-    pub fn touch_bodies(&mut self, db: &dyn HirDatabase, file: base_db::FileId) {
+    pub fn touch_bodies(&mut self, file: base_db::FileId) {
         self.frozen.edit_bodies(file);
         if let Some(base) = &mut self.base {
-            base.touch_bodies(db, file);
+            base.touch_bodies(file);
         }
         self.forget();
     }

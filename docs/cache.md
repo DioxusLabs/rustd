@@ -23,8 +23,10 @@ passes). A crate of your checkout is named by a hash of its source, so two check
 the same source share entries wherever they are on disk. An edit gives new names to
 everything in the edited crate and in the crates of the checkout that depend on it, so
 what the store serves across edits is the code of crates the edit does not reach:
-dependencies, their generic instances, and the untouched crates of the workspace. Within
-one running daemon, unchanged functions of an edited crate are kept by the database
+dependencies, their generic instances, and the untouched crates of the workspace. A build
+that can be patched does not use names of the checkout at all: it compiles that code itself,
+so that a later edit can replace it, and takes only code of dependencies from the store.
+Within one running daemon, unchanged functions of an edited crate are kept by the database
 instead.
 
 Before a record is written, the store hashes that key together with the store format, a

@@ -6078,7 +6078,7 @@ fn run_holding(mut args: Args, held: Option<Held>, ahead: bool) -> anyhow::Resul
                 if std::env::var_os("RUSTD_STATS").is_some() {
                     eprintln!("bodies only: {file:?}");
                 }
-                programs.iter_mut().for_each(|it| it.known.touch_bodies(&db, file));
+                programs.iter_mut().for_each(|it| it.known.touch_bodies(file));
                 continue;
             }
             let crates = ide_db::base_db::relevant_crates(&db, file);
