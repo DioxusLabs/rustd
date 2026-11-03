@@ -1140,6 +1140,7 @@ impl<'db> TypeFolder<DbInterner<'db>> for Canonical<'_, 'db> {
             TyKind::Dynamic(bounds, region) => {
                 use crate::next_solver::{BoundExistentialPredicates, ExistentialPredicate};
                 let interner = self.interner;
+                let region = region.fold_with(self);
                 let predicates = bounds.iter().map(|bound| {
                     bound.map_bound(|pred| {
                         let mut pred = pred.fold_with(self);

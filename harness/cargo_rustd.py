@@ -1589,7 +1589,295 @@ pub fn flatten() -> Option<u8> {
         check("one-copy analysis Flatten uses N impl environment", result.returncode == 0 and "cfg codegen body: flatten: T compiled 1, redirected 0, analysis-shared 1" in text and "cfg analysis query: mir flatten: test true" not in text and "cfg analysis query: infer flatten: test true" not in text, result.stderr[-300:])
     finally:
         single.cargo("stop")
-    return checks + test_graph_sharing_incremental(work)
+    return checks + test_graph_sharing_incremental(work) + test_graph_sharing_indirect(work) + test_graph_sharing_refusals(work)
+
+
+def test_graph_sharing_indirect(work):
+    """Test-only impls that change a body naming neither the impl nor its trait."""
+    checks = []
+    def check(name, ok, detail=""):
+        checks.append((name, ok, detail))
+    ws = os.path.realpath(os.path.join(work, "sharing-indirect"))
+    os.makedirs(os.path.join(ws, "src"))
+    os.makedirs(os.path.join(ws, "probe/src"))
+    pathlib.Path(ws, "Cargo.toml").write_text('[package]\nname="sharing_indirect"\nversion="0.1.0"\nedition="2021"\n[workspace]\nmembers=["probe"]\n[dev-dependencies]\nprobe={path="probe"}\n')
+    pathlib.Path(ws, "probe/Cargo.toml").write_text('[package]\nname="probe"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nsharing_indirect={path=".."}\n')
+    pathlib.Path(ws, "probe/src/lib.rs").write_text("pub use sharing_indirect::*;\n")
+    pathlib.Path(ws, "src/lib.rs").write_text(r'''//! Test-only impls whose effect on a body is indirect: nothing in the body names them.
+use std::ops::Deref;
+
+// 1. Autoderef probe: a test-only impl on the outer type of a *different* trait in scope wins.
+pub struct In; pub struct Out(pub In);
+impl Deref for Out { type Target = In; fn deref(&self) -> &In { &self.0 } }
+pub trait Far { fn who(&self) -> u32; }
+impl Far for In { fn who(&self) -> u32 { 1 } }
+pub trait Near { fn who(&self) -> u32; }
+#[cfg(test)] impl Near for Out { fn who(&self) -> u32 { 2 } }
+pub fn probe_scope() -> u32 { Out(In).who() }
+
+// 2. The same on a foreign type: the body names neither the trait nor a local type.
+pub mod foreign {
+    pub trait FarF { fn hit(&self) -> u32; }
+    impl FarF for u32 { fn hit(&self) -> u32 { 1 } }
+    pub trait NearF { fn hit(&self) -> u32; }
+    #[cfg(test)] impl NearF for Box<u32> { fn hit(&self) -> u32 { 2 } }
+    pub fn probe_foreign() -> u32 { Box::new(1u32).hit() }
+}
+
+// 3. A where-clause: a test-only impl enables an impl the body selects through another trait.
+pub trait Gate {} pub struct Open;
+#[cfg(test)] impl Gate for Open {}
+pub trait Pick { fn pick(&self) -> u32; }
+impl<T: Gate> Pick for T { fn pick(&self) -> u32 { 2 } }
+impl Pick for &Open { fn pick(&self) -> u32 { 1 } }
+pub fn probe_where() -> u32 { (&Open).pick() }
+
+// 4. Test-only blanket impl.
+pub trait Bl { fn bl(&self) -> u32; }
+pub trait BlOther { fn bl(&self) -> u32; }
+impl BlOther for u8 { fn bl(&self) -> u32 { 1 } }
+#[cfg(test)] impl<T> Bl for &T { fn bl(&self) -> u32 { 2 } }
+pub fn probe_blanket() -> u32 { (&&1u8).bl() }
+
+// 5. Test-only inherent method shadows a trait method on the same type.
+pub struct Inh; pub trait InhT { fn who(&self) -> u32; }
+impl InhT for Inh { fn who(&self) -> u32 { 1 } }
+#[cfg(test)] impl Inh { pub fn who(&self) -> u32 { 2 } }
+pub fn probe_inherent() -> u32 { Inh.who() }
+
+// 6. Inference through a sole impl; the test-only impl makes int fallback choose another.
+pub struct Sole; pub trait Tk<A> { fn tk(&self, a: A) -> usize; }
+impl Tk<u64> for Sole { fn tk(&self, _: u64) -> usize { 8 } }
+#[cfg(test)] impl Tk<i32> for Sole { fn tk(&self, _: i32) -> usize { 4 } }
+pub fn probe_fallback() -> usize { Sole.tk(1) }
+
+// 7. A test-only foreign-trait impl on a local type changes `?` conversion.
+#[derive(Debug)] pub struct Err1;
+pub struct Err2(pub u32);
+impl From<Err1> for Err2 { fn from(_: Err1) -> Err2 { Err2(1) } }
+pub fn inner() -> Result<(), Err1> { Err(Err1) }
+pub fn probe_question() -> u32 { fn f() -> Result<(), Err2> { inner()?; Ok(()) } f().unwrap_err().0 }
+
+// 8. Test-only trait imported only in the test copy.
+pub mod gated {
+    pub struct G; pub trait A { fn v(&self) -> u32; } impl A for G { fn v(&self) -> u32 { 1 } }
+    pub mod t { pub trait B { fn w(&self) -> u32; } impl B for super::G { fn w(&self) -> u32 { 2 } } }
+    #[cfg(test)] pub use t::B as _;
+    #[cfg(test)] pub fn has_b() -> u32 { G.w() }
+    pub fn plain() -> u32 { G.v() }
+}
+
+// 9. Block-scoped import of a trait gaining an impl.
+pub struct Bk; pub struct BkOut(pub Bk);
+impl Deref for BkOut { type Target = Bk; fn deref(&self) -> &Bk { &self.0 } }
+pub mod bt { pub trait X { fn q(&self) -> u32; } pub trait Y { fn q(&self) -> u32; }
+    impl X for super::Bk { fn q(&self) -> u32 { 1 } }
+    #[cfg(test)] impl Y for super::BkOut { fn q(&self) -> u32 { 2 } } }
+pub fn probe_block() -> u32 { use bt::{X, Y}; BkOut(Bk).q() }
+
+// 10. Controls: nothing here reads test; these should be shared.
+pub fn control_add(a: u32, b: u32) -> u32 { a.wrapping_add(b) }
+pub fn control_deref(x: &Box<u32>) -> u32 { **x }
+
+pub mod constblock {
+    pub struct Cb; pub trait CbT { fn v(&self) -> u32; }
+    const _: () = { #[cfg(test)] impl CbT for Cb { fn v(&self) -> u32 { 2 } } #[cfg(not(test))] impl CbT for Cb { fn v(&self) -> u32 { 1 } } };
+    pub fn probe() -> u32 { Cb.v() }
+    pub struct Cc; pub trait CcT { fn v(&self) -> u32; }
+    const _: () = { impl CcT for Cc { fn v(&self) -> u32 { 7 } } };
+    pub fn same() -> u32 { Cc.v() }
+}
+pub mod bodyimpl {
+    pub struct B; pub trait T { fn v(&self) -> u32; }
+    pub fn host() { #[cfg(test)] impl T for B { fn v(&self) -> u32 { 2 } } #[cfg(not(test))] impl T for B { fn v(&self) -> u32 { 1 } } }
+    pub fn probe() -> u32 { B.v() }
+}
+pub mod clean { pub fn add(a: u32, b: u32) -> u32 { a.wrapping_add(b) } pub fn deref(x: &Box<u32>) -> u32 { **x } }
+
+#[cfg(test)] mod tests;
+''')
+    pathlib.Path(ws, "src/tests.rs").write_text(r'''#[test] fn probe_scope_t() { assert_eq!(crate::probe_scope(), 2); }
+#[test] fn probe_scope_n() { assert_eq!(probe::probe_scope(), 1); }
+#[test] fn foreign_probe_foreign_t() { assert_eq!(crate::foreign::probe_foreign(), 2); }
+#[test] fn foreign_probe_foreign_n() { assert_eq!(probe::foreign::probe_foreign(), 1); }
+#[test] fn probe_where_t() { assert_eq!(crate::probe_where(), 2); }
+#[test] fn probe_where_n() { assert_eq!(probe::probe_where(), 1); }
+#[test] fn probe_blanket_t() { assert_eq!(crate::probe_blanket(), 2); }
+#[test] fn probe_blanket_n() { assert_eq!(probe::probe_blanket(), 1); }
+#[test] fn probe_inherent_t() { assert_eq!(crate::probe_inherent(), 2); }
+#[test] fn probe_inherent_n() { assert_eq!(probe::probe_inherent(), 1); }
+#[test] fn probe_fallback_t() { assert_eq!(crate::probe_fallback(), 4); }
+#[test] fn probe_fallback_n() { assert_eq!(probe::probe_fallback(), 8); }
+#[test] fn probe_question_t() { assert_eq!(crate::probe_question(), 1); }
+#[test] fn probe_question_n() { assert_eq!(probe::probe_question(), 1); }
+#[test] fn gated_plain_t() { assert_eq!(crate::gated::plain(), 1); }
+#[test] fn gated_plain_n() { assert_eq!(probe::gated::plain(), 1); }
+#[test] fn probe_block_t() { assert_eq!(crate::probe_block(), 2); }
+#[test] fn probe_block_n() { assert_eq!(probe::probe_block(), 1); }
+#[test] fn control() { assert_eq!(crate::control_add(1,2), 3); assert_eq!(crate::control_deref(&Box::new(4)), 4); }
+#[test] fn clean() { assert_eq!(crate::clean::add(1,2), 3); assert_eq!(crate::clean::deref(&Box::new(4)), 4); assert_eq!(probe::clean::add(1,2), 3); }
+#[test] fn cb_t() { assert_eq!(crate::constblock::probe(), 2); }
+#[test] fn cb_n() { assert_eq!(probe::constblock::probe(), 1); }
+#[test] fn cb_same() { assert_eq!(crate::constblock::same(), 7); assert_eq!(probe::constblock::same(), 7); }
+#[test] fn bi_t() { crate::bodyimpl::host(); assert_eq!(crate::bodyimpl::probe(), 2); }
+#[test] fn bi_n() { assert_eq!(probe::bodyimpl::probe(), 1); }
+''')
+    side = Side(ws, dict(base_env(os.path.join(work, "home-sharing-indirect")), RUSTD_CFG_TWINS="items", RUSTD_CFG_SHARING="local"), True)
+    try:
+        _, result = side.cargo("test")
+        check("indirect test-only impls keep per-copy method resolution", result.returncode == 0 and "25 passed; 0 failed" in result.stdout, result.stdout[-800:] + result.stderr[-400:])
+        text = "\n".join(path.read_text(errors="replace") for path in pathlib.Path(side.env["RUSTD_HOME"]).glob("**/log")) + result.stderr
+        check("no pair veto hides the indirect impls", "pair veto: none" in text and "analysis-shared" in text, text[-600:])
+    finally:
+        side.cargo("stop")
+    return checks
+
+
+def test_graph_sharing_refusals(work):
+    """Each case keeps runtime values per copy, whether its bodies were shared or refused."""
+    checks = []
+    cases = {
+        'gate': (9, r'''#![allow(unused,dead_code)]
+use std::mem::{size_of,size_of_val}; use std::any::TypeId;
+#[allow(unused)] fn _u(){let _=(size_of::<u8>(),size_of_val(&1u8),TypeId::of::<u8>());}
+
+pub struct S; pub trait Named { fn name(&self)->u32{2} const K:u32=2; fn other(&self)->u32{7} }
+impl Named for S {}
+impl S { #[cfg(test)] pub fn name(&self)->u32{1} #[cfg(test)] pub const K:u32=1; pub fn plain(&self)->u32{3} }
+pub fn g_method()->u32{S.name()}
+pub fn g_const()->u32{S::K}
+pub fn g_path()->u32{S::name(&S)}
+macro_rules! cn {($e:expr)=>{$e.name()}}
+pub fn g_macro()->u32{cn!(S)}
+pub fn g_closure()->u32{(||S.name())()}
+pub fn g_ufcs()->u32{<S>::name(&S)}
+pub struct W(pub Vec<u8>);
+impl std::ops::Deref for W {type Target=Vec<u8>; fn deref(&self)->&Vec<u8>{&self.0}}
+impl W {#[cfg(test)] pub fn len(&self)->usize{99}}
+pub fn g_deref()->usize{W(vec![1]).len()}
+pub fn ctl_other()->u32{S.other()}
+pub fn ctl_plain()->u32{S.plain()}
+#[cfg(test)] mod tests {use super::*;
+#[test] fn t_g_method(){assert_eq!(crate::g_method() as u64,1,"test copy");assert_eq!(probe::g_method() as u64,2,"normal copy");}
+#[test] fn t_g_const(){assert_eq!(crate::g_const() as u64,1,"test copy");assert_eq!(probe::g_const() as u64,2,"normal copy");}
+#[test] fn t_g_path(){assert_eq!(crate::g_path() as u64,1,"test copy");assert_eq!(probe::g_path() as u64,2,"normal copy");}
+#[test] fn t_g_macro(){assert_eq!(crate::g_macro() as u64,1,"test copy");assert_eq!(probe::g_macro() as u64,2,"normal copy");}
+#[test] fn t_g_closure(){assert_eq!(crate::g_closure() as u64,1,"test copy");assert_eq!(probe::g_closure() as u64,2,"normal copy");}
+#[test] fn t_g_ufcs(){assert_eq!(crate::g_ufcs() as u64,1,"test copy");assert_eq!(probe::g_ufcs() as u64,2,"normal copy");}
+#[test] fn t_g_deref(){assert_eq!(crate::g_deref() as u64,99,"test copy");assert_eq!(probe::g_deref() as u64,1,"normal copy");}
+#[test] fn t_ctl_other(){assert_eq!(crate::ctl_other() as u64,7,"test copy");assert_eq!(probe::ctl_other() as u64,7,"normal copy");}
+#[test] fn t_ctl_plain(){assert_eq!(crate::ctl_plain() as u64,3,"test copy");assert_eq!(probe::ctl_plain() as u64,3,"normal copy");}
+}
+'''),
+        'inert': (5, r'''#![allow(unused,dead_code)]
+use std::mem::{size_of,size_of_val}; use std::any::TypeId;
+#[allow(unused)] fn _u(){let _=(size_of::<u8>(),size_of_val(&1u8),TypeId::of::<u8>());}
+
+pub struct A; pub struct Ctx;
+pub trait Tr { const V:u32; fn v(&self)->u32{2} }
+impl Tr for A { const V:u32=2; }
+pub trait Fmt<C> { fn f(&self)->u32; }
+impl Fmt<Ctx> for u8 { fn f(&self)->u32{2} }
+pub trait Dy { fn d(&self)->u32; }
+impl Dy for A { fn d(&self)->u32{5} }
+#[cfg(test)] pub struct TX;
+#[cfg(test)] impl Tr for TX { const V:u32=42; fn v(&self)->u32{43} }
+#[cfg(test)] impl Fmt<TX> for u8 { fn f(&self)->u32{44} }
+#[cfg(test)] impl Fmt<Ctx> for TX { fn f(&self)->u32{47} }
+#[cfg(test)] impl Dy for TX { fn d(&self)->u32{45} }
+#[cfg(test)] impl From<TX> for A { fn from(_:TX)->A{A} }
+#[cfg(not(test))] pub struct NX;
+#[cfg(not(test))] impl Dy for NX { fn d(&self)->u32{46} }
+pub fn gen_v<T:Tr>()->u32{T::V}
+pub fn gen_m<T:Tr>(t:&T)->u32{t.v()}
+pub fn gen_f<C,T:Fmt<C>>(t:&T)->u32{t.f()}
+pub fn dyn_call(x:&dyn Dy)->u32{x.d()}
+pub fn ctl_v()->u32{gen_v::<A>()}
+pub fn ctl_m()->u32{gen_m(&A)}
+pub fn ctl_f()->u32{Fmt::<Ctx>::f(&1u8)}
+pub fn ctl_dy()->u32{dyn_call(&A)}
+pub fn dyn_id()->u64{ let mut h=std::collections::hash_map::DefaultHasher::new(); std::hash::Hash::hash(&TypeId::of::<dyn Dy>(),&mut h); std::hash::Hasher::finish(&h)}
+#[cfg(test)] mod tests {use super::*;
+#[test] fn t_ctl_v(){assert_eq!(crate::ctl_v() as u64,2,"test copy");assert_eq!(probe::ctl_v() as u64,2,"normal copy");}
+#[test] fn t_ctl_m(){assert_eq!(crate::ctl_m() as u64,2,"test copy");assert_eq!(probe::ctl_m() as u64,2,"normal copy");}
+#[test] fn t_ctl_f(){assert_eq!(crate::ctl_f() as u64,2,"test copy");assert_eq!(probe::ctl_f() as u64,2,"normal copy");}
+#[test] fn t_ctl_dy(){assert_eq!(crate::ctl_dy() as u64,5,"test copy");assert_eq!(probe::ctl_dy() as u64,5,"normal copy");}
+
+#[test] fn inst(){ assert_eq!(crate::gen_v::<TX>(),42); assert_eq!(crate::gen_m(&TX),43); assert_eq!(crate::gen_f::<TX,u8>(&1),44); assert_eq!(crate::gen_f::<Ctx,TX>(&TX),47); assert_eq!(crate::dyn_call(&TX),45); assert_eq!(probe::dyn_call(&probe::NX),46); assert_ne!(crate::dyn_id(),probe::dyn_id()); }
+}
+'''),
+        'path': (13, r'''#![allow(unused,dead_code)]
+use std::mem::{size_of,size_of_val};
+
+pub mod t {
+  pub struct A; pub struct D; pub struct Keyed;
+  pub trait Conv<X> { type O; fn conv(&self,x:X)->Self::O; }
+  impl Conv<A> for u8 { #[cfg(test)] type O=u32; #[cfg(not(test))] type O=u8; fn conv(&self,_:A)->Self::O{0} }
+  pub trait Fm<C> { fn f(&self)->u32; }
+  impl Fm<A> for u8 { fn f(&self)->u32{ if cfg!(test){1}else{2} } }
+  pub trait AsF { type F<'a> where Self:'a; fn g(&self)->Self::F<'_>; const V:u32; }
+  impl AsF for A { #[cfg(test)] type F<'a>=&'a u64; #[cfg(not(test))] type F<'a>=&'a u8;
+    #[cfg(test)] fn g(&self)->&u64{&7} #[cfg(not(test))] fn g(&self)->&u8{&8} const V:u32= if cfg!(test){1}else{2}; }
+  pub trait Key {type K;}
+  impl Key for Keyed {#[cfg(test)] type K=[u8;9]; #[cfg(not(test))] type K=[u8;3];}
+  pub struct H{pub v:<Keyed as Key>::K}
+  pub struct Far{pub h:H,pub x:u8}
+  pub struct Gn<T:Key>{pub v:T::K}
+  pub fn generic_size<T:AsF>(x:&T)->usize{ std::mem::size_of_val(&x.g()) }
+  pub static DROPS:std::sync::atomic::AtomicU32=std::sync::atomic::AtomicU32::new(0);
+  #[cfg(test)] impl Drop for D { fn drop(&mut self){DROPS.fetch_add(1,std::sync::atomic::Ordering::SeqCst);} }
+  pub struct Plain(pub u8);
+  pub fn plain_fn()->u8{3}
+}
+pub fn p_conv()->usize{size_of_val(&<u8 as t::Conv<t::A>>::conv(&1,t::A))}
+pub fn p_fm()->u32{<u8 as t::Fm<t::A>>::f(&1)}
+pub fn p_g()->usize{size_of_val(<t::A as t::AsF>::g(&t::A))}
+pub fn p_v()->u32{<t::A as t::AsF>::V}
+pub fn p_h()->usize{size_of::<t::H>()}
+pub fn p_far()->usize{size_of::<t::Far>()}
+pub fn p_gn()->usize{size_of::<t::Gn<t::Keyed>>()}
+pub fn p_field()->usize{ let f=t::Far{h:t::H{v:Default::default()},x:1}; size_of_val(&f.h.v)}
+pub fn p_gen()->usize{t::generic_size(&t::A)}
+pub fn p_drop()->u32{ use std::sync::atomic::Ordering::SeqCst; let b=t::DROPS.load(SeqCst); {let _d=t::D;} t::DROPS.load(SeqCst)-b }
+pub fn p_needs()->u32{std::mem::needs_drop::<t::D>() as u32}
+pub fn ctl_plain()->u8{t::Plain(4).0+t::plain_fn()}
+pub fn ctl_arith(a:u32)->u32{a+1}
+pub fn ctl()->u32{ctl_arith(1)}
+#[cfg(test)] mod tests {
+#[test] fn t_p_conv(){assert_eq!(crate::p_conv() as u64,4,"test copy");assert_eq!(probe::p_conv() as u64,1,"normal copy");}
+#[test] fn t_p_fm(){assert_eq!(crate::p_fm() as u64,1,"test copy");assert_eq!(probe::p_fm() as u64,2,"normal copy");}
+#[test] fn t_p_g(){assert_eq!(crate::p_g() as u64,8,"test copy");assert_eq!(probe::p_g() as u64,1,"normal copy");}
+#[test] fn t_p_v(){assert_eq!(crate::p_v() as u64,1,"test copy");assert_eq!(probe::p_v() as u64,2,"normal copy");}
+#[test] fn t_p_h(){assert_eq!(crate::p_h() as u64,9,"test copy");assert_eq!(probe::p_h() as u64,3,"normal copy");}
+#[test] fn t_p_far(){assert_eq!(crate::p_far() as u64,10,"test copy");assert_eq!(probe::p_far() as u64,4,"normal copy");}
+#[test] fn t_p_gn(){assert_eq!(crate::p_gn() as u64,9,"test copy");assert_eq!(probe::p_gn() as u64,3,"normal copy");}
+#[test] fn t_p_field(){assert_eq!(crate::p_field() as u64,9,"test copy");assert_eq!(probe::p_field() as u64,3,"normal copy");}
+#[test] fn t_p_gen(){assert_eq!(crate::p_gen() as u64,8,"test copy");assert_eq!(probe::p_gen() as u64,8,"normal copy");}
+#[test] fn t_p_drop(){assert_eq!(crate::p_drop() as u64,1,"test copy");assert_eq!(probe::p_drop() as u64,0,"normal copy");}
+#[test] fn t_p_needs(){assert_eq!(crate::p_needs() as u64,1,"test copy");assert_eq!(probe::p_needs() as u64,0,"normal copy");}
+#[test] fn t_ctl_plain(){assert_eq!(crate::ctl_plain() as u64,7,"test copy");assert_eq!(probe::ctl_plain() as u64,7,"normal copy");}
+#[test] fn t_ctl(){assert_eq!(crate::ctl() as u64,2,"test copy");assert_eq!(probe::ctl() as u64,2,"normal copy");}
+}
+'''),
+    }
+    for name, (passed, source) in cases.items():
+        ws = os.path.realpath(os.path.join(work, f"sharing-{name}"))
+        crate, probe = f"c_{name}", f"p_{name}"
+        for directory in (crate, probe):
+            os.makedirs(os.path.join(ws, directory, "src"))
+        pathlib.Path(ws, "Cargo.toml").write_text(f'[workspace]\nresolver="2"\nmembers=["{crate}","{probe}"]\n')
+        pathlib.Path(ws, crate, "Cargo.toml").write_text(f'[package]\nname="{crate}"\nversion="0.1.0"\nedition="2021"\n[dev-dependencies]\nprobe={{path="../{probe}",package="{probe}"}}\n')
+        pathlib.Path(ws, probe, "Cargo.toml").write_text(f'[package]\nname="{probe}"\nversion="0.1.0"\nedition="2021"\n[dependencies]\n{crate}={{path="../{crate}"}}\n')
+        pathlib.Path(ws, probe, "src/lib.rs").write_text(f"pub use {crate}::*;\n")
+        pathlib.Path(ws, crate, "src/lib.rs").write_text(source)
+        side = Side(ws, dict(base_env(os.path.join(work, f"home-sharing-{name}")), RUSTD_CFG_SHARING="local"), True)
+        try:
+            _, result = side.cargo("test", "-p", crate, "--lib")
+            held = result.returncode == 0 and f"{passed} passed; 0 failed" in result.stdout
+            checks.append((f"test graph: sharing refusals: {name} keeps per-copy values", held, result.stdout[-800:] + result.stderr[-400:]))
+        finally:
+            side.cargo("stop")
+    return checks
 
 
 def test_graph_sharing_incremental(work):
