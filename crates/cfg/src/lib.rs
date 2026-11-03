@@ -35,7 +35,7 @@ pub use dnf::DnfExpr;
 /// See: <https://doc.rust-lang.org/reference/conditional-compilation.html#set-configuration-options>
 #[derive(Clone)]
 pub struct CfgOptions {
-    enabled: FxHashSet<CfgAtom>,
+    enabled: Arc<FxHashSet<CfgAtom>>,
     reads: Option<CfgReadRecorder>,
 }
 
@@ -104,7 +104,7 @@ impl CfgReadRecorder {
 
 impl Default for CfgOptions {
     fn default() -> Self {
-        Self { enabled: FxHashSet::from_iter([CfgAtom::Flag(sym::true_)]), reads: None }
+        Self { enabled: Arc::new(FxHashSet::from_iter([CfgAtom::Flag(sym::true_)])), reads: None }
     }
 }
 
@@ -180,7 +180,7 @@ impl CfgOptions {
                 tracing::error!("cannot remove `true` or `false` from cfg");
                 continue;
             }
-            self.enabled.remove(&atom);
+            Arc::make_mut(&mut self.enabled).remove(&atom);
         }
     }
 
@@ -190,7 +190,7 @@ impl CfgOptions {
             tracing::error!("cannot insert `true` or `false` to cfg");
             return;
         }
-        self.enabled.insert(atom);
+        Arc::make_mut(&mut self.enabled).insert(atom);
     }
 
     pub fn get_cfg_keys(&self) -> impl Iterator<Item = &Symbol> {
@@ -228,14 +228,14 @@ impl CfgOptions {
 
     #[inline]
     pub fn shrink_to_fit(&mut self) {
-        self.enabled.shrink_to_fit();
+        Arc::make_mut(&mut self.enabled).shrink_to_fit();
     }
 
     pub fn append(&mut self, other: CfgOptions) {
         // Do not call `insert_any_atom()`, as it'll check for `true` and `false`, but this is not
         // needed since we already checked for that when constructing `other`. Furthermore, this
         // will always err, as `other` inevitably contains `true` (just as we do).
-        self.enabled.extend(other.enabled);
+        Arc::make_mut(&mut self.enabled).extend(Arc::unwrap_or_clone(other.enabled));
     }
 }
 
@@ -252,7 +252,7 @@ impl IntoIterator for CfgOptions {
 
     fn into_iter(self) -> Self::IntoIter {
         self.record_all();
-        <FxHashSet<CfgAtom> as IntoIterator>::into_iter(self.enabled)
+        <FxHashSet<CfgAtom> as IntoIterator>::into_iter(Arc::unwrap_or_clone(self.enabled))
     }
 }
 
@@ -263,7 +263,7 @@ impl<'a> IntoIterator for &'a CfgOptions {
 
     fn into_iter(self) -> Self::IntoIter {
         self.record_all();
-        <&FxHashSet<CfgAtom> as IntoIterator>::into_iter(&self.enabled)
+        <&FxHashSet<CfgAtom> as IntoIterator>::into_iter(&*self.enabled)
     }
 }
 
