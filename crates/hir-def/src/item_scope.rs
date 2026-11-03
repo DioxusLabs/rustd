@@ -430,6 +430,10 @@ impl ItemScope {
         }
     }
 
+    pub fn traits_in_scope(&self) -> Vec<TraitId> {
+        self.traits().collect()
+    }
+
     pub(crate) fn traits(&self) -> impl Iterator<Item = TraitId> + '_ {
         self.types
             .values()

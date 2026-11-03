@@ -22,11 +22,17 @@ use hir_def::{
     expr_store::{Body, ExpressionStore, HygieneId, StoreVisitor},
     hir::{Array, Expr, ExprId, Pat, generics::GenericParams},
     resolver::{HasResolver, ValueNs},
-    signatures::{ConstSignature, FunctionSignature, ImplSignature, TypeAliasSignature},
+    signatures::{
+        ConstSignature, EnumSignature, FunctionSignature, ImplSignature, StaticSignature,
+        StructSignature, TraitSignature, TypeAliasSignature, UnionSignature, VariantFields,
+    },
     twins::{crate_items, scope_pairs, twin_index},
     type_ref::{TypeRef, TypeRefId},
 };
-use hir_expand::mod_path::{ModPath, PathKind};
+use hir_expand::{
+    mod_path::{ModPath, PathKind},
+    name::Name,
+};
 use petgraph::{algo::kosaraju_scc, graph::DiGraph};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
@@ -1418,6 +1424,113 @@ fn test_only_statics(db: &dyn HirDatabase, normal: Crate, test: Crate) -> usize 
         .count()
 }
 
+/// Names whose method or associated-item lookup can resolve differently in the two copies.
+///
+/// Probing (`rustc_hir_typeck::method::probe`) chooses among inherent items and the traits in
+/// scope, so an item or `use` present in only one copy can change the result of a body whose
+/// own cfg reads are identical. The body's inference can then only be reused if it never looks
+/// such a name up.
+#[salsa::tracked(returns(ref))]
+fn lookup_differing_names(db: &dyn HirDatabase, normal: Crate, test: Crate) -> FxHashSet<Name> {
+    let twins = twin_index(db, normal, test);
+    let matched: FxHashSet<_> = twins.twins.values().copied().collect();
+    let mut names = FxHashSet::default();
+    let mut scan = |items: &FxHashSet<AttrDefId>, has_twin: &dyn Fn(AttrDefId) -> bool| {
+        for &item in items {
+            match item {
+                AttrDefId::ImplId(id)
+                    if ImplSignature::of(db, id).target_trait.is_none()
+                        && !matches!(
+                            db.impl_self_ty(id).skip_binder().kind(),
+                            TyKind::Adt(adt, _) if !has_twin(adt.def_id().into())
+                        ) =>
+                {
+                    names.extend(
+                        id.impl_items(db)
+                            .items
+                            .iter()
+                            .filter(|(_, id)| !has_twin(AttrDefId::from(*id)))
+                            .map(|(name, _)| name.clone()),
+                    );
+                }
+                AttrDefId::TraitId(id) => {
+                    let whole = !has_twin(item);
+                    names.extend(
+                        id.trait_items(db)
+                            .items
+                            .iter()
+                            .filter(|(_, id)| whole || !has_twin(AttrDefId::from(*id)))
+                            .map(|(name, _)| name.clone()),
+                    );
+                }
+                _ => {}
+            }
+        }
+    };
+    scan(&crate_items(db, normal).items, &|item| matched.contains(&item));
+    scan(&crate_items(db, test).items, &|item| twins.twins.contains_key(&item));
+    for (n, t) in scope_pairs(db, normal, test) {
+        let in_normal = n.def_map(db).module(db, n).scope(db).traits_in_scope();
+        let in_test = t.def_map(db).module(db, t).scope(db).traits_in_scope();
+        let to_normal = |id: TraitId| match twins.twins.get(&AttrDefId::TraitId(id)) {
+            Some(&AttrDefId::TraitId(id)) => id,
+            _ => id,
+        };
+        let mapped: FxHashSet<_> = in_test.iter().map(|&id| to_normal(id)).collect();
+        let mut add = |id: TraitId| {
+            names.extend(id.trait_items(db).items.iter().map(|(name, _)| name.clone()));
+        };
+        in_normal.iter().filter(|id| !mapped.contains(id)).for_each(|&id| add(id));
+        let in_normal: FxHashSet<_> = in_normal.into_iter().collect();
+        in_test.iter().filter(|&&id| !in_normal.contains(&to_normal(id))).for_each(|&id| add(id));
+    }
+    names
+}
+
+fn looks_up(store: &ExpressionStore, names: &FxHashSet<Name>) -> bool {
+    let in_path = |path: &hir_def::expr_store::path::Path| {
+        path.segments().iter().any(|segment| names.contains(segment.name))
+    };
+    store.exprs().any(|(_, expr)| match expr {
+        Expr::MethodCall { method_name, .. } => names.contains(method_name),
+        Expr::Path(path) => in_path(path),
+        Expr::RecordLit { path, .. } => in_path(path),
+        Expr::InlineAsm(asm) => asm.operands.iter().any(
+            |(_, operand)| matches!(operand, hir_def::hir::AsmOperand::Sym(path) if in_path(path)),
+        ),
+        _ => false,
+    }) || store.pats().any(|(_, pat)| match pat {
+        Pat::Path(path) => in_path(path),
+        Pat::Record { path, .. } | Pat::TupleStruct { path, .. } => in_path(path),
+        _ => false,
+    }) || store.types.iter().any(|(_, ty)| matches!(ty, TypeRef::Path(path) if in_path(path)))
+}
+
+fn item_looks_up(db: &dyn HirDatabase, item: AttrDefId, names: &FxHashSet<Name>) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    let fields = |id: VariantId| looks_up(&VariantFields::of(db, id).store, names);
+    let signature = match item {
+        AttrDefId::FunctionId(id) => looks_up(&FunctionSignature::of(db, id).store, names),
+        AttrDefId::ConstId(id) => looks_up(&ConstSignature::of(db, id).store, names),
+        AttrDefId::StaticId(id) => looks_up(&StaticSignature::of(db, id).store, names),
+        AttrDefId::TypeAliasId(id) => looks_up(&TypeAliasSignature::of(db, id).store, names),
+        AttrDefId::ImplId(id) => looks_up(&ImplSignature::of(db, id).store, names),
+        AttrDefId::TraitId(id) => looks_up(&TraitSignature::of(db, id).store, names),
+        AttrDefId::AdtId(AdtId::StructId(id)) => {
+            looks_up(&StructSignature::of(db, id).store, names) || fields(id.into())
+        }
+        AttrDefId::AdtId(AdtId::UnionId(id)) => {
+            looks_up(&UnionSignature::of(db, id).store, names) || fields(id.into())
+        }
+        AttrDefId::AdtId(AdtId::EnumId(id)) => looks_up(&EnumSignature::of(db, id).store, names),
+        AttrDefId::EnumVariantId(id) => fields(id.into()),
+        _ => false,
+    };
+    signature || body(db, item).is_some_and(|id| looks_up(Body::of(db, id), names))
+}
+
 #[salsa::tracked(returns(ref))]
 fn eligibility_facts(
     db: &dyn HirDatabase,
@@ -1435,6 +1548,9 @@ fn eligibility_facts(
             Some(Rejection::CfgDiffering)
         }
         Some(t) if !per_copy && twins.unknown_items.contains(&t) => Some(Rejection::Unknown),
+        Some(_) if item_looks_up(db, item, lookup_differing_names(db, normal, test)) => {
+            Some(Rejection::CfgDiffering)
+        }
         Some(_) if references.generic_unresolved => Some(Rejection::GenericUnresolved),
         Some(_) if references.unknown => Some(Rejection::Unknown),
         Some(_) => None,
