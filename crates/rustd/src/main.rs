@@ -9,8 +9,8 @@ mod deps;
 mod doctest;
 mod inputs;
 mod launder;
-mod lru;
 mod lint;
+mod lru;
 mod memory;
 mod outline;
 mod plan;
@@ -1980,7 +1980,17 @@ fn load(
         debug: Vec::new(),
         beside,
     };
-    let mut db = RootDatabase::new(lru::capacity());
+    let (capacity, scope) = lru::settings();
+    let mut db = RootDatabase::new(capacity.filter(|_| scope.is_none()));
+    match (capacity, scope) {
+        (Some(capacity), Some(lru::Scope::Syntax)) => {
+            hir::db::set_syntax_lru_capacity(&mut db, usize::from(capacity))
+        }
+        (Some(capacity), Some(lru::Scope::Semantic)) => {
+            hir::db::set_semantic_lru_capacity(&mut db, usize::from(capacity))
+        }
+        _ => {}
+    }
     let mut vfs = vfs::Vfs::default();
     checkouts.add(projects, &mut db, &mut vfs)?;
     Ok((db, vfs, checkouts))
