@@ -154,14 +154,7 @@ impl Tree {
         use std::os::unix::process::ExitStatusExt as _;
         if self.ended.is_none() {
             let pid = self.child.id() as libc::pid_t;
-            let flags = libc::WEXITED | libc::WNOWAIT | if block { 0 } else { libc::WNOHANG };
-            // SAFETY: all zeros is a valid value of this structure of integers.
-            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            let seen = retrying(|| {
-                // SAFETY: the pointer is to a live value of the type asked for.
-                unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) }
-            });
-            if seen == 0 && info.si_signo == 0 {
+            if !block && !has_exited(pid) {
                 return None;
             }
             self.kill_all();
@@ -213,6 +206,25 @@ impl Tree {
         return job::cpu(self.job.as_ref());
         #[cfg(not(windows))]
         cpu_of_group(self.child.id())
+    }
+}
+
+/// Whether `pid`, a child not waited for yet, is one to wait for. macOS can answer for a child
+/// that only stopped, however it is asked, and `si_code` is what tells these apart.
+#[cfg(unix)]
+fn has_exited(pid: libc::pid_t) -> bool {
+    // CLD_EXITED, CLD_KILLED and CLD_DUMPED: the same on Linux and macOS, not all in libc.
+    const EXITED: std::ops::RangeInclusive<libc::c_int> = 1..=3;
+    // SAFETY: all zeros is a valid value of this structure of integers.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let flags = libc::WEXITED | libc::WNOWAIT | libc::WNOHANG;
+    let seen = retrying(|| {
+        // SAFETY: the pointer is to a live value of the type asked for.
+        unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) }
+    });
+    match seen {
+        0 => info.si_signo != 0 && EXITED.contains(&info.si_code),
+        _ => io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD),
     }
 }
 

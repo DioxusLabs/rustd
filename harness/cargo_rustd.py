@@ -1287,7 +1287,7 @@ def abuse(work, ws, tree, env, check, status, alive):
     _, after = here.cargo("run", "again")
     now = status()
     check("a client killed while its build is held leaves the daemon serving", waits and after.returncode == 0 and greets(after.stdout, "tree0 again") and now[0] == pid and how_built(after.stderr) == "daemon", how_built(after.stderr))
-    check("and the worker it was held by", now[1] == workers, now[2] + open(os.path.join(env["RUSTD_HOME"], "daemon.log")).read()[-3000:])
+    check("and the worker it was held by", now[1] == workers, now[2])
     workers = now[1]
 
     edit("held two")
