@@ -1772,9 +1772,9 @@ pub fn total() -> u64 {{ {total} }}
                     checks.append((name, held, fresh[-700:]))
                     print(f"  {'ok ' if held else 'NOT'} {name}", flush=True)
                     if case == "restored code":
-                        name = f"cfg sharing: {mode} {prime}-prime body edits skip impl prewarm"
+                        name = f"cfg sharing: {mode} {prime}-prime body edits prewarm impls"
                         prewarm = re.findall(r"check impls prewarm: (\w+);", fresh)
-                        held = bool(prewarm) and all(value == "skipped" for value in prewarm)
+                        held = bool(prewarm) and all(value == "enabled" for value in prewarm)
                         checks.append((name, held, str(prewarm)))
                         print(f"  {'ok ' if held else 'NOT'} {name}: {prewarm}", flush=True)
                         name = f"cfg sharing: {mode} {prime}-prime root checks follow changed functions"

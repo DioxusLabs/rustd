@@ -3304,7 +3304,7 @@ fn build(
     // thread: left to the questions, whichever gets there has the others wait for all of it.
     let next = std::sync::atomic::AtomicUsize::new(0);
     let impls = std::sync::atomic::AtomicU64::new(0);
-    let prewarm = known.impls_changed();
+    let prewarm = std::env::var_os("RUSTD_NO_PREWARM").is_none() || known.impls_changed();
     let impl_crates = if prewarm { local.as_slice() } else { &[] };
     let stale: Option<Vec<_>> = std::thread::scope(|scope| {
         let parts: Vec<_> = (0..threads)
