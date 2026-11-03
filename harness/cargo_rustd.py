@@ -1558,7 +1558,92 @@ pub fn flatten() -> Option<u8> {
         check("one-copy analysis Flatten uses N impl environment", result.returncode == 0 and "cfg codegen body: flatten: T compiled 1, redirected 0, analysis-shared 1" in text and "cfg analysis query: mir flatten: test true" not in text and "cfg analysis query: infer flatten: test true" not in text, result.stderr[-300:])
     finally:
         single.cargo("stop")
-    return checks + test_graph_sharing_incremental(work)
+    return checks + test_graph_sharing_incremental(work) + test_graph_sharing_lookup(work)
+
+
+def test_graph_sharing_lookup(work):
+    ws = os.path.realpath(os.path.join(work, "sharing-lookup"))
+    source = '''#![allow(unused, dead_code)]
+pub struct S;
+pub trait Named { const K: usize = 2; fn same_impl(&self) -> u32 { 2 } fn own_impl(&self) -> u32 { 2 } fn normal_only(&self) -> u32 { 1 } fn other(&self) -> u32 { 7 } }
+impl Named for S {}
+impl S {
+    #[cfg(test)] pub const K: usize = 1;
+    #[cfg(test)] pub fn same_impl(&self) -> u32 { 1 }
+    #[cfg(not(test))] pub fn normal_only(&self) -> u32 { 2 }
+    pub fn plain(&self) -> u32 { 3 }
+}
+#[cfg(test)] impl S { pub fn own_impl(&self) -> u32 { 1 } }
+pub trait ByValue { #[cfg(test)] fn trait_item(self) -> u32 where Self: Sized { 1 } }
+impl ByValue for S {}
+#[cfg(test)] pub trait TestOnly { fn test_trait(self) -> u32 where Self: Sized { 1 } }
+#[cfg(test)] impl TestOnly for S {}
+mod scoped { pub trait InScope { fn in_scope(self) -> u32 where Self: Sized { 1 } } impl InScope for super::S {} }
+#[cfg(test)] use scoped::InScope as _;
+pub trait ByRef { fn trait_item(&self) -> u32 { 2 } fn test_trait(&self) -> u32 { 2 } fn in_scope(&self) -> u32 { 2 } }
+impl ByRef for S {}
+pub struct W<T>(pub T);
+impl<T> Named for W<T> {}
+impl<T> W<T> { #[cfg(test)] pub fn same_impl(&self) -> u32 { 1 } }
+pub struct Sized_ { pub bytes: [u8; S::K] }
+pub const ITEM: usize = S::K;
+pub fn method() -> u32 { S.same_impl() }
+pub fn path() -> u32 { S::same_impl(&S) }
+pub fn closure() -> u32 { (|| S.same_impl())() }
+pub fn nested() -> u32 { fn inner() -> u32 { S.same_impl() } inner() }
+pub fn generic() -> u32 { W(0u8).same_impl() }
+pub fn separate() -> u32 { S.own_impl() }
+pub fn removed() -> u32 { S.normal_only() }
+pub fn trait_item() -> u32 { S.trait_item() }
+pub fn test_trait() -> u32 { S.test_trait() }
+pub fn in_scope() -> u32 { S.in_scope() }
+pub fn constant() -> usize { S::K }
+pub fn pattern() -> usize { match 1 { S::K => 1, _ => 2 } }
+pub fn field() -> usize { std::mem::size_of::<Sized_>() }
+pub fn item() -> usize { ITEM }
+pub fn caller() -> u32 { method() + 10 }
+pub fn untouched() -> u32 { S.plain() + S.other() }
+#[cfg(test)] mod tests {
+    macro_rules! both { ($($name:ident: $test:expr, $normal:expr;)*) => { $(#[test] fn $name() {
+        assert_eq!(crate::$name() as u64, $test, "test copy");
+        assert_eq!(probe::$name() as u64, $normal, "normal copy");
+    })* } }
+    both! {
+        method: 1, 2; path: 1, 2; closure: 1, 2; nested: 1, 2; generic: 1, 2; separate: 1, 2; removed: 1, 2;
+        trait_item: 1, 2; test_trait: 1, 2; in_scope: 1, 2; constant: 1, 2; pattern: 1, 2; field: 1, 2; item: 1, 2;
+        caller: 11, 12; untouched: 10, 10;
+    }
+}
+'''
+    files = {
+        "Cargo.toml": '[package]\nname = "sharing_lookup"\nversion = "0.1.0"\nedition = "2021"\n[workspace]\nmembers = ["probe"]\n[dev-dependencies]\nprobe = { path = "probe" }\n',
+        "src/lib.rs": source,
+        "probe/Cargo.toml": '[package]\nname = "probe"\nversion = "0.1.0"\nedition = "2021"\n[dependencies]\nsharing_lookup = { path = ".." }\n',
+        "probe/src/lib.rs": "pub use sharing_lookup::*;\n",
+    }
+    for name, text in files.items():
+        path = pathlib.Path(ws, name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    env = dict(base_env(os.path.join(work, "home-sharing-lookup")), RUSTD_CFG_TWINS="items", RUSTD_CFG_SHARING="1", RUSTD_CFG_VERIFY="1", RUSTD_STATS="1")
+    side = Side(ws, env, True)
+    checks = []
+    try:
+        _, built = side.cargo("test", "--lib")
+        text = "\n".join(path.read_text(errors="replace") for path in pathlib.Path(env["RUSTD_HOME"]).glob("**/log"))
+        output = built.stdout + built.stderr
+        checks.append(("cfg sharing: a name resolved differently per copy keeps both results", built.returncode == 0 and "test result: ok. 16 passed" in output, output[-1500:]))
+        untouched = re.search(r"cfg body: sharing_lookup::untouched: (\S+)", text)
+        checks.append(("cfg sharing: lookup of an unaffected name stays shared", bool(untouched) and untouched.group(1) in ("fully-shared", "analysis-shared"), untouched.group(0) if untouched else text[-700:]))
+        edited = source.replace("#[cfg(test)] pub fn same_impl(&self) -> u32 { 1 }\n", "", 1).replace("method: 1, 2; path: 1, 2; closure: 1, 2; nested: 1, 2;", "method: 2, 2; path: 2, 2; closure: 2, 2; nested: 2, 2;").replace("caller: 11, 12", "caller: 12, 12")
+        pathlib.Path(ws, "src/lib.rs").write_text(edited)
+        _, removed = side.cargo("test", "--lib")
+        pathlib.Path(ws, "src/lib.rs").write_text(source)
+        _, restored = side.cargo("test", "--lib")
+        checks.append(("cfg sharing: warm edit of a test-only item changes the lookup", removed.returncode == 0 and restored.returncode == 0 and how_built(restored.stderr) == "daemon", (removed.stdout + restored.stdout)[-1500:]))
+    finally:
+        side.cargo("stop")
+    return checks
 
 
 def test_graph_sharing_incremental(work):
