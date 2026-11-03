@@ -150,7 +150,7 @@ fn staged(
         ahead.config.id()
     });
     let state = match Built::staged(asked, &crates)? {
-        Ok(built) => daemons(asked, cwd, key, built, counts)
+        Ok(built) => daemons(asked, cwd, key, built, counts, ahead.as_deref())
             .unwrap_or_else(|why| Err(format!("{why:#}")))
             .map_err(NotBuilt::Daemons),
         Err(code) => Err(NotBuilt::Failed(code)),
@@ -169,8 +169,14 @@ fn daemons(
     key: &str,
     built: Built,
     counts: Counts,
+    ahead: Option<&str>,
 ) -> anyhow::Result<Result<State, String>> {
     let state = State::after(asked, cwd, key, built, counts)?;
+    if let Some(id) = ahead
+        && !state.checkouts.iter().any(|it| !it.programs.is_empty() && it.config.id() == id)
+    {
+        let _ = client::ask(Request::Forget(id.to_owned()), Start::Never);
+    }
     Ok(first_by_daemon(state))
 }
 

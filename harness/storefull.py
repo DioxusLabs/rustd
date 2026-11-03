@@ -26,8 +26,7 @@ from storelib import Checkout, Daemon, cache, files, scratch, stats, verify
 WINDOWS = os.name == "nt"
 # NTFS keeps a log and a file table of its own, which do not fit in the 8 MB a tmpfs can be.
 SIZE = (64 if WINDOWS else 8) << 20
-# How much room the store has, in bytes. A cold build of the workspace writes about 1.5 MB
-# with Cranelift on Linux and under 1 MB with LLVM on Windows, so the last room is measured.
+# How much room the store has, in bytes, capped below what a cold build writes.
 ROOMS = [0, 4096, 16 << 10, 128 << 10, 512 << 10]
 SEALS = {"RUSTD_CACHE_SEAL_AT": "1", "RUSTD_CACHE_MAX": "off"}
 NO_ROOM = "There is not enough space on the disk" if WINDOWS else "No space left on device"
@@ -107,14 +106,18 @@ class Disk:
 
 
 def cold(checkout, disk):
-    """How many bytes a cold build of the workspace writes to a store with room."""
+    """The bytes and records a cold build writes to a store with room."""
     disk.empty_store()
     if os.path.exists(disk.ballast):
         os.remove(disk.ballast)
     daemon = Daemon(checkout, disk.store, name="cold", env=SEALS)
     checkout.check(daemon, "with room, to measure")
     daemon.kill()
-    return sum(os.path.getsize(os.path.join(disk.store, name)) for name in os.listdir(disk.store))
+    whole, numbers, out = verify(disk.store)
+    if not whole or not numbers.get("records"):
+        fail(f"the cold store did not keep valid records: {out}")
+    size = sum(os.path.getsize(os.path.join(disk.store, name)) for name in os.listdir(disk.store))
+    return size, numbers["records"]
 
 
 def built_without(checkout, disk, room):
@@ -144,10 +147,10 @@ def built_without(checkout, disk, room):
     return not_used
 
 
-def kept_again(checkout, disk):
+def kept_again(checkout, disk, expected, room):
     """Room is made while a daemon runs; the next build that writes the store keeps what it compiles."""
     disk.empty_store()
-    disk.leave(128 << 10)
+    disk.leave(room)
     checkout.set(11)
     daemon = Daemon(checkout, disk.store, name="again", env=SEALS)
     checkout.check(daemon, "before room is made")
@@ -160,7 +163,7 @@ def kept_again(checkout, disk):
     log = daemon.log()
     daemon.kill()
     whole, numbers, out = verify(disk.store)
-    if NO_ROOM in log or not whole or numbers["records"] < 1000:
+    if NO_ROOM in log or not whole or numbers["records"] < expected:
         fail(f"with room again the daemon did not keep what it compiled: {daemon.log_path}\n{out}")
     daemon = Daemon(checkout, disk.store, name="again", env=SEALS)
     checkout.check(daemon, "from the store that was full")
@@ -216,9 +219,12 @@ def main():
     checkout = Checkout(work)
     disk = Disk(work)
     try:
-        rooms = [*ROOMS, cold(checkout, disk) * 2 // 3]
+        size, records = cold(checkout, disk)
+        print(f"cold store: {size} bytes, {records} records")
+        limit = size * 2 // 3
+        rooms = sorted({min(room, limit) for room in ROOMS} | {limit})
         not_used = sum(built_without(checkout, disk, room) for room in rooms)
-        kept_again(checkout, disk)
+        kept_again(checkout, disk, records, min(128 << 10, limit))
         commands(checkout, disk, work)
     finally:
         disk.unmount()

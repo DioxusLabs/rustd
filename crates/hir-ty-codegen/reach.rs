@@ -17,6 +17,7 @@ use crate::{db::HirDatabase, traits::StoredParamEnvAndCrate};
 use super::{
     CodegenError, Instance, InstanceDef, compiled_instance, compiled_root, compiled_static,
     fragment::{DataRequest, FuncTarget, Requests},
+    home::mentioned_crates,
     instance_serial, is_thread_local,
     patch::Mark,
     print_of, root_serial, static_serial,
@@ -34,6 +35,8 @@ enum Node {
 pub struct Reached {
     /// `None` when something it reaches did not compile: what that calls is not known.
     pub print: Option<u128>,
+    /// The print when the test runs in a process of its own.
+    pub alone: Option<u128>,
     /// Equal for tests that reach a static the program can write, directly or through a
     /// chain of tests that do: one of them can leave there what another finds.
     pub group: usize,
@@ -53,6 +56,7 @@ impl Node {
 
 #[derive(Default)]
 struct Graph {
+    homes: super::home::Homes,
     ids: FxHashMap<Node, usize>,
     /// The print of each node's own code and of the source locations it reports.
     own: Vec<Option<u128>>,
@@ -153,7 +157,7 @@ impl Graph {
         let funcs = requests.funcs.iter().filter_map(|it| match &it.target {
             FuncTarget::Instance(instance, env) => Some(match instance.def {
                 InstanceDef::Fn(func) if instance.args.as_ref().is_empty() => Node::Root(func),
-                _ => Node::Instance(instance.clone(), env.clone()),
+                _ => Node::Instance(instance.clone(), self.homes.home(db, instance, env)),
             }),
             // Code rustc compiled, which is the same until cargo builds again, or a name the
             // linker resolves, which the caller hands in as reached by everything.
@@ -166,9 +170,8 @@ impl Graph {
         funcs.chain(statics).collect()
     }
 
-    /// Whether the node is of a crate no edit reaches, and of nothing else: a function
-    /// without type arguments, or a static. What it calls is then of such crates too,
-    /// unless it was handed it when the program ran, by code that is a node of its own.
+    /// Whether the node is of crates no edit reaches, and of nothing else. What it calls is
+    /// then of such crates too, unless it was handed it when the program ran, by code that is a node of its own.
     fn settled(&self, db: &dyn HirDatabase, node: &Node) -> bool {
         let krate = match node {
             Node::Root(func) => func.krate(db),
@@ -177,7 +180,14 @@ impl Graph {
             {
                 func.krate(db)
             }
-            Node::Instance(..) => return false,
+            // Its code comes of what its name mentions, and an edit can't add an impl that
+            // only those crates can hold.
+            Node::Instance(instance, env) => {
+                return !self.edited.contains(&env.krate)
+                    && env.param_env(db).clauses.is_empty()
+                    && mentioned_crates(db, instance)
+                        .is_some_and(|it| it.is_disjoint(&self.edited));
+            }
             Node::Static(id) => id.krate(db),
         };
         !self.edited.contains(&krate)
@@ -339,7 +349,7 @@ pub fn reached(
     let reached = std::iter::zip(group, alone)
         .map(|(group, alone)| {
             let all = together[&group].as_ref();
-            Reached { print: alone.zip(all).map(|it| print_of(&it)), group }
+            Reached { print: alone.zip(all).map(|it| print_of(&it)), alone, group }
         })
         .collect();
     (reached, everywhere.as_ref().map(print_of), graph.unknown)

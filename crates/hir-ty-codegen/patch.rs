@@ -692,6 +692,21 @@ impl Base {
             && base_db::relevant_crates(db, file).iter().any(|it| self.crates.contains(it));
     }
 
+    /// Asks for one of `parts` of what the base holds, for a walk over all of it to find it
+    /// looked at.
+    pub(super) fn look_at(&self, db: &dyn HirDatabase, part: usize, parts: usize) {
+        let mine = |at: &usize| at % parts == part;
+        for (_, (root, _)) in self.compiled.iter().enumerate().filter(|(at, _)| mine(at)) {
+            probe(|| root_serial(db, *root));
+        }
+        for (_, (instance, was)) in self.instances.iter().enumerate().filter(|(at, _)| mine(at)) {
+            probe(|| instance_serial(db, instance.clone(), was.env.clone()));
+        }
+        for (_, id) in self.statics.keys().enumerate().filter(|(at, _)| mine(at)) {
+            probe(|| static_serial(db, *id));
+        }
+    }
+
     /// Takes what every part of [`Base::stale`] found as where the next edit starts from.
     pub(super) fn settle(&mut self, db: &dyn HirDatabase, found: &mut [Stale]) {
         self.their_statics(db, found);

@@ -489,9 +489,9 @@ impl CodegenUnit {
         let on_demand: FxHashSet<FunctionId> = roots.on_demand.iter().copied().collect();
         let all = || roots.entries.iter().chain(roots.on_demand).copied();
         let mut declined = None;
-        // Code of the checkout comes from the store in the first build alone: what a patch is
-        // of has to be compiled here, to tell what an edit changes.
-        let hydrate = known.base.is_none();
+        // A patchable base must compile checkout code itself to track its instances.
+        // Code of dependencies can still come from the store.
+        let hydrate = !known.patching && known.base.is_none();
         if let Some(base) = known.base.take().filter(|it| !it.outdated()) {
             let own_statics = OwnStatics::new(
                 db,
@@ -909,6 +909,14 @@ impl Rejections {
     /// changed, which threads can do a part each. `None` when no patch is to be made.
     pub fn stale(&self, db: &dyn HirDatabase, part: usize, parts: usize) -> Option<Stale> {
         Some(self.base.as_ref()?.stale(db, part, parts))
+    }
+
+    /// Looks at one of `parts` of what the last build compiled, so that threads share the
+    /// cost of a walk over all of it after an edit.
+    pub fn look_at(&self, db: &dyn HirDatabase, part: usize, parts: usize) {
+        if let Some(base) = &self.base {
+            base.look_at(db, part, parts);
+        }
     }
 
     /// Whether the next build is a patch of the last one. A build that is interrupted leaves

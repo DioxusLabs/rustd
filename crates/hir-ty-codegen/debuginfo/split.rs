@@ -17,6 +17,7 @@ use cranelift_codegen::gimli::{
         Address, DebugLine, LineProgram, LineStringTable, Range, Sections, StringTable, Writer,
     },
 };
+use cranelift_codegen::isa::TargetIsa;
 use cranelift_object::object::{
     self, BinaryFormat, SectionFlags, SectionKind, elf,
     write::{Object, StandardSegment},
@@ -101,16 +102,17 @@ pub(super) struct Split {
 
 impl Split {
     pub(super) fn new(
+        isa: &dyn TargetIsa,
         encoding: Encoding,
         directory: Vec<u8>,
         name: String,
-        like: &Object<'_>,
-    ) -> Self {
-        Split {
+    ) -> Option<Self> {
+        let object = object_target(isa.triple())?;
+        Some(Split {
             encoding,
             directory,
             name,
-            object: (like.format(), like.architecture()),
+            object,
             info: SectionWriter::default(),
             abbrev: SectionWriter::default(),
             line: DebugLine(SectionWriter::default()),
@@ -118,7 +120,11 @@ impl Split {
             addr: SectionWriter::default(),
             loc_apart: SectionWriter::default(),
             files: Vec::new(),
-        }
+        })
+    }
+
+    pub(super) fn next_name(&self) -> String {
+        file(&self.name, self.files.len())
     }
 
     /// Writes one unit: its entries apart, and its lines, addresses and skeleton to link.
@@ -342,5 +348,82 @@ impl Split {
         ];
         let linked = linked.into_iter().map(|(id, written)| Section { id, written });
         (linked.collect(), self.files)
+    }
+}
+
+fn object_target(triple: &target_lexicon::Triple) -> Option<(BinaryFormat, object::Architecture)> {
+    let format = match triple.binary_format {
+        target_lexicon::BinaryFormat::Elf => BinaryFormat::Elf,
+        target_lexicon::BinaryFormat::Macho => BinaryFormat::MachO,
+        _ => return None,
+    };
+    let architecture = match triple.architecture {
+        target_lexicon::Architecture::X86_32(_) => object::Architecture::I386,
+        target_lexicon::Architecture::X86_64 => object::Architecture::X86_64,
+        target_lexicon::Architecture::Arm(_) => object::Architecture::Arm,
+        target_lexicon::Architecture::Aarch64(_) => object::Architecture::Aarch64,
+        target_lexicon::Architecture::Riscv64(_) if format == BinaryFormat::Elf => {
+            object::Architecture::Riscv64
+        }
+        target_lexicon::Architecture::S390x => object::Architecture::S390x,
+        _ => return None,
+    };
+    Some((format, architecture))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_object_target_matches_the_object_writer() {
+        for triple in [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "x86_64-apple-darwin",
+            "aarch64-apple-darwin",
+        ] {
+            let isa = cranelift_codegen::isa::lookup(triple.parse().unwrap())
+                .unwrap()
+                .finish(cranelift_codegen::settings::Flags::new(
+                    cranelift_codegen::settings::builder(),
+                ))
+                .unwrap();
+            let builder = cranelift_object::ObjectBuilder::new(
+                isa.clone(),
+                "test",
+                cranelift_module::default_libcall_names(),
+            )
+            .unwrap();
+            let object = cranelift_object::ObjectModule::new(builder).finish().object;
+            let encoding = Encoding {
+                format: gimli::Format::Dwarf32,
+                version: 4,
+                address_size: isa.pointer_bytes(),
+            };
+            let split = Split::new(&*isa, encoding, Vec::new(), "test.o".to_owned()).unwrap();
+            assert_eq!(split.object, (object.format(), object.architecture()));
+            #[cfg(not(feature = "wasm"))]
+            if object.format() == BinaryFormat::MachO {
+                let context =
+                    super::super::DebugContext::new(&*isa, "/", true, Some("test.o".to_owned()))
+                        .unwrap();
+                let super::super::DebugContext::Dwarf(dwarf) = context else { panic!() };
+                assert!(dwarf.apart.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_object_targets_are_not_split() {
+        for triple in [
+            "x86_64-pc-windows-msvc",
+            "wasm32-unknown-unknown",
+            "mips-unknown-linux-gnu",
+            "riscv64gc-apple-darwin",
+            "unknown-unknown-unknown",
+        ] {
+            assert!(object_target(&triple.parse().unwrap()).is_none(), "{triple}");
+        }
     }
 }
