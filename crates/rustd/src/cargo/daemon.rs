@@ -284,8 +284,8 @@ struct Worker {
     asked: Mutex<Instant>,
     lost: Mutex<Option<String>>,
     requests: Mutex<Vec<Instant>>,
-    /// The kernel's count of what it killed for memory, when last seen with the process alive.
-    oom_kills: Mutex<Option<u64>>,
+    /// The kernel's count of what it killed for memory, from when the process was still alive.
+    oom_kills: Mutex<OomKills>,
     /// The CPU time of a process that was asked something, and when it last changed.
     progress: Mutex<Option<(u64, Instant)>>,
     paths: Vec<PathBuf>,
@@ -382,7 +382,7 @@ impl Worker {
             asked: Mutex::new(Instant::now()),
             lost: Mutex::new(None),
             requests: Mutex::new(Vec::new()),
-            oom_kills: Mutex::new(oom_kills()),
+            oom_kills: Mutex::new(OomKills::new(oom_kills())),
             progress: Mutex::new(None),
             paths: std::iter::once(dir)
                 .chain(checkout.programs.iter().flat_map(|it| {
@@ -445,7 +445,7 @@ impl Worker {
                 let mut reason =
                     format!("the daemon's worker (pid {pid}) was killed by signal {signal}");
                 if signal == 9 {
-                    let seen = *lock(&self.oom_kills);
+                    let seen = lock(&self.oom_kills).before();
                     reason.push_str(&sigkill(
                         seen.zip(oom_kills()).map(|(a, b)| b.saturating_sub(a)),
                     ));
@@ -482,7 +482,7 @@ impl Worker {
         if self.end().is_some() {
             return;
         }
-        *lock(&self.oom_kills) = oom_kills();
+        lock(&self.oom_kills).advance(oom_kills);
         let asked = !lock(&self.requests).is_empty() || self.loads();
         let mut progress = lock(&self.progress);
         let (Some(limit), true, Some(cpu)) = (hung_after, asked, lock(&self.tree).cpu()) else {
@@ -1239,6 +1239,33 @@ impl Drop for Outstanding<'_> {
     }
 }
 
+/// The kernel counts a kill when it chooses the process, and a process of many gigabytes takes
+/// its time to die: the count to compare with is one from before that.
+const OOM_DYING: Duration = Duration::from_secs(30);
+
+struct OomKills {
+    older: Option<u64>,
+    newer: Option<u64>,
+    at: Instant,
+}
+
+impl OomKills {
+    fn new(kills: Option<u64>) -> OomKills {
+        OomKills { older: kills, newer: kills, at: Instant::now() }
+    }
+
+    fn advance(&mut self, kills: impl FnOnce() -> Option<u64>) {
+        if self.at.elapsed() >= OOM_DYING {
+            *self = OomKills { older: self.newer, newer: kills(), at: Instant::now() };
+        }
+    }
+
+    /// The count from at least [`OOM_DYING`] ago, or since the process started.
+    fn before(&self) -> Option<u64> {
+        self.older
+    }
+}
+
 /// The kernel's system-wide count, which goes up for any process.
 fn oom_kills() -> Option<u64> {
     if !cfg!(target_os = "linux") {
@@ -1294,6 +1321,19 @@ pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_kill_counted_while_the_process_dies_is_not_counted_away() {
+        let mut kills = OomKills::new(Some(5));
+        kills.advance(|| Some(6));
+        assert_eq!(kills.before(), Some(5));
+        kills.at -= OOM_DYING;
+        kills.advance(|| Some(6));
+        assert_eq!(kills.before(), Some(5));
+        kills.at -= OOM_DYING;
+        kills.advance(|| Some(6));
+        assert_eq!(kills.before(), Some(6));
+    }
 
     #[test]
     fn a_kill_is_out_of_memory_only_when_the_kernel_counted_one() {
