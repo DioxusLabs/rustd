@@ -1032,40 +1032,51 @@ def incremental(work):
 TEST_EDIT_WORKSPACE = {
     "Cargo.toml": '[workspace]\nmembers = ["app", "dep"]\nresolver = "2"\n',
     "dep/Cargo.toml": '[package]\nname = "dep"\nversion = "0.1.0"\nedition = "2021"\n',
-    "dep/src/lib.rs": "pub fn sum<T: Copy + Into<u64>>(xs: &[T]) -> u64 {\n    xs.iter().map(|&x| x.into()).sum()\n}\npub fn words(s: &str) -> Vec<String> {\n    s.split(' ').map(|w| w.to_string()).collect()\n}\n",
+    "dep/src/lib.rs": "pub fn scale<T: Copy + Into<u64>>(x: T) -> u64 { x.into() * 2 }\n#[inline]\npub fn base() -> u64 { 100 }\n",
     "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\ndep = { path = "../dep" }\n',
-    "app/src/lib.rs": "pub fn total() -> u64 { dep::sum(&[1u32, 2, 3]) }\npub fn count() -> usize { dep::words(\"a b\").len() }\npub fn flag(x: u32) -> bool { x > 1 }\npub fn other(x: u32) -> u32 { x + 1 }\n#[cfg(test)]\nmod tests {\n    #[test] fn total() { assert_eq!(super::total(), 6); assert_eq!(super::count(), 2); }\n    #[test] fn flag() { assert!(super::flag(2)); }\n    #[test] fn other() { assert!(super::other(1) >= 2); }\n}\n",
+    "app/src/lib.rs": "#[derive(Clone, Copy)]\npub struct M(pub u32);\nimpl From<M> for u64 { fn from(m: M) -> u64 { m.0 as u64 + 1 } }\npub fn twice<T: Copy + Into<u64>>(x: T) -> u64 { dep::scale(x) + dep::base() }\npub fn total() -> u64 { twice(M(1)) }\n#[cfg(test)]\nmod tests {\n    #[test] fn unit() { println!(\"VALUE {}\", super::total()); }\n}\n",
+    "app/tests/it.rs": '#[test] fn it() { println!("VALUE {}", app::total()); }\n',
 }
 
 
 def test_edit(work):
-    """What an edit of a body recompiles in a test build of a worker that found code of the
-    workspace in the store. The result is each check with whether it held."""
+    """What body edits recompile in a test build whose workers restarted with the code of the
+    workspace in the store, and that the programs run the edit. The result is each check with
+    whether it held."""
     ws = os.path.realpath(os.path.join(work, "test-edit"))
     for file, text in TEST_EDIT_WORKSPACE.items():
         os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
         open(os.path.join(ws, file), "w").write(text)
-    lib = os.path.join(ws, "app/src/lib.rs")
     home = os.path.join(work, "home-test-edit")
     side = Side(ws, base_env(home), True)
     logs = lambda: {path: open(path, errors="replace").read() for path in glob.glob(os.path.join(home, "*", "*", "log"))}
-    side.cargo("test", "-p", "app")
-    # A new daemon's workers find the code of `dep` in the store.
+    run = lambda: side.cargo("test", "-p", "app", "--tests", "--", "--nocapture")[1]
+    run()
     side.cargo("stop")
-    open(lib, "w").write(TEST_EDIT_WORKSPACE["app/src/lib.rs"].replace("x + 1 }", "x + 2 }"))
-    side.cargo("test", "-p", "app")
-    before = logs()
-    open(lib, "w").write(TEST_EDIT_WORKSPACE["app/src/lib.rs"].replace("x + 1 }", "x + 2 }").replace("x > 1 }", "x > 0 }"))
-    _, ran = side.cargo("test", "-p", "app")
-    builds = [log[len(before.get(path, "")):] for path, log in logs().items()]
-    patched = [int(it) for log in builds for it in re.findall(r"^patch: (\d+) functions$", log, re.M)]
-    whole = sum(len(re.findall(r"^stats: ", log, re.M)) for log in builds) - len(patched)
+    run()
+    checks = []
+    for name, file, old, new, value in (
+        ("a generic body of a dependency", "dep/src/lib.rs", "x.into() * 2", "x.into() * 3", 106),
+        ("an #[inline] body of a dependency", "dep/src/lib.rs", "u64 { 100 }", "u64 { 200 }", 206),
+        ("a body of the crate under test", "app/src/lib.rs", "m.0 as u64 + 1", "m.0 as u64 + 2", 209),
+    ):
+        path = os.path.join(ws, file)
+        before = logs()
+        text = open(path).read()
+        open(path, "w").write(text.replace(old, new))
+        ran = run()
+        builds = [log[len(before.get(path, "")):] for path, log in logs().items()]
+        patched = [int(it) for log in builds for it in re.findall(r"^patch: (\d+) functions$", log, re.M)]
+        whole = sum(len(re.findall(r"^stats: ", log, re.M)) for log in builds) - len(patched)
+        values = {int(it) for it in re.findall(r"^VALUE (\d+)$", ran.stdout, re.M)}
+        how = how_built(ran.stderr)
+        held = ran.returncode == 0 and how == "daemon" and whole == 0 and patched != [] and max(patched) <= 3 and values == {value}
+        detail = f"{how}, patched {patched}, {whole} built whole, ran {sorted(values)}"
+        check = f"test edit: {name} patches and runs"
+        print(f"  {'ok ' if held else 'NOT'} {check}  {detail}", flush=True)
+        checks.append((check, held, detail))
     side.cargo("stop")
-    how = how_built(ran.stderr)
-    held = ran.returncode == 0 and how == "daemon" and whole == 0 and patched != [] and max(patched) == 1
-    detail = f"{how}, patched {patched}, {whole} built whole"
-    print(f"  {'ok ' if held else 'NOT'} test edit: a body edit recompiles that function alone  {detail}", flush=True)
-    return [("test edit: a body edit recompiles that function alone", held, detail)]
+    return checks
 
 
 def daemon(work):
