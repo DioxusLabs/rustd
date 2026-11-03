@@ -1619,6 +1619,14 @@ fn same_signature_mode(
                 && !n.has_non_region_infer()
                 && n == t
         }
+        (AttrDefId::TypeAliasId(n), AttrDefId::TypeAliasId(t))
+            if TypeAliasSignature::of(db, n).ty.is_none()
+                && TypeAliasSignature::of(db, t).ty.is_none()
+                && matches!(n.lookup(db).container, ItemContainerId::TraitId(_)) =>
+        {
+            // A trait's associated type has no value to compare; a cfg in its bounds is a read.
+            GenericParams::of(db, n.into()).len() == GenericParams::of(db, t.into()).len()
+        }
         (AttrDefId::TypeAliasId(n), AttrDefId::TypeAliasId(t)) => {
             let n = db.ty(TyDefId::TypeAliasId(n)).skip_binder().fold_with(&mut mapper);
             let t = db.ty(TyDefId::TypeAliasId(t)).skip_binder().fold_with(&mut mapper);
@@ -1885,7 +1893,12 @@ fn local_declaration(
         return LocalDeclaration { stable: true, edges: Vec::new() };
     }
     let Some(twin) = hir_def::twins::declaration_twin(db, test, normal, item) else {
-        return unstable;
+        return match item {
+            AttrDefId::ImplId(id) if local_inert_impl(db, test, normal, id) => {
+                LocalDeclaration { stable: true, edges: Vec::new() }
+            }
+            _ => unstable,
+        };
     };
     let (own, other) = (
         hir_def::twins::declaration_reads(db, item),
@@ -1908,21 +1921,38 @@ fn local_declaration(
         refs.items.iter().chain(&refs.type_items).chain(&refs.signature_types).copied().collect();
     match item {
         AttrDefId::AdtId(adt) => {
-            edges.extend(applicable_adt_impls(db, adt).iter().map(|&id| AttrDefId::ImplId(id)));
-        }
-        AttrDefId::TraitId(id) => {
-            let impls = |krate, id| local_trait_impls(db, krate).get(&id).map_or(0, Vec::len);
-            let AttrDefId::TraitId(test_id) = twin else { return unstable };
-            if impls(normal, id) != impls(test, test_id) {
-                return unstable;
-            }
+            // Impls with this ADT as Self can change a body with no call to show for it (Copy, say).
+            // One that only names it in its arguments is selected through a reference.
             edges.extend(
-                local_trait_impls(db, normal)
-                    .get(&id)
-                    .into_iter()
-                    .flatten()
+                applicable_adt_impls(db, adt)
+                    .iter()
+                    .filter(|&&id| match db.impl_self_ty(id).skip_binder().kind() {
+                        TyKind::Adt(def, _) => def.def_id() == adt,
+                        _ => true,
+                    })
                     .map(|&id| AttrDefId::ImplId(id)),
             );
+        }
+        AttrDefId::TraitId(id) => {
+            let impls = |other, krate, id| {
+                local_trait_impls(db, krate).get(&id).map_or(0, |impls| {
+                    impls.iter().filter(|&&id| !local_inert_impl(db, other, krate, id)).count()
+                })
+            };
+            let AttrDefId::TraitId(test_id) = twin else { return unstable };
+            if impls(test, normal, id) != impls(normal, test, test_id) {
+                return unstable;
+            }
+            // The impl set must agree, but what an impl contains only matters to a body that
+            // selects it, and selecting it is a reference; generic bodies select per copy.
+            let same_header = |&id: &ImplId| {
+                local_inert_impl(db, test, normal, id)
+                    || hir_def::twins::declaration_twin(db, test, normal, id.into())
+                        .is_some_and(|twin| *same_signature_mode(db, normal, id.into(), twin, true))
+            };
+            if !local_trait_impls(db, normal).get(&id).into_iter().flatten().all(same_header) {
+                return unstable;
+            }
         }
         _ => {}
     }
@@ -2062,6 +2092,9 @@ fn local_facts(
     if !local_scope_traits_stable(db, normal, test, item, twin) {
         return Err(LocalRejection::Signature);
     }
+    if local_mentions_gated_name(db, normal, test, item) {
+        return Err(LocalRejection::Signature);
+    }
     let refs = references(db, item, !matches!(item, AttrDefId::StaticId(_)));
     if refs.unknown && !refs.generic_unresolved {
         return Err(LocalRejection::Unknown);
@@ -2157,6 +2190,118 @@ fn local_traits_stable(
     own == mapped && !own.iter().any(|&id| unstable.contains(&AttrDefId::from(id)))
 }
 
+/// An impl whose header names an ADT only this copy has. Selecting it needs that ADT, so a body
+/// that does not mention it (the reference check sees every type in its MIR) never selects it, and
+/// an inference variable that could match it either settles the same way or fails to compile.
+#[salsa::tracked(returns(copy))]
+fn local_inert_impl(db: &dyn HirDatabase, other: Crate, krate: Crate, id: ImplId) -> bool {
+    struct OneCopy<'db> {
+        db: &'db dyn HirDatabase,
+        other: Crate,
+        krate: Crate,
+        found: bool,
+    }
+    impl<'db> TypeVisitor<DbInterner<'db>> for OneCopy<'db> {
+        type Result = ();
+        fn visit_ty(&mut self, ty: Ty<'db>) {
+            match ty.kind() {
+                TyKind::Alias(_) => return,
+                TyKind::Adt(def, _) => {
+                    let item = AttrDefId::from(def.def_id());
+                    self.found |= item.module(self.db).krate(self.db) == self.krate
+                        && hir_def::twins::declaration_twin(self.db, self.other, self.krate, item)
+                            .is_none();
+                }
+                _ => {}
+            }
+            ty.super_visit_with(self);
+        }
+    }
+    let Some(trait_ref) = db.impl_trait(id) else { return false };
+    let mut one_copy = OneCopy { db, other, krate, found: false };
+    trait_ref.skip_binder().visit_with(&mut one_copy);
+    one_copy.found
+}
+
+fn inherent_items_by_twin(
+    db: &dyn HirDatabase,
+    other: Crate,
+    krate: Crate,
+    other_id: Option<ImplId>,
+    id: ImplId,
+) -> Option<Vec<hir_expand::name::Name>> {
+    let others: FxHashSet<AttrDefId> = other_id
+        .map(|other_id| {
+            other_id.impl_items(db).items.iter().map(|(_, it)| AttrDefId::from(*it)).collect()
+        })
+        .unwrap_or_default();
+    let mut names = Vec::new();
+    for (name, item) in id.impl_items(db).items.iter() {
+        let twin = hir_def::twins::declaration_twin(db, other, krate, AttrDefId::from(*item));
+        if twin.is_some_and(|twin| others.contains(&twin)) {
+            continue;
+        }
+        match item {
+            hir_def::AssocItemId::FunctionId(_) | hir_def::AssocItemId::ConstId(_) => {
+                names.push(name.clone())
+            }
+            hir_def::AssocItemId::TypeAliasId(_) => return None,
+        }
+    }
+    Some(names)
+}
+
+/// Inherent associated items only one copy has, by name. Lookup needs the name, so they can only
+/// change a body that spells it. `None` when something other than a name differs.
+#[salsa::tracked(returns(ref))]
+fn local_gated_names(
+    db: &dyn HirDatabase,
+    normal: Crate,
+    test: Crate,
+) -> Option<FxHashSet<hir_expand::name::Name>> {
+    let mut names = FxHashSet::default();
+    for (other, krate) in [(normal, test), (test, normal)] {
+        for &id in local_impls(db, krate) {
+            if db.impl_trait(id).is_some() {
+                continue;
+            }
+            let twin = match hir_def::twins::declaration_twin(db, other, krate, id.into()) {
+                Some(AttrDefId::ImplId(twin)) => Some(twin),
+                _ => None,
+            };
+            names.extend(inherent_items_by_twin(db, other, krate, twin, id)?);
+        }
+    }
+    Some(names)
+}
+
+fn local_mentions_gated_name(
+    db: &dyn HirDatabase,
+    normal: Crate,
+    test: Crate,
+    item: AttrDefId,
+) -> bool {
+    let Some(names) = local_gated_names(db, normal, test) else { return true };
+    if names.is_empty() {
+        return false;
+    }
+    let owner = match item {
+        AttrDefId::FunctionId(id) => DefWithBodyId::from(id),
+        AttrDefId::ConstId(id) => id.into(),
+        AttrDefId::StaticId(id) => id.into(),
+        _ => return false,
+    };
+    let body = hir_def::expr_store::Body::of(db, owner);
+    let path = |path: &hir_def::expr_store::path::Path| {
+        path.segments().iter().any(|segment| names.contains(segment.name))
+    };
+    body.exprs().any(|(_, expr)| match expr {
+        hir_def::hir::Expr::MethodCall { method_name, .. } => names.contains(method_name),
+        hir_def::hir::Expr::Path(it) => path(it),
+        _ => false,
+    }) || body.pats().any(|(_, pat)| matches!(pat, hir_def::hir::Pat::Path(it) if path(it)))
+}
+
 #[salsa::tracked(returns(copy))]
 fn local_impl_mismatch(db: &dyn HirDatabase, normal: Crate, test: Crate, item: AttrDefId) -> bool {
     let AttrDefId::AdtId(adt) = item else { return false };
@@ -2164,8 +2309,18 @@ fn local_impl_mismatch(db: &dyn HirDatabase, normal: Crate, test: Crate, item: A
     else {
         return true;
     };
-    let normals = applicable_adt_impls(db, adt);
-    let tests = applicable_adt_impls(db, test_adt);
+    let relevant = |other, krate, id: AdtId| -> FxHashSet<ImplId> {
+        applicable_adt_impls(db, id)
+            .iter()
+            .copied()
+            .filter(|&id| db.impl_trait(id).is_some() && !local_inert_impl(db, other, krate, id))
+            .collect()
+    };
+    if local_gated_names(db, normal, test).is_none() {
+        return true;
+    }
+    let normals = relevant(test, normal, adt);
+    let tests = relevant(normal, test, test_adt);
     normals.len() != tests.len()
         || tests.iter().any(|&test_impl| {
             let Some(AttrDefId::ImplId(normal_impl)) =
