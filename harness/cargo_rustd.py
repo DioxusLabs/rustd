@@ -1082,7 +1082,7 @@ fn integration() {
     for file, text in files.items():
         os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
         open(os.path.join(ws, file), "w").write(text)
-    side = Side(ws, dict(base_env(os.path.join(work, "home-test-graph")), RUSTD_CFG_TWINS="items"), True)
+    side = Side(ws, dict(base_env(os.path.join(work, "home-test-graph")), RUSTD_CFG_TWINS="items", RUSTD_CFG_SHARING="1"), True)
     checks = []
 
     def check(name, held, detail):
@@ -1437,7 +1437,7 @@ pub fn hidden_size() -> usize { std::mem::size_of_val(&changed()) }
         path = pathlib.Path(ws, file)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
-    side = Side(ws, dict(base_env(os.path.join(work, "home-graph-sharing")), RUSTD_CFG_TWINS="items", RUSTD_CACHE_CHECK="1", RUSTD_CFG_ANALYSIS_TRACE="1"), True)
+    side = Side(ws, dict(base_env(os.path.join(work, "home-graph-sharing")), RUSTD_CFG_TWINS="items", RUSTD_CFG_SHARING="1", RUSTD_CACHE_CHECK="1", RUSTD_CFG_ANALYSIS_TRACE="1"), True)
     checks = []
 
     def check(name, held, detail):
@@ -1548,7 +1548,7 @@ pub fn flatten() -> Option<u8> {
     assert!(boxed().downcast::<Token>().is_ok());
 }
 ''')
-    single = Side(single_ws, dict(base_env(os.path.join(work, "home-sharing-single")), RUSTD_CFG_TWINS="items", RUSTD_CFG_ANALYSIS_TRACE="1"), True)
+    single = Side(single_ws, dict(base_env(os.path.join(work, "home-sharing-single")), RUSTD_CFG_TWINS="items", RUSTD_CFG_SHARING="1", RUSTD_CFG_ANALYSIS_TRACE="1"), True)
     try:
         single.cargo("test")
         wait_warm(single, single_ws)

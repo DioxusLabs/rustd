@@ -2691,10 +2691,10 @@ fn program_sharing(db: &RootDatabase, args: &Args) -> hir_ty::mir::codegen::Shar
         }
     }
     let sharing = hir_ty::mir::codegen::Sharing::new(pairs);
-    if std::env::var_os("RUSTD_CFG_SHARING").is_some_and(|it| it == "0") {
-        sharing.disabled()
-    } else {
+    if std::env::var_os("RUSTD_CFG_SHARING").is_some_and(|it| it != "0") {
         sharing
+    } else {
+        sharing.disabled()
     }
 }
 

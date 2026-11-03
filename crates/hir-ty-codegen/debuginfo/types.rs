@@ -97,6 +97,49 @@ pub(in super::super) struct Types<'db> {
     normalized: FxHashMap<Ty<'db>, Ty<'db>>,
 }
 
+/// For each place an `async` body yields, what it keeps there that a debugger is told of: the
+/// name, the field of the state it is in and the type. Every thread of every program asks this
+/// of each future it describes, and finding what is held takes a pass over the whole body.
+#[salsa::tracked(returns(ref))]
+fn kept_names<'db>(
+    db: &'db dyn HirDatabase,
+    instance: super::super::Instance,
+    env: crate::traits::StoredParamEnvAndCrate,
+    sharing: super::super::Sharing,
+) -> Option<Vec<Vec<(String, usize, crate::next_solver::StoredTy)>>> {
+    let def = instance.def;
+    let body = super::super::program_instance_body(db, &instance, env.clone(), &sharing).ok()?;
+    let env = env.as_ref(db);
+    let infcx = DbInterner::new_with(db, env.krate).infer_ctxt().build(TypingMode::PostAnalysis);
+    let held = body.locals_held_across_yields(&infcx, env.param_env);
+    let (super::super::InstanceDef::Coroutine(id) | super::super::InstanceDef::CoroutineByMove(id)) =
+        def
+    else {
+        return None;
+    };
+    let closure = salsa::plumbing::FromId::from_id(id);
+    let closure: crate::db::InternedCoroutineId<'db> = closure;
+    let closure = closure.loc(db);
+    let store = ExpressionStore::of(db, closure.owner.expression_store_owner(db));
+    let bindings = body.local_to_binding_map();
+    let point = |point: &crate::mir::YieldPoint| {
+        let awaited = body.awaited(point);
+        let kept = point.kept.iter().enumerate().filter_map(|(field, &local)| {
+            let local = held.locals[local];
+            // A value the body keeps without a name for it is not told of, but for the
+            // future it waits for there, which rustc has a name for.
+            let name = match bindings.get(local) {
+                Some(&binding) => store[binding].name.as_str().to_owned(),
+                None if awaited == Some(local) => "__awaitee".to_owned(),
+                None => return None,
+            };
+            Some((name, field, body.locals[local].ty.clone()))
+        });
+        kept.collect()
+    };
+    Some(held.yields.iter().map(point).collect())
+}
+
 impl<'db> Types<'db> {
     pub(in super::super) fn new(
         db: &'db dyn HirDatabase,
@@ -608,38 +651,21 @@ impl<'db> Types<'db> {
         } else {
             super::super::InstanceDef::Coroutine(id.0.as_id())
         };
-        let body = super::super::program_instance_body(
-            self.db,
-            &super::super::Instance { def, args: parent_args.store(), checked: false },
-            self.env.store(),
-            &self.sharing,
-        )
-        .ok()?;
-        let held = body.locals_held_across_yields(&self.infcx, self.env.param_env);
-        let closure = id.0.loc(self.db);
-        let store = ExpressionStore::of(self.db, closure.owner.expression_store_owner(self.db));
-        let bindings = body.local_to_binding_map();
+        let instance = super::super::Instance { def, args: parent_args.store(), checked: false };
+        let frame =
+            kept_names(self.db, instance, self.env.store(), self.sharing.clone()).as_ref()?;
         let mut told = Vec::new();
         for (state, name) in ["Unresumed", "Returned", "Panicked"].into_iter().enumerate() {
             let fields = captured.clone();
             told.push(Variant { name: name.to_owned(), tag: Some(state as u64), fields });
         }
         let waiting = variants.iter().skip(CoroutineFrame::SUSPENDED);
-        for (nth, (point, kept)) in held.yields.iter().zip(waiting).enumerate() {
+        for (nth, (point, kept)) in frame.iter().zip(waiting).enumerate() {
             let mut fields = Vec::new();
-            let awaited = body.awaited(point);
-            for (field, &local) in point.kept.iter().enumerate() {
-                let local = held.locals[local];
-                // A value the body keeps without a name for it is not told of, but for the
-                // future it waits for there, which rustc has a name for.
-                let name = match bindings.get(local) {
-                    Some(&binding) => store[binding].name.as_str(),
-                    None if awaited == Some(local) => "__awaitee",
-                    None => continue,
-                };
-                let offset = kept.field_offsets[RustcFieldIdx::new(field)].bytes();
-                if let Some(ty) = self.ty(body.locals[local].ty.as_ref(), pointers) {
-                    fields.push(Field { name: name.to_owned(), offset, ty });
+            for (name, field, ty) in point {
+                let offset = kept.field_offsets[RustcFieldIdx::new(*field)].bytes();
+                if let Some(ty) = self.ty(ty.as_ref(), pointers) {
+                    fields.push(Field { name: name.clone(), offset, ty });
                 }
             }
             fields.extend(captured.iter().cloned());
