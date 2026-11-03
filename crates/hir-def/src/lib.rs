@@ -38,8 +38,18 @@ pub mod expr_store;
 
 /// Sets all syntax, expansion, body and IDE-attribute LRU capacities. Zero disables eviction.
 pub fn set_lru_capacity(db: &mut dyn base_db::SourceDatabase, capacity: usize) {
+    set_syntax_lru_capacity(db, capacity);
+    set_semantic_lru_capacity(db, capacity);
+}
+
+/// The capped queries that hold syntax: parses, expansions and AST id maps.
+pub fn set_syntax_lru_capacity(db: &mut dyn base_db::SourceDatabase, capacity: usize) {
     base_db::EditionedFileId::set_parse_lru_capacity(db, capacity);
     hir_expand::set_lru_capacity(db, capacity);
+}
+
+/// The capped queries lowered from syntax: bodies and attributes.
+pub fn set_semantic_lru_capacity(db: &mut dyn base_db::SourceDatabase, capacity: usize) {
     expr_store::Body::set_lru_capacity(db, capacity);
     attrs::set_lru_capacity(db, capacity);
 }
