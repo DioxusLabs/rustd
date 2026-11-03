@@ -455,10 +455,16 @@ impl State {
 
     pub(crate) fn write(&self) -> anyhow::Result<()> {
         let path = State::path(&self.key)?;
-        std::fs::create_dir_all(path.parent().context("a state without a directory")?)?;
+        let saying = || format!("writing {}", path.display());
+        std::fs::create_dir_all(path.parent().context("a state without a directory")?)
+            .with_context(saying)?;
         let new = path.with_extension(format!("{}.new", std::process::id()));
-        std::fs::write(&new, serde_json::to_vec(self)?)?;
-        std::fs::rename(&new, &path)?;
+        std::fs::write(&new, serde_json::to_vec(self)?)
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&new);
+            })
+            .with_context(saying)?;
+        std::fs::rename(&new, &path).with_context(saying)?;
         for unit in self.programs.iter().filter_map(|it| it.unit.as_deref()) {
             if !State::of_unit(unit).contains(&self.key) {
                 let mut states =
@@ -471,7 +477,9 @@ impl State {
             .iter()
             .flat_map(|program| program.places().map(|it| (it, &*program.cargos)))
             .collect();
-        Ok(std::fs::write(State::kept_path(&self.key)?, serde_json::to_vec(&kept)?)?)
+        let path = State::kept_path(&self.key)?;
+        std::fs::write(&path, serde_json::to_vec(&kept)?)
+            .with_context(|| format!("writing {}", path.display()))
     }
 
     /// Every state this rustd wrote for the user.

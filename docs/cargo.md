@@ -132,6 +132,22 @@ rust-analyzer database for one repository, toolchain, target, feature set and `c
 setting. Git worktrees of one repository share a worker, so what they have in common is
 analysed once. Different repositories get different workers.
 
+A worker that dies, loses its connection, runs out of disk space or hangs fails the build
+with the reason and its log path; workspace code is never handed back to cargo. Its socket
+is removed and the next build starts a fresh worker under the same daemon. A source error
+while loading is remembered until the source changes. Status shows lost workers, outstanding
+build requests and spare workers. On Linux, signal 9 reports the kernel's OOM-kill count
+since the worker started and its sampled peak RSS when available.
+
+`RUSTD_HUNG_SECS` sets how long a worker and what it started may use no CPU time while loading
+or answering a request before they are killed (default 300 seconds; 0 disables the check). It
+does not apply to an idle worker.
+
+A worker runs in a process group (a job object on Windows), so what it started, such as a
+linker, ends with it. Its log goes through a pipe of the daemon's, so a full disk under the log
+does not fail the build. A worker that exits on an I/O error is not held to the source: the next
+build starts a new one without an edit.
+
 A new worktree still has cargo build the dependencies, because it has a target directory
 of its own. What it saves is the daemon's side: the worktree joins the worker that is
 already loaded instead of loading the workspace again.
